@@ -11,6 +11,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Global variables for DNS configuration
+primary_dns=""
+fallback_dns=""
+selected_names=()
+
 # Logging function
 log() {
     echo -e "${GREEN}-->${NC} $1"
@@ -22,6 +27,16 @@ error() {
 
 warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+unlock_resolv_conf() {
+    if [[ -f /etc/resolv.conf ]]; then
+        if lsattr /etc/resolv.conf 2>/dev/null | grep -q '^....i'; then
+            log "Detected locked /etc/resolv.conf, unlocking..."
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            log "✅ /etc/resolv.conf unlocked"
+        fi
+    fi
 }
 
 # Check if running as root
@@ -55,10 +70,90 @@ fi
 
 log "Detected: $ID $VERSION_ID (Debian compatibility: $debian_version)"
 
-# Secure resolved.conf configuration
-SECURE_RESOLVED_CONFIG="[Resolve]
-DNS=1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001
-FallbackDNS=8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844
+select_dns_providers() {
+    echo ""
+    echo "=========================================="
+    echo "  Select DNS Providers"
+    echo "=========================================="
+    echo ""
+    echo "Available DNS providers:"
+    echo "  1) Cloudflare (1.1.1.1, 1.0.0.1)"
+    echo "  2) Google (8.8.8.8, 8.8.4.4)"
+    echo "  3) Quad9 (9.9.9.9, 149.112.112.112)"
+    echo "  4) OpenDNS (208.67.222.222, 208.67.220.220)"
+    echo "  5) AdGuard (94.140.14.14, 94.140.15.15)"
+    echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9)"
+    echo ""
+    echo "Enter your choices separated by spaces (e.g., '1 2 3')"
+    echo "The first choice will be your primary DNS provider."
+    echo -n "Selection: "
+    
+    read -r selections
+    
+    declare -A dns_ipv4
+    declare -A dns_ipv6
+    declare -A dns_names
+    
+    dns_ipv4[1]="1.1.1.1 1.0.0.1"
+    dns_ipv6[1]="2606:4700:4700::1111 2606:4700:4700::1001"
+    dns_names[1]="Cloudflare"
+    
+    dns_ipv4[2]="8.8.8.8 8.8.4.4"
+    dns_ipv6[2]="2001:4860:4860::8888 2001:4860:4860::8844"
+    dns_names[2]="Google"
+    
+    dns_ipv4[3]="9.9.9.9 149.112.112.112"
+    dns_ipv6[3]="2620:fe::fe 2620:fe::9"
+    dns_names[3]="Quad9"
+    
+    dns_ipv4[4]="208.67.222.222 208.67.220.220"
+    dns_ipv6[4]="2620:119:35::35 2620:119:53::53"
+    dns_names[4]="OpenDNS"
+    
+    dns_ipv4[5]="94.140.14.14 94.140.15.15"
+    dns_ipv6[5]="2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+    dns_names[5]="AdGuard"
+    
+    dns_ipv4[6]="185.228.168.9 185.228.169.9"
+    dns_ipv6[6]="2a0d:2a00:1:: 2a0d:2a00:2::"
+    dns_names[6]="CleanBrowsing"
+    
+    primary_dns=""
+    fallback_dns=""
+    selected_names=()
+    
+    local first=true
+    for choice in $selections; do
+        if [[ -n "${dns_ipv4[$choice]:-}" ]]; then
+            if $first; then
+                primary_dns="${dns_ipv4[$choice]} ${dns_ipv6[$choice]}"
+                selected_names+=("${dns_names[$choice]}")
+                first=false
+            else
+                fallback_dns+=" ${dns_ipv4[$choice]} ${dns_ipv6[$choice]}"
+                selected_names+=("${dns_names[$choice]}")
+            fi
+        fi
+    done
+    
+    if [[ -z "$primary_dns" ]]; then
+        warning "No valid selection made. Using Cloudflare as default."
+        primary_dns="1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001"
+        fallback_dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
+        selected_names=("Cloudflare" "Google")
+    fi
+    
+    fallback_dns=$(echo "$fallback_dns" | xargs)
+    
+    echo ""
+    log "Selected providers: ${selected_names[*]}"
+    echo ""
+}
+
+generate_resolved_config() {
+    SECURE_RESOLVED_CONFIG="[Resolve]
+DNS=$primary_dns
+FallbackDNS=$fallback_dns
 Domains=~.
 DNSSEC=yes
 DNSOverTLS=opportunistic
@@ -68,6 +163,7 @@ DNSStubListener=yes
 DNSStubListenerExtra=127.0.0.53
 ReadEtcHosts=yes
 ResolveUnicastSingleLabel=no"
+}
 
 # Health check function
 health_check() {
@@ -119,6 +215,8 @@ health_check() {
 # Main purification function
 purify_dns() {
     echo "--- Starting DNS purification and hardening process ---"
+    
+    unlock_resolv_conf
     
     # Phase 1: Remove all conflict sources
     log "Phase 1: Removing all potential DNS conflict sources..."
@@ -172,7 +270,9 @@ EOF
     systemctl start systemd-resolved 2>/dev/null
     
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
+    generate_resolved_config
     echo -e "${SECURE_RESOLVED_CONFIG}" > /etc/systemd/resolved.conf
+    unlock_resolv_conf
     rm -f /etc/resolv.conf 2>/dev/null || true
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
     systemctl restart systemd-resolved
@@ -219,9 +319,20 @@ verify_dns() {
 main() {
     if health_check; then
         echo "No action needed. System is already properly configured."
-        exit 0
+        echo ""
+        echo -n "Do you want to force rerun the DNS configuration anyway? (y/N): "
+        read -r force_rerun
+        
+        if [[ ! "$force_rerun" =~ ^[Yy]$ ]]; then
+            echo "Exiting without changes."
+            exit 0
+        fi
+        
+        echo ""
+        log "Forcing DNS reconfiguration as requested..."
     fi
     
+    select_dns_providers
     purify_dns
     verify_dns
     
@@ -231,8 +342,9 @@ main() {
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Your system is now using:"
-    echo "  • Primary DNS: Cloudflare (1.1.1.1, 1.0.0.1)"
-    echo "  • Fallback DNS: Google (8.8.8.8, 8.8.4.4)"
+    for name in "${selected_names[@]}"; do
+        echo "  • $name DNS"
+    done
     echo "  • Features: DNSSEC, DNS-over-TLS (opportunistic)"
     echo ""
 }
