@@ -86,9 +86,14 @@ select_dns_providers() {
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
     echo "The first choice will be your primary DNS provider."
-    echo -n "Selection: "
+    echo -n "Selection (default: 1 2 5): "
     
     read -r selections < /dev/tty
+    
+    if [[ -z "$selections" ]]; then
+        selections="1 2 5"
+        log "Using default selection: Cloudflare, Google, AdGuard"
+    fi
     
     declare -A dns_ipv4
     declare -A dns_ipv6
@@ -137,10 +142,10 @@ select_dns_providers() {
     done
     
     if [[ -z "$primary_dns" ]]; then
-        warning "No valid selection made. Using Cloudflare as default."
+        warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
         primary_dns="1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001"
-        fallback_dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
-        selected_names=("Cloudflare" "Google")
+        fallback_dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844 94.140.14.14 94.140.15.15 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+        selected_names=("Cloudflare" "Google" "AdGuard")
     fi
     
     fallback_dns=$(echo "$fallback_dns" | xargs)
