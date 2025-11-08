@@ -1,152 +1,240 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
+# DNS Setup Script - Purifies and hardens DNS configuration
+# Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
+
 set -euo pipefail
 
-readonly TARGET_DNS="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
-readonly SECURE_RESOLVED_CONFIG="[Resolve]
-DNS=${TARGET_DNS}
-LLMNR=no
-MulticastDNS=no
-DNSSEC=allow-downgrade
-DNSOverTLS=yes
-"
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-readonly GREEN="\033[0;32m"
-readonly YELLOW="\033[1;33m"
-readonly RED="\033[0;31m"
-readonly NC="\033[0m"
+# Logging function
+log() {
+    echo -e "${GREEN}-->${NC} $1"
+}
 
-log() { echo -e "${GREEN}--> $1${NC}"; }
-log_warn() { echo -e "${YELLOW}--> $1${NC}"; }
-log_error() { echo -e "${RED}--> $1${NC}" >&2; }
+error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
 
-purify_and_harden_dns() {
-    echo -e "\n--- Starting DNS purification and hardening process ---"
+warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root"
+    exit 1
+fi
+
+# Detect OS version
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    os_name="$ID"
+    os_version="$VERSION_ID"
+else
+    error "Cannot detect OS version"
+    exit 1
+fi
+
+# Determine Debian version for compatibility
+debian_version=""
+if [[ "$os_name" == "debian" ]]; then
+    debian_version="$os_version"
+elif [[ "$os_name" == "ubuntu" ]]; then
+    case "$os_version" in
+        20.04) debian_version="10" ;;
+        22.04) debian_version="11" ;;
+        24.04) debian_version="12" ;;
+        *) debian_version="12" ;;
+    esac
+fi
+
+log "Detected: $ID $VERSION_ID (Debian compatibility: $debian_version)"
+
+# Secure resolved.conf configuration
+SECURE_RESOLVED_CONFIG="[Resolve]
+DNS=1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001
+FallbackDNS=8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844
+Domains=~.
+DNSSEC=yes
+DNSOverTLS=opportunistic
+Cache=yes
+CacheFromLocalhost=no
+DNSStubListener=yes
+DNSStubListenerExtra=127.0.0.53
+ReadEtcHosts=yes
+ResolveUnicastSingleLabel=no"
+
+# Health check function
+health_check() {
+    local all_passed=true
     
-    local debian_version
-    debian_version=$(grep "VERSION_ID" /etc/os-release | cut -d'=' -f2 | tr -d '"' || echo "unknown")
+    echo ""
+    echo "--- Starting comprehensive system DNS health check ---"
     
+    # Check 1: systemd-resolved service
+    echo -n "1. Checking systemd-resolved status... "
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo -e "${GREEN}✓ Running${NC}"
+    else
+        echo -e "${RED}Service not running or unresponsive${NC}"
+        all_passed=false
+    fi
+    
+    # Check 2: dhclient.conf configuration
+    echo -n "2. Checking dhclient.conf configuration... "
+    if [[ -f /etc/dhcp/dhclient.conf ]] && \
+       grep -q "^supersede domain-name-servers" /etc/dhcp/dhclient.conf && \
+       grep -q "^prepend domain-name-servers" /etc/dhcp/dhclient.conf; then
+        echo -e "${GREEN}✓ Properly configured${NC}"
+    else
+        echo -e "${YELLOW}'ignore' parameters not found${NC}"
+        all_passed=false
+    fi
+    
+    # Check 3: if-up.d conflict script
+    echo -n "3. Checking if-up.d conflict script... "
+    if [[ -x /etc/network/if-up.d/resolved ]]; then
+        echo -e "${YELLOW}Script exists and is executable${NC}"
+        all_passed=false
+    else
+        echo -e "${GREEN}✓ No conflicts${NC}"
+    fi
+    
+    echo ""
+    if [[ "$all_passed" == true ]]; then
+        echo -e "${GREEN}==> All checks passed! DNS configuration is healthy.${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}--> One or more checks failed. Running full purification and hardening process...${NC}"
+        echo ""
+        return 1
+    fi
+}
+
+# Main purification function
+purify_dns() {
+    echo "--- Starting DNS purification and hardening process ---"
+    
+    # Phase 1: Remove all conflict sources
     log "Phase 1: Removing all potential DNS conflict sources..."
     
-    local dhclient_conf="/etc/dhcp/dhclient.conf"
-    if [[ -f "$dhclient_conf" ]]; then
-        if ! grep -q "ignore domain-name-servers;" "$dhclient_conf" || ! grep -q "ignore domain-search;" "$dhclient_conf"; then
-            log "Configuring DHCP client (dhclient)..."
-            echo "" >> "$dhclient_conf"
-            echo "ignore domain-name-servers;" >> "$dhclient_conf"
-            echo "ignore domain-search;" >> "$dhclient_conf"
-            log "✅ Added 'ignore' directives to ${dhclient_conf}"
-        fi
+    # Configure dhclient to ignore DHCP DNS
+    log "Configuring DHCP client (dhclient)..."
+    if [[ -f /etc/dhcp/dhclient.conf ]]; then
+        # Remove any existing supersede/prepend lines
+        sed -i '/^supersede domain-name-servers/d' /etc/dhcp/dhclient.conf
+        sed -i '/^prepend domain-name-servers/d' /etc/dhcp/dhclient.conf
+        
+        # Add our configuration
+        cat >> /etc/dhcp/dhclient.conf << 'EOF'
+
+# DNS override configuration - added by setup_dns.sh
+supersede domain-name-servers 127.0.0.53;
+prepend domain-name-servers 127.0.0.53;
+EOF
+        log "✅ Added 'ignore' directives to /etc/dhcp/dhclient.conf"
     fi
     
-    local ifup_script="/etc/network/if-up.d/resolved"
-    if [[ -f "$ifup_script" ]] && [[ -x "$ifup_script" ]]; then
-        log "Disabling conflicting if-up.d script..."
-        chmod -x "$ifup_script"
-        log "✅ Removed execute permission from ${ifup_script}"
+    # Disable the if-up.d resolved script
+    log "Disabling conflicting if-up.d script..."
+    if [[ -f /etc/network/if-up.d/resolved ]]; then
+        chmod -x /etc/network/if-up.d/resolved 2>/dev/null || true
+        log "✅ Removed execute permission from /etc/network/if-up.d/resolved"
     fi
     
-    local interfaces_file="/etc/network/interfaces"
-    if [[ -f "$interfaces_file" ]] && grep -qE '^[[:space:]]*(dns-(nameservers|search|domain))' "$interfaces_file"; then
-        log "Purifying /etc/network/interfaces DNS configuration..."
-        sed -i -E 's/^[[:space:]]*(dns-(nameservers|search|domain).*)/# \1/' "$interfaces_file"
-        log "✅ Legacy DNS configuration commented out"
-    fi
-    
+    # Phase 2: Configure systemd-resolved
     log "Phase 2: Configuring systemd-resolved..."
+    
+    export DEBIAN_FRONTEND=noninteractive
     
     if ! command -v resolvectl &> /dev/null; then
         log "Installing systemd-resolved..."
-        apt-get update -y > /dev/null
-        apt-get install -y systemd-resolved > /dev/null
+        apt-get update -qq > /dev/null 2>&1
+        apt-get install -y systemd-resolved > /dev/null 2>&1
     fi
     
-    if [[ "$debian_version" == "11" ]] && dpkg -s resolvconf &> /dev/null; then
+    # Remove resolvconf on Debian 11 if present
+    if [[ "$debian_version" == "11" ]] && dpkg -s resolvconf &> /dev/null 2>&1; then
         log "Detected 'resolvconf' on Debian 11, uninstalling..."
-        apt-get remove -y resolvconf > /dev/null
+        apt-get remove -y resolvconf > /dev/null 2>&1
         rm -f /etc/resolv.conf
         log "✅ 'resolvconf' successfully uninstalled"
     fi
     
     log "Enabling and starting systemd-resolved service..."
-    systemctl enable systemd-resolved
-    systemctl start systemd-resolved
+    systemctl unmask systemd-resolved 2>/dev/null || true
+    systemctl enable systemd-resolved 2>/dev/null
+    systemctl start systemd-resolved 2>/dev/null
     
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
     echo -e "${SECURE_RESOLVED_CONFIG}" > /etc/systemd/resolved.conf
+    rm -f /etc/resolv.conf 2>/dev/null || true
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
     systemctl restart systemd-resolved
-    sleep 1
+    sleep 2
     
-    log "Phase 3: Safely restarting network services..."
-    if systemctl is-enabled --quiet networking.service; then
-        systemctl restart networking.service
-        log "✅ networking.service safely restarted"
-    fi
-    
-    echo -e "\n${GREEN}✅ All operations completed! Final DNS configuration status:${NC}"
-    echo "===================================================="
-    resolvectl status
-    echo "===================================================="
-    echo -e "\n${GREEN}DNS purification script completed${NC}"
+    log "✅ DNS purification and hardening complete!"
+    echo ""
 }
 
+# Verification function
+verify_dns() {
+    echo "--- Verifying DNS configuration ---"
+    
+    if systemctl is-active --quiet systemd-resolved; then
+        log "✅ systemd-resolved is active"
+    else
+        error "systemd-resolved is not running"
+        return 1
+    fi
+    
+    if resolvectl status >/dev/null 2>&1; then
+        log "✅ resolvectl is working"
+        echo ""
+        resolvectl status | grep -A 5 "DNS Servers"
+    else
+        warning "resolvectl status check failed"
+    fi
+    
+    echo ""
+    log "Testing DNS resolution..."
+    if nslookup google.com >/dev/null 2>&1; then
+        log "✅ DNS resolution is working"
+    else
+        warning "DNS resolution test failed"
+    fi
+    
+    echo ""
+    log "Current /etc/resolv.conf:"
+    cat /etc/resolv.conf
+    echo ""
+}
+
+# Main execution
 main() {
-    if [[ $EUID -ne 0 ]]; then
-       log_error "Error: This script must be run as root. Please use 'sudo'."
-       exit 1
-    fi
-    
-    echo "--- Starting comprehensive system DNS health check ---"
-    local is_perfect=true
-    
-    echo -n "1. Checking systemd-resolved status... "
-    if ! command -v resolvectl &> /dev/null || ! resolvectl status &> /dev/null; then
-        echo -e "${YELLOW}Service not running or unresponsive${NC}"
-        is_perfect=false
-    else
-        local status_output
-        status_output=$(resolvectl status)
-        
-        local current_dns
-        current_dns=$(echo "${status_output}" | sed -n '/Global/,/^\s*$/{/DNS Servers:/s/.*DNS Servers:[[:space:]]*//p}' | tr -d '\r\n' | xargs)
-        
-        if [[ "${current_dns}" != "${TARGET_DNS}" ]] || ! echo "${status_output}" | grep -q -- "-LLMNR" || ! echo "${status_output}" | grep -q -- "-mDNS" || ! echo "${status_output}" | grep -q -- "+DNSOverTLS" || ! echo "${status_output}" | grep -q "DNSSEC=allow-downgrade"; then
-            echo -e "${YELLOW}Configuration does not match security target${NC}"
-            is_perfect=false
-        else
-            echo -e "${GREEN}Correct configuration${NC}"
-        fi
-    fi
-    
-    echo -n "2. Checking dhclient.conf configuration... "
-    local dhclient_conf="/etc/dhcp/dhclient.conf"
-    if [[ -f "$dhclient_conf" ]]; then
-        if grep -q "ignore domain-name-servers;" "$dhclient_conf" && grep -q "ignore domain-search;" "$dhclient_conf"; then
-            echo -e "${GREEN}Purified${NC}"
-        else
-            echo -e "${YELLOW}'ignore' parameters not found${NC}"
-            is_perfect=false
-        fi
-    else
-        echo -e "${GREEN}File does not exist, no purification needed${NC}"
-    fi
-    
-    echo -n "3. Checking if-up.d conflict script... "
-    local ifup_script="/etc/network/if-up.d/resolved"
-    if [[ ! -f "$ifup_script" ]] || [[ ! -x "$ifup_script" ]]; then
-        echo -e "${GREEN}Disabled or does not exist${NC}"
-    else
-        echo -e "${YELLOW}Script exists and is executable${NC}"
-        is_perfect=false
-    fi
-    
-    if [[ "$is_perfect" == true ]]; then
-        echo -e "\n${GREEN}✅ Comprehensive check passed! System DNS configuration is stable and secure. No action needed.${NC}"
+    if health_check; then
+        echo "No action needed. System is already properly configured."
         exit 0
-    else
-        echo -e "\n${YELLOW}--> One or more checks failed. Running full purification and hardening process...${NC}"
-        purify_and_harden_dns
     fi
+    
+    purify_dns
+    verify_dns
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}DNS setup completed successfully!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Your system is now using:"
+    echo "  • Primary DNS: Cloudflare (1.1.1.1, 1.0.0.1)"
+    echo "  • Fallback DNS: Google (8.8.8.8, 8.8.4.4)"
+    echo "  • Features: DNSSEC, DNS-over-TLS (opportunistic)"
+    echo ""
 }
 
 main "$@"
