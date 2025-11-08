@@ -88,7 +88,7 @@ select_dns_providers() {
     echo "The first choice will be your primary DNS provider."
     echo -n "Selection: "
     
-    read -r selections
+    read -r selections < /dev/tty
     
     declare -A dns_ipv4
     declare -A dns_ipv6
@@ -321,7 +321,7 @@ main() {
         echo "No action needed. System is already properly configured."
         echo ""
         echo -n "Do you want to force rerun the DNS configuration anyway? (y/N): "
-        read -r force_rerun
+        read -r force_rerun < /dev/tty
         
         if [[ ! "$force_rerun" =~ ^[Yy]$ ]]; then
             echo "Exiting without changes."
