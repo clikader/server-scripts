@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# DNS Setup Script - Purifies and hardens DNS configuration
-# Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
+# DNS Setup Script - Purifies and hardens DNS configuration with DNS-over-TLS
+# Primarily supports: Debian 12/13, Ubuntu 22.04/24.04
+# May work on: Debian 11, Ubuntu 20.04 (with limited testing)
 
 set -euo pipefail
 
@@ -15,6 +16,20 @@ NC='\033[0m' # No Color
 primary_dns=""
 fallback_dns=""
 selected_names=()
+ipv6_support=false
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -6|--ipv6)
+            ipv6_support=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 # Logging function
 log() {
@@ -70,19 +85,25 @@ fi
 
 log "Detected: $ID $VERSION_ID (Debian compatibility: $debian_version)"
 
+if [[ "$ipv6_support" == true ]]; then
+    log "IPv6 support: ENABLED"
+else
+    log "IPv6 support: DISABLED (use -6 flag to enable)"
+fi
+
 select_dns_providers() {
     echo ""
     echo "=========================================="
-    echo "  Select DNS Providers"
+    echo "  Select DNS Providers (DNS-over-TLS)"
     echo "=========================================="
     echo ""
     echo "Available DNS providers:"
-    echo "  1) Cloudflare (1.1.1.1, 1.0.0.1)"
-    echo "  2) Google (8.8.8.8, 8.8.4.4)"
-    echo "  3) Quad9 (9.9.9.9, 149.112.112.112)"
-    echo "  4) OpenDNS (208.67.222.222, 208.67.220.220)"
-    echo "  5) AdGuard (94.140.14.14, 94.140.15.15)"
-    echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9)"
+    echo "  1) Cloudflare (1.1.1.1, 1.0.0.1) - DoT: cloudflare-dns.com"
+    echo "  2) Google (8.8.8.8, 8.8.4.4) - DoT: dns.google"
+    echo "  3) Quad9 (9.9.9.9, 149.112.112.112) - DoT: dns.quad9.net"
+    echo "  4) OpenDNS (208.67.222.222, 208.67.220.220) - DoT: dns.opendns.com"
+    echo "  5) AdGuard (94.140.14.14, 94.140.15.15) - DoT: dns.adguard.com"
+    echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9) - DoT: family-filter-dns.cleanbrowsing.org"
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
     echo "The first choice will be your primary DNS provider."
@@ -99,28 +120,28 @@ select_dns_providers() {
     declare -A dns_ipv6
     declare -A dns_names
     
-    dns_ipv4[1]="1.1.1.1 1.0.0.1"
-    dns_ipv6[1]="2606:4700:4700::1111 2606:4700:4700::1001"
+    dns_ipv4[1]="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
+    dns_ipv6[1]="2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
     dns_names[1]="Cloudflare"
     
-    dns_ipv4[2]="8.8.8.8 8.8.4.4"
-    dns_ipv6[2]="2001:4860:4860::8888 2001:4860:4860::8844"
+    dns_ipv4[2]="8.8.8.8#dns.google 8.8.4.4#dns.google"
+    dns_ipv6[2]="2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
     dns_names[2]="Google"
     
-    dns_ipv4[3]="9.9.9.9 149.112.112.112"
-    dns_ipv6[3]="2620:fe::fe 2620:fe::9"
+    dns_ipv4[3]="9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net"
+    dns_ipv6[3]="2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
     dns_names[3]="Quad9"
     
-    dns_ipv4[4]="208.67.222.222 208.67.220.220"
-    dns_ipv6[4]="2620:119:35::35 2620:119:53::53"
+    dns_ipv4[4]="208.67.222.222#dns.opendns.com 208.67.220.220#dns.opendns.com"
+    dns_ipv6[4]="2620:119:35::35#dns.opendns.com 2620:119:53::53#dns.opendns.com"
     dns_names[4]="OpenDNS"
     
-    dns_ipv4[5]="94.140.14.14 94.140.15.15"
-    dns_ipv6[5]="2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+    dns_ipv4[5]="94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
+    dns_ipv6[5]="2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
     dns_names[5]="AdGuard"
     
-    dns_ipv4[6]="185.228.168.9 185.228.169.9"
-    dns_ipv6[6]="2a0d:2a00:1:: 2a0d:2a00:2::"
+    dns_ipv4[6]="185.228.168.9#family-filter-dns.cleanbrowsing.org 185.228.169.9#family-filter-dns.cleanbrowsing.org"
+    dns_ipv6[6]="2a0d:2a00:1::#family-filter-dns.cleanbrowsing.org 2a0d:2a00:2::#family-filter-dns.cleanbrowsing.org"
     dns_names[6]="CleanBrowsing"
     
     primary_dns=""
@@ -131,11 +152,17 @@ select_dns_providers() {
     for choice in $selections; do
         if [[ -n "${dns_ipv4[$choice]:-}" ]]; then
             if $first; then
-                primary_dns="${dns_ipv4[$choice]} ${dns_ipv6[$choice]}"
+                primary_dns="${dns_ipv4[$choice]}"
+                if [[ "$ipv6_support" == true ]]; then
+                    primary_dns+=" ${dns_ipv6[$choice]}"
+                fi
                 selected_names+=("${dns_names[$choice]}")
                 first=false
             else
-                fallback_dns+=" ${dns_ipv4[$choice]} ${dns_ipv6[$choice]}"
+                fallback_dns+=" ${dns_ipv4[$choice]}"
+                if [[ "$ipv6_support" == true ]]; then
+                    fallback_dns+=" ${dns_ipv6[$choice]}"
+                fi
                 selected_names+=("${dns_names[$choice]}")
             fi
         fi
@@ -143,8 +170,14 @@ select_dns_providers() {
     
     if [[ -z "$primary_dns" ]]; then
         warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
-        primary_dns="1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001"
-        fallback_dns="8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844 94.140.14.14 94.140.15.15 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+        primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
+        fallback_dns="8.8.8.8#dns.google 8.8.4.4#dns.google 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
+        
+        if [[ "$ipv6_support" == true ]]; then
+            primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
+            fallback_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+        fi
+        
         selected_names=("Cloudflare" "Google" "AdGuard")
     fi
     
@@ -261,9 +294,9 @@ EOF
         apt-get install -y systemd-resolved > /dev/null 2>&1
     fi
     
-    # Remove resolvconf on Debian 11 if present
-    if [[ "$debian_version" == "11" ]] && dpkg -s resolvconf &> /dev/null 2>&1; then
-        log "Detected 'resolvconf' on Debian 11, uninstalling..."
+    # Remove resolvconf if present (common on older Debian/Ubuntu)
+    if dpkg -s resolvconf &> /dev/null 2>&1; then
+        log "Detected 'resolvconf' package, uninstalling..."
         apt-get remove -y resolvconf > /dev/null 2>&1
         rm -f /etc/resolv.conf
         log "✅ 'resolvconf' successfully uninstalled"
@@ -348,9 +381,17 @@ main() {
     echo ""
     echo "Your system is now using:"
     for name in "${selected_names[@]}"; do
-        echo "  • $name DNS"
+        echo "  • $name DNS (DNS-over-TLS)"
     done
-    echo "  • Features: DNSSEC, DNS-over-TLS (opportunistic)"
+    echo ""
+    echo "Security features enabled:"
+    echo "  • DNSSEC: Yes"
+    echo "  • DNS-over-TLS: Opportunistic"
+    if [[ "$ipv6_support" == true ]]; then
+        echo "  • IPv6 support: Enabled"
+    else
+        echo "  • IPv6 support: Disabled (use -6 flag to enable)"
+    fi
     echo ""
 }
 
