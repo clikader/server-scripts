@@ -358,10 +358,10 @@ main() {
     if health_check; then
         echo "No action needed. System is already properly configured."
         echo ""
-        echo -n "Do you want to force rerun the DNS configuration anyway? (y/N): "
+        echo -n "Do you want to force rerun the DNS configuration anyway? (Y/n): "
         read -r force_rerun < /dev/tty
         
-        if [[ ! "$force_rerun" =~ ^[Yy]$ ]]; then
+        if [[ "$force_rerun" =~ ^[Nn]$ ]]; then
             echo "Exiting without changes."
             exit 0
         fi
