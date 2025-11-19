@@ -91,6 +91,68 @@ else
     log "IPv6 support: DISABLED (use -6 flag to enable)"
 fi
 
+get_custom_dns() {
+    local custom_ipv4=""
+    local custom_ipv6=""
+    local custom_dot=""
+    
+    echo ""
+    echo "=========================================="
+    echo "  Custom DNS Configuration"
+    echo "=========================================="
+    echo ""
+    echo "Enter your custom DNS server details:"
+    echo ""
+    
+    # Get IPv4 DNS servers
+    echo -n "IPv4 DNS servers (space-separated, e.g., '1.1.1.1 1.0.0.1'): "
+    read -r custom_ipv4 < /dev/tty
+    
+    if [[ -z "$custom_ipv4" ]]; then
+        error "IPv4 DNS servers are required for custom DNS"
+        return 1
+    fi
+    
+    # Get IPv6 DNS servers if IPv6 support is enabled
+    if [[ "$ipv6_support" == true ]]; then
+        echo -n "IPv6 DNS servers (space-separated, optional): "
+        read -r custom_ipv6 < /dev/tty
+    fi
+    
+    # Get DoT hostname
+    echo -n "DNS-over-TLS hostname (e.g., 'dns.example.com', leave empty if not supported): "
+    read -r custom_dot < /dev/tty
+    
+    # Build the DNS configuration
+    local dns_config_ipv4=""
+    local dns_config_ipv6=""
+    
+    for ip in $custom_ipv4; do
+        if [[ -n "$custom_dot" ]]; then
+            dns_config_ipv4+="$ip#$custom_dot "
+        else
+            dns_config_ipv4+="$ip "
+        fi
+    done
+    
+    for ip in $custom_ipv6; do
+        if [[ -n "$custom_dot" ]]; then
+            dns_config_ipv6+="$ip#$custom_dot "
+        else
+            dns_config_ipv6+="$ip "
+        fi
+    done
+    
+    # Return the configuration via global variables
+    dns_ipv4[7]="$dns_config_ipv4"
+    dns_ipv6[7]="$dns_config_ipv6"
+    dns_names[7]="Custom"
+    
+    log "Custom DNS configured successfully"
+    echo ""
+    return 0
+}
+
 select_dns_providers() {
     echo ""
     echo "=========================================="
@@ -104,6 +166,7 @@ select_dns_providers() {
     echo "  4) OpenDNS (208.67.222.222, 208.67.220.220) - DoT: dns.opendns.com"
     echo "  5) AdGuard (94.140.14.14, 94.140.15.15) - DoT: dns.adguard.com"
     echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9) - DoT: family-filter-dns.cleanbrowsing.org"
+    echo "  7) Custom DNS (define your own)"
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
     echo "The first choice will be your primary DNS provider."
@@ -143,6 +206,14 @@ select_dns_providers() {
     dns_ipv4[6]="185.228.168.9#family-filter-dns.cleanbrowsing.org 185.228.169.9#family-filter-dns.cleanbrowsing.org"
     dns_ipv6[6]="2a0d:2a00:1::#family-filter-dns.cleanbrowsing.org 2a0d:2a00:2::#family-filter-dns.cleanbrowsing.org"
     dns_names[6]="CleanBrowsing"
+    
+    # Check if custom DNS (option 7) is selected
+    if echo "$selections" | grep -qw "7"; then
+        if ! get_custom_dns; then
+            error "Failed to configure custom DNS. Aborting."
+            exit 1
+        fi
+    fi
     
     primary_dns=""
     fallback_dns=""
