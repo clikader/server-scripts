@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.2"
+CLIKADER_VERSION="1.0.3"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -46,19 +46,19 @@ fi
 
 # Function to display menu
 display_menu() {
-    clear
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}"
-    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    clear >&2
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}" >&2
+    echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}" >&2
+    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}" >&2
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}" >&2
+    echo "" >&2
     
     for i in "${!MENU_ITEMS[@]}"; do
-        echo "  $((i+1))) ${MENU_ITEMS[$i]}"
+        echo "  $((i+1))) ${MENU_ITEMS[$i]}" >&2
     done
     
-    echo "  0) Exit"
-    echo ""
+    echo "  0) Exit" >&2
+    echo "" >&2
 }
 
 # Function to get user selection
@@ -66,20 +66,20 @@ get_selection() {
     while true; do
         display_menu
         
-        echo -n "Enter your choice [0-${#MENU_ITEMS[@]}]: "
+        echo -n "Enter your choice [0-${#MENU_ITEMS[@]}]: " >&2
         read -r choice < /dev/tty
         
         # Validate input is a number
         if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo "Invalid input. Please enter a number."
+            echo "Invalid input. Please enter a number." >&2
             sleep 2
             continue
         fi
         
         # Check if exit
         if [[ $choice -eq 0 ]]; then
-            echo ""
-            echo "Exiting..."
+            echo "" >&2
+            echo "Exiting..." >&2
             exit 0
         fi
         
@@ -88,7 +88,7 @@ get_selection() {
             echo $((choice - 1))
             return 0
         else
-            echo "Invalid choice. Please try again."
+            echo "Invalid choice. Please try again." >&2
             sleep 2
         fi
     done
