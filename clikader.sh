@@ -76,11 +76,14 @@ get_selection() {
     # Hide cursor
     tput civis
     
+    # Ensure we read from terminal, not stdin (important for curl | bash)
+    exec < /dev/tty
+    
     while true; do
         display_menu $selected
         
-        # Read single character
-        read -rsn1 key
+        # Read single character from terminal
+        IFS= read -rsn1 key < /dev/tty
         
         case "$key" in
             A) # Up arrow
@@ -109,7 +112,7 @@ get_selection() {
                 exit 0
                 ;;
             $'\x1b') # ESC sequence
-                read -rsn2 key
+                IFS= read -rsn2 key < /dev/tty
                 case "$key" in
                     '[A') # Up arrow
                         ((selected--))
