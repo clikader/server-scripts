@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.0"
+CLIKADER_VERSION="1.0.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -85,7 +85,8 @@ get_selection() {
         
         # Check if valid menu option
         if [[ $choice -ge 1 ]] && [[ $choice -le ${#MENU_ITEMS[@]} ]]; then
-            return $((choice - 1))
+            echo $((choice - 1))
+            return 0
         else
             echo "Invalid choice. Please try again."
             sleep 2
@@ -365,9 +366,7 @@ run_script() {
 # Main menu loop
 main() {
     while true; do
-        get_selection
-        local selected=$?
-        
+        local selected=$(get_selection)
         local selected_title="${MENU_ITEMS[$selected]}"
         
         # Handle special menu items
