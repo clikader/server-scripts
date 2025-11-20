@@ -262,7 +262,7 @@ show_menu() {
     echo ""
     echo "  1) Fix hostname resolution (add to /etc/hosts)"
     echo "  2) Change hostname"
-    echo "  3) Exit"
+    echo "  0) Exit"
     echo ""
 }
 
@@ -271,7 +271,7 @@ main() {
     while true; do
         show_menu
         
-        echo -n "Enter your choice (1-3): "
+        echo -n "Enter your choice [0-2]: "
         read -r choice < /dev/tty
         
         case "$choice" in
@@ -279,22 +279,22 @@ main() {
                 fix_hostname_resolution
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
             2)
                 change_hostname
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
-            3)
+            0)
                 echo ""
                 log "Exiting..."
                 echo ""
                 exit 0
                 ;;
             *)
-                error "Invalid choice. Please enter 1, 2, or 3."
+                error "Invalid choice. Please enter 0, 1, or 2."
                 sleep 2
                 ;;
         esac

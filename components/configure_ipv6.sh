@@ -523,7 +523,7 @@ show_menu() {
     echo "  2) Disable IPv6"
     echo "  3) Configure IPv6 address"
     echo "  4) Check status only"
-    echo "  5) Exit"
+    echo "  0) Exit"
     echo ""
 }
 
@@ -532,7 +532,7 @@ main() {
     while true; do
         show_menu
         
-        echo -n "Enter your choice (1-5): "
+        echo -n "Enter your choice [0-4]: "
         read -r choice < /dev/tty
         
         case "$choice" in
@@ -540,19 +540,19 @@ main() {
                 enable_ipv6
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
             2)
                 disable_ipv6
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
             3)
                 configure_ipv6_address
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
             4)
                 echo ""
@@ -561,16 +561,16 @@ main() {
                 sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
                 echo ""
                 echo "Press any key to continue..."
-                read -rsn1
+                read -rsn1 < /dev/tty
                 ;;
-            5)
+            0)
                 echo ""
                 log "Exiting..."
                 echo ""
                 exit 0
                 ;;
             *)
-                error "Invalid choice. Please enter 1, 2, 3, 4, or 5."
+                error "Invalid choice. Please enter 0-4."
                 sleep 2
                 ;;
         esac

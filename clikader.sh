@@ -35,6 +35,7 @@ MENU_ITEMS=(
     "Fix Hostname"
     "Configure IPv6"
     "Update CLiKader"
+    "Uninstall CLiKader"
 )
 
 # Check if running as root
@@ -43,80 +44,51 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Function to clear screen and show header
-show_header() {
+# Function to display menu
+display_menu() {
     clear
     echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}"
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo ""
-}
-
-# Function to display menu with arrow key navigation
-display_menu() {
-    local selected=$1
-    
-    show_header
-    
-    echo "Use ↑/↓ arrow keys to navigate, Enter to select, Q to quit"
+    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
     echo ""
     
     for i in "${!MENU_ITEMS[@]}"; do
-        if [[ $i -eq $selected ]]; then
-            echo -e "  ${GREEN}▶ ${MENU_ITEMS[$i]}${NC}"
-        else
-            echo -e "    ${MENU_ITEMS[$i]}"
-        fi
+        echo "  $((i+1))) ${MENU_ITEMS[$i]}"
     done
     
+    echo "  0) Exit"
     echo ""
 }
 
-# Function to get user selection with arrow keys
+# Function to get user selection
 get_selection() {
-    local selected=0
-    local menu_size=${#MENU_ITEMS[@]}
-    
-    # Hide cursor
-    tput civis
-    
     while true; do
-        display_menu $selected
+        display_menu
         
-        # Read input - use -sN3 to capture escape sequences properly
-        # Arrow keys send 3 characters: ESC [ A/B/C/D
-        read -rsN1 input < /dev/tty
+        echo -n "Enter your choice [0-${#MENU_ITEMS[@]}]: "
+        read -r choice < /dev/tty
         
-        # Check if it's an escape sequence
-        if [[ $input == $'\x1b' ]]; then
-            # Read next 2 characters
-            read -rsN2 -t 0.1 input < /dev/tty
-            
-            case $input in
-                '[A') # Up arrow
-                    ((selected--))
-                    if [[ $selected -lt 0 ]]; then
-                        selected=$((menu_size - 1))
-                    fi
-                    ;;
-                '[B') # Down arrow
-                    ((selected++))
-                    if [[ $selected -ge $menu_size ]]; then
-                        selected=0
-                    fi
-                    ;;
-            esac
-        elif [[ $input == "" ]]; then
-            # Enter key
-            tput cnorm
-            return $selected
-        elif [[ $input == "q" ]] || [[ $input == "Q" ]]; then
-            # Quit
-            tput cnorm
-            show_header
-            echo "Exiting..."
+        # Validate input is a number
+        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+            echo "Invalid input. Please enter a number."
+            sleep 2
+            continue
+        fi
+        
+        # Check if exit
+        if [[ $choice -eq 0 ]]; then
             echo ""
+            echo "Exiting..."
             exit 0
+        fi
+        
+        # Check if valid menu option
+        if [[ $choice -ge 1 ]] && [[ $choice -le ${#MENU_ITEMS[@]} ]]; then
+            return $((choice - 1))
+        else
+            echo "Invalid choice. Please try again."
+            sleep 2
         fi
     done
 }
@@ -245,6 +217,86 @@ update_clikader() {
     read -rsn1 < /dev/tty
 }
 
+# Uninstall CLiKader function
+uninstall_clikader() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║      Uninstall CLiKader               ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # Check if installed
+    local install_path=""
+    if command -v clikader &> /dev/null; then
+        install_path=$(command -v clikader)
+        echo -e "${BLUE}→${NC} CLiKader is installed at: ${install_path}"
+    else
+        echo -e "${YELLOW}→${NC} CLiKader is not installed"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo ""
+    warning "This will remove CLiKader from your system"
+    echo ""
+    echo "The following will be removed:"
+    echo "  • $install_path"
+    if [[ -f "${install_path}.backup" ]]; then
+        echo "  • ${install_path}.backup"
+    fi
+    echo ""
+    echo -n "Are you sure you want to uninstall CLiKader? (y/N): "
+    read -r confirm < /dev/tty
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "Uninstall cancelled"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo ""
+    echo -e "${BLUE}→${NC} Uninstalling CLiKader..."
+    
+    # Remove main file
+    if rm -f "$install_path"; then
+        echo -e "${GREEN}✅${NC} Removed $install_path"
+    else
+        error "Failed to remove $install_path"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    # Remove backup if exists
+    if [[ -f "${install_path}.backup" ]]; then
+        rm -f "${install_path}.backup"
+        echo -e "${GREEN}✅${NC} Removed backup file"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   CLiKader uninstalled successfully!  ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo "CLiKader has been removed from your system."
+    echo ""
+    echo "To reinstall, run:"
+    echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
+    echo ""
+    echo -n "Press any key to exit..."
+    read -rsn1 < /dev/tty
+    
+    echo ""
+    echo "Goodbye!"
+    exit 0
+}
+
 # Function to download and execute script
 run_script() {
     local script_name="$1"
@@ -321,6 +373,8 @@ main() {
         # Handle special menu items
         if [[ "$selected_title" == "Update CLiKader" ]]; then
             update_clikader
+        elif [[ "$selected_title" == "Uninstall CLiKader" ]]; then
+            uninstall_clikader
         else
             local selected_script="${SCRIPTS[$selected_title]}"
             run_script "$selected_script" "$selected_title"

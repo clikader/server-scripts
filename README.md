@@ -30,11 +30,10 @@ sudo clikader
 ## 📜 Available Tools
 
 ### **clikader.sh** - Interactive Menu System
-Master entrypoint with arrow key navigation for all server management tasks.
+Master entrypoint with simple numbered menu for all server management tasks.
 
 **Features:**
-- Arrow key navigation (↑/↓)
-- Press Enter to select, Q to Quit
+- Simple numbered menu selection (1, 2, 3...)
 - Built-in update command with version checking
 - Automatically downloads component scripts from GitHub if not found locally
 - Color-coded interface
