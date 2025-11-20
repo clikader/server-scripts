@@ -70,67 +70,57 @@ display_menu() {
 # Function to get user selection with arrow keys
 get_selection() {
     local selected=0
-    local key=""
     local menu_size=${#MENU_ITEMS[@]}
     
     # Hide cursor
     tput civis
     
-    # Ensure we read from terminal, not stdin (important for curl | bash)
-    exec < /dev/tty
-    
     while true; do
         display_menu $selected
         
-        # Read single character from terminal
+        # Read a key from the terminal
+        # Use read with -d to read until a delimiter, but with timeout
+        local key
         IFS= read -rsn1 key < /dev/tty
         
-        case "$key" in
-            A) # Up arrow
-                ((selected--))
-                if [[ $selected -lt 0 ]]; then
-                    selected=$((menu_size - 1))
-                fi
-                ;;
-            B) # Down arrow
-                ((selected++))
-                if [[ $selected -ge $menu_size ]]; then
-                    selected=0
-                fi
-                ;;
-            '') # Enter key
-                # Show cursor
-                tput cnorm
-                return $selected
-                ;;
-            q|Q) # Quit
-                # Show cursor
-                tput cnorm
-                show_header
-                echo "Exiting..."
-                echo ""
-                exit 0
-                ;;
-            $'\x1b') # ESC sequence
-                IFS= read -rsn2 key < /dev/tty
-                case "$key" in
-                    '[A') # Up arrow
+        # Handle different key inputs
+        if [[ $key == $'\x1b' ]]; then
+            # This is an escape sequence (arrow keys, etc.)
+            # Read the next character
+            IFS= read -rsn1 -t 0.01 key2 < /dev/tty
+            if [[ $key2 == '[' ]]; then
+                # Read the third character
+                IFS= read -rsn1 -t 0.01 key3 < /dev/tty
+                case "$key3" in
+                    'A') # Up arrow
                         ((selected--))
                         if [[ $selected -lt 0 ]]; then
                             selected=$((menu_size - 1))
                         fi
                         ;;
-                    '[B') # Down arrow
+                    'B') # Down arrow
                         ((selected++))
                         if [[ $selected -ge $menu_size ]]; then
                             selected=0
                         fi
                         ;;
                 esac
-                ;;
-        esac
+            fi
+        elif [[ $key == '' ]]; then
+            # Enter key
+            tput cnorm
+            return $selected
+        elif [[ $key == 'q' ]] || [[ $key == 'Q' ]]; then
+            # Quit
+            tput cnorm
+            show_header
+            echo "Exiting..."
+            echo ""
+            exit 0
+        fi
     done
 }
+
 
 # Function to download and execute script
 run_script() {
