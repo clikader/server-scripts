@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.6"
+CLIKADER_VERSION="1.0.7"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -37,6 +37,23 @@ MENU_ITEMS=(
     "Update CLiKader"
     "Uninstall CLiKader"
 )
+
+# Logging functions
+log() {
+    echo -e "${GREEN}→${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
