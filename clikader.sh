@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.3"
+CLIKADER_VERSION="1.0.4"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -44,14 +44,19 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Function to show header
+show_header() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}"
+    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
 # Function to display menu
 display_menu() {
-    clear >&2
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}" >&2
-    echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}" >&2
-    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}" >&2
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}" >&2
-    echo "" >&2
+    show_header >&2
     
     for i in "${!MENU_ITEMS[@]}"; do
         echo "  $((i+1))) ${MENU_ITEMS[$i]}" >&2
