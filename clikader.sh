@@ -2,12 +2,11 @@
 
 # Clikader - Interactive Server Management Script
 # Master entrypoint for various server management tasks
-# Version: 1.0.0
 
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.7"
+CLIKADER_VERSION="1.0.8"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -318,6 +317,11 @@ uninstall_clikader() {
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
     echo ""
     echo "CLiKader has been removed from your system."
+    echo ""
+    info "To clear the command from your shell cache, run:"
+    echo -e "  ${BLUE}hash -d clikader${NC}"
+    echo ""
+    echo "Or simply start a new shell session."
     echo ""
     echo "To reinstall, run:"
     echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
