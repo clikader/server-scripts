@@ -2,8 +2,12 @@
 
 # Clikader - Interactive Server Management Script
 # Master entrypoint for various server management tasks
+# Version: 1.0.0
 
 set -euo pipefail
+
+# Version
+CLIKADER_VERSION="1.0.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -30,6 +34,7 @@ MENU_ITEMS=(
     "Setup DNS"
     "Fix Hostname"
     "Configure IPv6"
+    "Update CLiKader"
 )
 
 # Check if running as root
@@ -121,6 +126,129 @@ get_selection() {
     done
 }
 
+# Update CLiKader function
+update_clikader() {
+    clear
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║      Update CLiKader                  ║${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    echo -e "${BLUE}Current version:${NC} ${BOLD}${CLIKADER_VERSION}${NC}"
+    echo ""
+    
+    # Check if installed or running from local file
+    local install_path=""
+    if command -v clikader &> /dev/null; then
+        install_path=$(command -v clikader)
+        echo -e "${GREEN}→${NC} CLiKader is installed at: ${install_path}"
+    else
+        echo -e "${YELLOW}→${NC} CLiKader is not installed (running from local file)"
+        echo ""
+        echo "To install CLiKader system-wide, run:"
+        echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo ""
+    echo -e "${BLUE}→${NC} Checking for updates..."
+    
+    # Download latest version to temp file
+    local tmp_file="/tmp/clikader_latest.sh"
+    if ! curl -fsSL "${GITHUB_RAW_BASE%/components}/clikader.sh" -o "$tmp_file" 2>/dev/null; then
+        echo -e "${RED}❌ Failed to check for updates${NC}"
+        echo "Please check your internet connection"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    # Extract version from downloaded file
+    local remote_version=$(grep '^CLIKADER_VERSION=' "$tmp_file" | head -n1 | cut -d'"' -f2)
+    
+    if [[ -z "$remote_version" ]]; then
+        echo -e "${RED}❌ Could not determine remote version${NC}"
+        rm -f "$tmp_file"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo -e "${BLUE}Latest version:${NC} ${BOLD}${remote_version}${NC}"
+    echo ""
+    
+    # Compare versions
+    if [[ "$CLIKADER_VERSION" == "$remote_version" ]]; then
+        echo -e "${GREEN}✅ CLiKader is up to date!${NC}"
+        rm -f "$tmp_file"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    # Update available
+    echo -e "${YELLOW}→${NC} Update available: ${CLIKADER_VERSION} → ${remote_version}"
+    echo ""
+    echo -n "Do you want to update CLiKader? (y/N): "
+    read -r confirm < /dev/tty
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "Update cancelled"
+        rm -f "$tmp_file"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo ""
+    echo -e "${BLUE}→${NC} Installing update..."
+    
+    # Backup current version
+    cp "$install_path" "${install_path}.backup"
+    
+    # Install new version
+    if mv "$tmp_file" "$install_path" && chmod +x "$install_path"; then
+        echo -e "${GREEN}✅ CLiKader updated successfully!${NC}"
+        echo ""
+        echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║   Updated to version ${remote_version}           ║${NC}"
+        echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "Backup saved to: ${install_path}.backup"
+        echo ""
+        echo "Please restart CLiKader to use the new version"
+        echo ""
+        echo -n "Exit now? (Y/n): "
+        read -r exit_confirm < /dev/tty
+        
+        if [[ ! "$exit_confirm" =~ ^[Nn]$ ]]; then
+            echo ""
+            echo "Exiting... Please run 'sudo clikader' again"
+            exit 0
+        fi
+    else
+        echo -e "${RED}❌ Update failed${NC}"
+        echo "Restoring backup..."
+        mv "${install_path}.backup" "$install_path"
+        rm -f "$tmp_file"
+        echo ""
+        echo "Press any key to return to menu..."
+        read -rsn1 < /dev/tty
+        return
+    fi
+    
+    echo ""
+    echo "Press any key to return to menu..."
+    read -rsn1 < /dev/tty
+}
 
 # Function to download and execute script
 run_script() {
@@ -184,7 +312,7 @@ run_script() {
     
     echo ""
     echo "Press any key to return to menu..."
-    read -rsn1
+    read -rsn1 < /dev/tty
 }
 
 # Main menu loop
@@ -194,9 +322,14 @@ main() {
         local selected=$?
         
         local selected_title="${MENU_ITEMS[$selected]}"
-        local selected_script="${SCRIPTS[$selected_title]}"
         
-        run_script "$selected_script" "$selected_title"
+        # Handle special menu items
+        if [[ "$selected_title" == "Update CLiKader" ]]; then
+            update_clikader
+        else
+            local selected_script="${SCRIPTS[$selected_title]}"
+            run_script "$selected_script" "$selected_title"
+        fi
     done
 }
 

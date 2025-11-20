@@ -5,20 +5,25 @@ A collection of shell scripts for managing Debian and Ubuntu servers.
 ## 🚀 Quick Start
 
 ```bash
-# Download and run the interactive menu
-curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/clikader.sh | sudo bash
+# Install CLiKader
+curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash
+
+# Run from anywhere
+sudo clikader
 ```
 
-Or if you've cloned the repository:
+**That's it!** CLiKader is now installed and ready to use.
 
-```bash
-git clone https://github.com/clikader/server-scripts.git
-cd server-scripts
-chmod +x clikader.sh
-sudo bash clikader.sh
-```
+**Features:**
+- ✅ Simple installation with one command
+- ✅ Reliable stdin/input handling
+- ✅ Easy updates with built-in update command
+- ✅ Run from anywhere with `sudo clikader`
+- ✅ Version tracking
 
-**Note:** All component scripts are located in the `components/` folder and should be run through the interactive menu (`clikader.sh`).
+**Note:** All component scripts are downloaded automatically from GitHub when needed.
+
+---
 
 ---
 
@@ -30,6 +35,7 @@ Master entrypoint with arrow key navigation for all server management tasks.
 **Features:**
 - Arrow key navigation (↑/↓)
 - Press Enter to select, Q to Quit
+- Built-in update command with version checking
 - Automatically downloads component scripts from GitHub if not found locally
 - Color-coded interface
 
@@ -123,18 +129,35 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 
 ## 📥 Installation
 
-### Quick Install (One-liner)
+See [Quick Start](#-quick-start) above for installation instructions.
+
+**What the installer does:**
+1. Downloads `clikader` from GitHub
+2. Installs it to `/usr/local/bin/clikader`
+3. Makes it executable
+4. Verifies installation
+
+After installation, you can run `sudo clikader` from anywhere on your system.
+
+---
+
+## 🔄 Updating
+
+CLiKader has a built-in update feature with version checking.
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/clikader.sh | sudo bash
+# Run CLiKader
+sudo clikader
+
+# Select "Update CLiKader" from the menu
+# It will:
+#   - Check your current version
+#   - Check the latest version on GitHub
+#   - Offer to update if a new version is available
+#   - Create a backup before updating
 ```
 
-### Manual Install
-```bash
-git clone https://github.com/clikader/server-scripts.git
-cd server-scripts
-chmod +x clikader.sh
-sudo bash clikader.sh
-```
+**Automatic version detection** - only updates if a newer version is available.
 
 ---
 
