@@ -514,7 +514,7 @@ show_menu() {
     echo -e "${CYAN}${BOLD}║      IPv6 Configuration Tool          ║${NC}"
     echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
     
-    check_ipv6_status
+    check_ipv6_status || true
     
     echo ""
     echo "What would you like to do?"

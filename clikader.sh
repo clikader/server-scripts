@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.4"
+CLIKADER_VERSION="1.0.6"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -74,6 +74,16 @@ get_selection() {
         echo -n "Enter your choice [0-${#MENU_ITEMS[@]}]: " >&2
         read -r choice < /dev/tty
         
+        # Trim whitespace
+        choice=$(echo "$choice" | xargs)
+        
+        # Check for empty input
+        if [[ -z "$choice" ]]; then
+            echo "Invalid input. Please enter a number." >&2
+            sleep 2
+            continue
+        fi
+        
         # Validate input is a number
         if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
             echo "Invalid input. Please enter a number." >&2
@@ -82,7 +92,7 @@ get_selection() {
         fi
         
         # Check if exit
-        if [[ $choice -eq 0 ]]; then
+        if [[ "$choice" == "0" ]]; then
             echo "" >&2
             echo "Exiting..." >&2
             exit 0

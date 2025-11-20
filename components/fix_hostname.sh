@@ -55,7 +55,7 @@ check_hostname_resolution() {
         local resolved_ip=$(getent hosts "$current_hostname" | awk '{print $1}')
         log "✅ Hostname resolves to: $resolved_ip"
         
-        if [[ "$resolved_ip" == "127.0.0.1" ]] || [[ "$resolved_ip" == "127.0.1.1" ]]; then
+        if [[ "$resolved_ip" == "127.0.0.1" ]] || [[ "$resolved_ip" == "127.0.1.1" ]] || [[ "$resolved_ip" == "::1" ]]; then
             log "✅ Hostname correctly resolves to localhost"
             return 0
         else
@@ -255,7 +255,7 @@ show_menu() {
     echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
     echo ""
     
-    check_hostname_resolution
+    check_hostname_resolution || true
     
     echo ""
     echo "What would you like to do?"
