@@ -4,222 +4,155 @@ A collection of shell scripts for managing Debian and Ubuntu servers.
 
 ## 🚀 Quick Start
 
-### Using the Interactive Menu (Recommended)
-
 ```bash
-# Download and run the master script
+# Download and run the interactive menu
 curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/clikader.sh | sudo bash
 ```
 
 Or if you've cloned the repository:
 
 ```bash
+git clone https://github.com/clikader/server-scripts.git
+cd server-scripts
+chmod +x clikader.sh
 sudo bash clikader.sh
 ```
 
-### Running Individual Scripts
+**Note:** All component scripts are located in the `components/` folder and should be run through the interactive menu (`clikader.sh`).
 
-You can also run individual scripts directly:
+---
 
-```bash
-# Reset APT sources
-curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/reset_apt_source.sh | sudo bash
+## 📜 Available Tools
 
-# Setup DNS
-curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/setup_dns.sh | sudo bash
-```
-
-## 📜 Available Scripts
-
-### 1. **clikader.sh** - Interactive Menu System
+### **clikader.sh** - Interactive Menu System
 Master entrypoint with arrow key navigation for all server management tasks.
 
 **Features:**
 - Arrow key navigation (↑/↓)
-- Press Enter to select
-- Press Q to quit
-- Automatically downloads scripts from GitHub if not found locally
+- Press Enter to select, Q to Quit
+- Automatically downloads component scripts from GitHub if not found locally
 - Color-coded interface
-
-**Usage:**
-```bash
-sudo bash clikader.sh
-```
 
 ---
 
-### 2. **reset_apt_source.sh** - APT Source Reset
+## 🛠️ Component Scripts
+
+All component scripts are in the `components/` folder and accessed through `clikader.sh`.
+
+### 1. Reset APT Sources
 Resets APT sources to official repositories for Debian and Ubuntu systems.
 
 **Supported Systems:**
-- Debian 13 (Trixie)
-- Debian 12 (Bookworm)
-- Debian 11 (Bullseye)
-- Ubuntu 24.10 (Oracular Oriole)
-- Ubuntu 24.04 LTS (Noble Numbat)
-- Ubuntu 22.04 LTS (Jammy Jellyfish)
-- Ubuntu 20.04 LTS (Focal Fossa)
+- Debian 13 (Trixie), 12 (Bookworm), 11 (Bullseye)
+- Ubuntu 24.10, 24.04 LTS, 22.04 LTS, 20.04 LTS
 
 **Features:**
 - Automatic backup of existing sources
-- Resets to official mirrors
-- Cleans third-party sources
-- Updates APT cache
-- Verifies configuration
-
-**Usage:**
-```bash
-sudo bash reset_apt_source.sh
-```
-
-**What it does:**
-1. Creates timestamped backup in `/etc/apt/sources.list.backup_YYYYMMDD_HHMMSS/`
-2. Generates appropriate sources for your OS version
-3. Removes third-party sources from `/etc/apt/sources.list.d/`
-4. Updates APT cache
-5. Verifies the new configuration
+- Supports both traditional `.list` and modern DEB822 `.sources` formats
+- Cleans all third-party sources (`.list`, `.sources`, `.gpg`, backups)
+- Updates and verifies APT cache
 
 ---
 
-### 3. **setup_dns.sh** - DNS Configuration
+### 2. Setup DNS
 Configures DNS with DNS-over-TLS support using systemd-resolved.
 
-**Supported DNS Providers:**
-1. Cloudflare
-2. Google
-3. Quad9
-4. OpenDNS
-5. AdGuard
-6. CleanBrowsing
-7. Custom DNS (define your own)
+**DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Custom
 
 **Features:**
-- DNS-over-TLS (DoT) support
-- DNSSEC validation
-- IPv6 support (optional with `-6` flag)
-- Multiple DNS providers
+- DNS-over-TLS (DoT) and DNSSEC validation
+- IPv6 support (optional)
+- Multiple DNS providers with fallback
 - Automatic conflict resolution
-- Health checks
 
-**Usage:**
-```bash
-# IPv4 only
-sudo bash setup_dns.sh
+---
 
-# With IPv6 support
-sudo bash setup_dns.sh -6
+### 3. Fix Hostname
+Fixes hostname resolution issues and allows changing the system hostname.
+
+**Common VPS Issue:**
+```
+sudo: unable to resolve host your-hostname
 ```
 
-**Interactive Options:**
-- Select multiple DNS providers
-- First selection becomes primary
-- Others become fallbacks
-- Custom DNS configuration support
+**Features:**
+- Detects hostname resolution issues
+- Fix hostname resolution (add to `/etc/hosts`)
+- Change system hostname with RFC 1123 validation
+- Automatic backup of `/etc/hosts`
+
+---
+
+### 4. Configure IPv6
+Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addresses.
+
+**Features:**
+- Check current IPv6 status
+- Enable/disable IPv6 system-wide
+- **Configure IPv6 address manually** (for VPS providers that require it)
+- **Safety check**: Detects existing IPv6 configuration before changes
+- **Add multiple addresses**: Support for adding additional addresses from allocated prefix
+- Persistent configuration across reboots
+- Automatic verification and connectivity testing
+
+**What it does:**
+- **Enable:** Removes disable configuration, enables IPv6 on all interfaces, tests connectivity
+- **Disable:** Creates `/etc/sysctl.d/99-disable-ipv6.conf` with persistent disable settings
+- **Configure Address:** 
+  - Checks for existing IPv6 addresses and warns user
+  - Allows adding addresses from your allocated prefix (e.g., `2001:db8::/48`)
+  - Supports CIDR notation like `2001:db8::1/64`
+  - Keeps existing addresses (adds, doesn't replace)
+
+**Supports multiple network configuration systems:**
+- `/etc/network/interfaces` (Debian/Ubuntu)
+- Netplan (Ubuntu 18.04+)
+- NetworkManager
+- Manual configuration
+
+
+---
 
 ## 🔧 Requirements
 
 - **OS**: Debian 11/12/13 or Ubuntu 20.04/22.04/24.04/24.10
 - **Privileges**: Root access (sudo)
-- **Network**: Internet connection (for downloading scripts)
+- **Network**: Internet connection (for downloading scripts from GitHub)
+
+---
 
 ## 📥 Installation
 
-### Clone the Repository
+### Quick Install (One-liner)
+```bash
+curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/clikader.sh | sudo bash
+```
+
+### Manual Install
 ```bash
 git clone https://github.com/clikader/server-scripts.git
 cd server-scripts
-chmod +x *.sh
-```
-
-### Or Download Individual Scripts
-```bash
-# Download clikader.sh
-curl -O https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/clikader.sh
 chmod +x clikader.sh
-
-# Download reset_apt_source.sh
-curl -O https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/reset_apt_source.sh
-chmod +x reset_apt_source.sh
-
-# Download setup_dns.sh
-curl -O https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/setup_dns.sh
-chmod +x setup_dns.sh
+sudo bash clikader.sh
 ```
 
-## 🛡️ Safety Features
+---
 
-### APT Source Reset
-- **Automatic Backups**: All existing sources are backed up before changes
-- **Backup Location**: `/etc/apt/sources.list.backup_YYYYMMDD_HHMMSS/`
-- **Official Sources Only**: Uses only official Debian/Ubuntu mirrors
-- **Verification**: Validates configuration after changes
+##🛡️ Safety Features
 
-### DNS Setup
-- **Health Checks**: Verifies DNS configuration before making changes
-- **Conflict Resolution**: Automatically resolves common DNS conflicts
-- **Service Validation**: Ensures systemd-resolved is working correctly
-- **Rollback Support**: Can revert to previous configuration if needed
+**All scripts include:**
+- Automatic backups before changes
+- Configuration validation
+- Clear status reporting
+- Error handling
 
-## 💡 Examples
+**Specific safeguards:**
+- **APT Reset**: Timestamped backups in `/etc/apt/sources.list.backup_*/`
+- **DNS Setup**: Health checks before modifications
+- **Hostname**: Validates hostname format (RFC 1123)
+- **IPv6**: Confirmation prompt before disabling
 
-### Example 1: Reset APT Sources
-```bash
-$ sudo bash reset_apt_source.sh
-
-==========================================
-  APT Source Reset Script
-==========================================
-
---> Detected: ubuntu 24.04 (noble)
---> Creating backup of existing APT sources...
-✅ Backed up /etc/apt/sources.list to /etc/apt/sources.list.backup_20251120_141209/
-
---> Resetting APT sources for Ubuntu 24.04...
-✅ Generated Ubuntu 24.04 LTS (Noble Numbat) sources
---> Cleaning /etc/apt/sources.list.d/ directory...
-✅ Removed 5 third-party source file(s)
-
---> Updating APT cache...
-✅ APT cache updated successfully
-```
-
-### Example 2: Interactive Menu
-```bash
-$ sudo bash clikader.sh
-
-╔════════════════════════════════════════╗
-║      CLIKADER - Server Manager        ║
-╔════════════════════════════════════════╗
-
-Use ↑/↓ arrow keys to navigate, Enter to select, Q to quit
-
-  ▶ Reset APT Sources
-    Setup DNS
-```
-
-### Example 3: Setup DNS with Custom Provider
-```bash
-$ sudo bash setup_dns.sh
-
-==========================================
-  Select DNS Providers (DNS-over-TLS)
-==========================================
-
-Available DNS providers:
-  1) Cloudflare (1.1.1.1, 1.0.0.1) - DoT: cloudflare-dns.com
-  2) Google (8.8.8.8, 8.8.4.4) - DoT: dns.google
-  ...
-  7) Custom DNS (define your own)
-
-Selection: 7
-
-IPv4 DNS servers: 192.168.1.1 1.1.1.1
-DNS-over-TLS hostname: dns.example.com
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+---
 
 ## 📝 License
 
@@ -231,7 +164,3 @@ These scripts modify system configuration. While they include safety features li
 - Test in a non-production environment first
 - Ensure you have backups of critical data
 - Review the scripts before running them
-
-## 📞 Support
-
-For issues or questions, please open an issue on GitHub.

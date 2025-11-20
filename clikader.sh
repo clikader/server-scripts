@@ -15,17 +15,21 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # GitHub raw URL base
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/components"
 
 # Script definitions
 declare -A SCRIPTS
 SCRIPTS["Reset APT Sources"]="reset_apt_source.sh"
 SCRIPTS["Setup DNS"]="setup_dns.sh"
+SCRIPTS["Fix Hostname"]="fix_hostname.sh"
+SCRIPTS["Configure IPv6"]="configure_ipv6.sh"
 
 # Order of menu items
 MENU_ITEMS=(
     "Reset APT Sources"
     "Setup DNS"
+    "Fix Hostname"
+    "Configure IPv6"
 )
 
 # Check if running as root
@@ -135,8 +139,9 @@ run_script() {
     echo -e "${BLUE}Selected:${NC} ${BOLD}${script_title}${NC}"
     echo ""
     
-    # Check if script exists locally first
-    local local_script="$(dirname "$(readlink -f "$0")")/${script_name}"
+    # Check if script exists locally first (in components folder)
+    local script_dir="$(dirname "$(readlink -f "$0")")"
+    local local_script="${script_dir}/components/${script_name}"
     
     if [[ -f "$local_script" ]]; then
         echo -e "${GREEN}→${NC} Found local script: ${local_script}"
