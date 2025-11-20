@@ -83,39 +83,34 @@ get_selection() {
     while true; do
         display_menu $selected
         
-        # Read a key from the terminal
-        # Use read with -d to read until a delimiter, but with timeout
-        local key
-        IFS= read -rsn1 key < /dev/tty
+        # Read input - use -sN3 to capture escape sequences properly
+        # Arrow keys send 3 characters: ESC [ A/B/C/D
+        read -rsN1 input < /dev/tty
         
-        # Handle different key inputs
-        if [[ $key == $'\x1b' ]]; then
-            # This is an escape sequence (arrow keys, etc.)
-            # Read the next character
-            IFS= read -rsn1 -t 0.01 key2 < /dev/tty
-            if [[ $key2 == '[' ]]; then
-                # Read the third character
-                IFS= read -rsn1 -t 0.01 key3 < /dev/tty
-                case "$key3" in
-                    'A') # Up arrow
-                        ((selected--))
-                        if [[ $selected -lt 0 ]]; then
-                            selected=$((menu_size - 1))
-                        fi
-                        ;;
-                    'B') # Down arrow
-                        ((selected++))
-                        if [[ $selected -ge $menu_size ]]; then
-                            selected=0
-                        fi
-                        ;;
-                esac
-            fi
-        elif [[ $key == '' ]]; then
+        # Check if it's an escape sequence
+        if [[ $input == $'\x1b' ]]; then
+            # Read next 2 characters
+            read -rsN2 -t 0.1 input < /dev/tty
+            
+            case $input in
+                '[A') # Up arrow
+                    ((selected--))
+                    if [[ $selected -lt 0 ]]; then
+                        selected=$((menu_size - 1))
+                    fi
+                    ;;
+                '[B') # Down arrow
+                    ((selected++))
+                    if [[ $selected -ge $menu_size ]]; then
+                        selected=0
+                    fi
+                    ;;
+            esac
+        elif [[ $input == "" ]]; then
             # Enter key
             tput cnorm
             return $selected
-        elif [[ $key == 'q' ]] || [[ $key == 'Q' ]]; then
+        elif [[ $input == "q" ]] || [[ $input == "Q" ]]; then
             # Quit
             tput cnorm
             show_header
