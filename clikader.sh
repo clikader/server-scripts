@@ -108,7 +108,7 @@ get_selection() {
         fi
         
         # Check if exit
-        if [[ "$choice" == "0" ]]; then
+        if [[ $choice -eq 0 ]]; then
             echo "" >&2
             echo "Exiting..." >&2
             exit 0
