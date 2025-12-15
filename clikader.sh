@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.9"
+CLIKADER_VERSION="1.0.10"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -65,7 +65,7 @@ show_header() {
     clear
     echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}"
-    echo -e "${CYAN}${BOLD}║             v${CLIKADER_VERSION}                      ║${NC}"
+    echo -e "${CYAN}${BOLD}║            v${CLIKADER_VERSION}                     ║${NC}"
     echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -115,7 +115,7 @@ get_selection() {
         fi
         
         # Check if valid menu option
-        if [[ $choice -ge 1 ]] && [[ $choice -le ${#MENU_ITEMS[@]} ]]; then
+        if (( choice >= 1 && choice <= ${#MENU_ITEMS[@]} )); then
             echo $((choice - 1))
             return 0
         else

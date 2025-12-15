@@ -17,6 +17,7 @@ primary_dns=""
 fallback_dns=""
 selected_names=()
 ipv6_support=false
+has_dot_support=true
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -126,7 +127,7 @@ get_custom_dns() {
     # Build the DNS configuration
     local dns_config_ipv4=""
     local dns_config_ipv6=""
-    
+
     for ip in $custom_ipv4; do
         if [[ -n "$custom_dot" ]]; then
             dns_config_ipv4+="$ip#$custom_dot "
@@ -134,7 +135,7 @@ get_custom_dns() {
             dns_config_ipv4+="$ip "
         fi
     done
-    
+
     for ip in $custom_ipv6; do
         if [[ -n "$custom_dot" ]]; then
             dns_config_ipv6+="$ip#$custom_dot "
@@ -142,12 +143,20 @@ get_custom_dns() {
             dns_config_ipv6+="$ip "
         fi
     done
-    
+
+    # Set global flag for DoT support
+    if [[ -z "$custom_dot" ]]; then
+        has_dot_support=false
+        log "Custom DNS configured without DNS-over-TLS support"
+    else
+        has_dot_support=true
+    fi
+
     # Return the configuration via global variables
     dns_ipv4[7]="$dns_config_ipv4"
     dns_ipv6[7]="$dns_config_ipv6"
     dns_names[7]="Custom"
-    
+
     log "Custom DNS configured successfully"
     echo ""
     return 0
@@ -260,12 +269,17 @@ select_dns_providers() {
 }
 
 generate_resolved_config() {
+    local dot_setting="opportunistic"
+    if [[ "$has_dot_support" == false ]]; then
+        dot_setting="no"
+    fi
+
     SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=$primary_dns
 FallbackDNS=$fallback_dns
 Domains=~.
 DNSSEC=yes
-DNSOverTLS=opportunistic
+DNSOverTLS=$dot_setting
 Cache=yes
 CacheFromLocalhost=no
 DNSStubListener=yes
@@ -452,12 +466,20 @@ main() {
     echo ""
     echo "Your system is now using:"
     for name in "${selected_names[@]}"; do
-        echo "  • $name DNS (DNS-over-TLS)"
+        if [[ "$has_dot_support" == true ]]; then
+            echo "  • $name DNS (DNS-over-TLS)"
+        else
+            echo "  • $name DNS"
+        fi
     done
     echo ""
     echo "Security features enabled:"
     echo "  • DNSSEC: Yes"
-    echo "  • DNS-over-TLS: Opportunistic"
+    if [[ "$has_dot_support" == true ]]; then
+        echo "  • DNS-over-TLS: Opportunistic"
+    else
+        echo "  • DNS-over-TLS: Disabled (custom DNS without DoT support)"
+    fi
     if [[ "$ipv6_support" == true ]]; then
         echo "  • IPv6 support: Enabled"
     else
