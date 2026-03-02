@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Hostname Fix Script - Fixes hostname resolution and allows hostname changes
 # Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04/24.10

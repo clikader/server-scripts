@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # DNS Setup Script - Purifies and hardens DNS configuration with DNS-over-TLS
 # Primarily supports: Debian 12/13, Ubuntu 22.04/24.04

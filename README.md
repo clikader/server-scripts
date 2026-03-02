@@ -8,35 +8,41 @@ A collection of shell scripts for managing Debian and Ubuntu servers.
 # Install CLiKader
 curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash
 
-# Run from anywhere
-sudo clikader
+# Show available tools
+clikader --help
 ```
 
 **That's it!** CLiKader is now installed and ready to use.
 
 **Features:**
 - ✅ Simple installation with one command
-- ✅ Reliable stdin/input handling
+- ✅ Direct sub-command usage (`clikader dns`, `clikader hostname`, etc.)
 - ✅ Easy updates with built-in update command
-- ✅ Run from anywhere with `sudo clikader`
+- ✅ Run from anywhere with `clikader`
 - ✅ Version tracking
 
 **Note:** All component scripts are downloaded automatically from GitHub when needed.
 
 ---
 
----
-
 ## 📜 Available Tools
 
-### **clikader.sh** - Interactive Menu System
-Master entrypoint with simple numbered menu for all server management tasks.
+### **clikader.sh** - Sub-command Entry Point
+Master entrypoint with direct sub-commands for all server management tasks.
 
 **Features:**
-- Simple numbered menu selection (1, 2, 3...)
+- Direct command execution with aliases
 - Built-in update command with version checking
 - Automatically downloads component scripts from GitHub if not found locally
 - Color-coded interface
+
+**Commands:**
+- `clikader --help` / `clikader help` / `clikader`
+- `clikader update` / `clikader upgrade`
+- `clikader dns`
+- `clikader apt-reset` / `clikader aptreset`
+- `clikader hostname`
+- `clikader ipv6` / `clikader 6`
 
 ---
 
@@ -57,6 +63,13 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 - Cleans all third-party sources (`.list`, `.sources`, `.gpg`, backups)
 - Updates and verifies APT cache
 
+**Files modified by this script:**
+- `/etc/apt/sources.list`
+- `/etc/apt/sources.list.d/ubuntu.sources` (Ubuntu 24.04/24.10 DEB822 mode)
+- `/etc/apt/sources.list.d/*` (removes third-party `*.list`, `*.sources`, `*.list.save`, `*.distUpgrade`, `*.gpg`)
+- `/etc/apt/sources.list.save` (removed when present)
+- `/etc/apt/sources.list.backup_<timestamp>/` (created for backups)
+
 ---
 
 ### 2. Setup DNS
@@ -69,6 +82,12 @@ Configures DNS with DNS-over-TLS support using systemd-resolved.
 - IPv6 support (optional)
 - Multiple DNS providers with fallback
 - Automatic conflict resolution
+
+**Files modified by this script:**
+- `/etc/systemd/resolved.conf`
+- `/etc/resolv.conf` (re-created as symlink to systemd-resolved stub)
+- `/etc/dhcp/dhclient.conf`
+- `/etc/network/if-up.d/resolved` (removes execute permission when present)
 
 ---
 
@@ -86,6 +105,11 @@ sudo: unable to resolve host your-hostname
 - Change system hostname with RFC 1123 validation
 - Automatic backup of `/etc/hosts`
 
+**Files modified by this script:**
+- System hostname configuration (via `hostnamectl`; fallback writes `/etc/hostname`)
+- `/etc/hosts`
+- `/etc/hosts.backup_<timestamp>` (created before changes)
+
 ---
 
 ### 4. Configure IPv6
@@ -99,6 +123,12 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 - **Add multiple addresses**: Support for adding additional addresses from allocated prefix
 - Persistent configuration across reboots
 - Automatic verification and connectivity testing
+
+**Files modified by this script:**
+- `/etc/sysctl.d/99-disable-ipv6.conf` (created/removed depending on enable/disable action)
+- `/etc/sysctl.conf` (removes `disable_ipv6` lines during enable action)
+- `/etc/network/interfaces` (only when interface-based persistent config is selected)
+- `/etc/network/interfaces.backup_<timestamp>` (created before editing `/etc/network/interfaces`)
 
 **What it does:**
 - **Enable:** Removes disable configuration, enables IPv6 on all interfaces, tests connectivity
@@ -123,6 +153,7 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 - **OS**: Debian 11/12/13 or Ubuntu 20.04/22.04/24.04/24.10
 - **Privileges**: Root access (sudo)
 - **Network**: Internet connection (for downloading scripts from GitHub)
+- **Shell runtime**: `bash` (scripts can be launched from `bash`, `zsh`, or `fish` as long as Bash is installed)
 
 ---
 
@@ -136,7 +167,7 @@ See [Quick Start](#-quick-start) above for installation instructions.
 3. Makes it executable
 4. Verifies installation
 
-After installation, you can run `sudo clikader` from anywhere on your system.
+After installation, you can run `clikader` from anywhere on your system.
 
 ---
 
@@ -145,10 +176,9 @@ After installation, you can run `sudo clikader` from anywhere on your system.
 CLiKader has a built-in update feature with version checking.
 
 ```bash
-# Run CLiKader
-sudo clikader
+# Run update command directly
+sudo clikader update
 
-# Select "Update CLiKader" from the menu
 # It will:
 #   - Check your current version
 #   - Check the latest version on GitHub
@@ -178,7 +208,7 @@ sudo clikader
 
 ## 📝 License
 
-MIT License - feel free to use these scripts for your own purposes.
+Apache License 2.0. See [LICENSE](./LICENSE) for full terms.
 
 ## ⚠️ Disclaimer
 

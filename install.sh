@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Clikader Installer - Installs clikader as a system command
 
@@ -71,7 +71,7 @@ if command -v clikader &> /dev/null; then
         echo ""
     fi
     echo "You can now run clikader from anywhere:"
-    echo -e "  ${BLUE}sudo clikader${NC}"
+    echo -e "  ${BLUE}clikader --help${NC}"
     echo ""
 else
     echo -e "${YELLOW}⚠${NC} Installation completed but 'clikader' command not found in PATH"

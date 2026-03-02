@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # IPv6 Configuration Script - Enable or disable IPv6 on Debian/Ubuntu systems
 # Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04/24.10

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # APT Source Reset Script - Resets APT sources to official mirrors
 # Supports: Debian 12/13, Ubuntu 22.04/24.04/24.10

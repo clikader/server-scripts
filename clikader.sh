@@ -1,12 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Clikader - Interactive Server Management Script
-# Master entrypoint for various server management tasks
+# Clikader - Server Management Toolkit
+# Master entrypoint for server management tasks via sub-commands.
 
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.0.10"
+CLIKADER_VERSION="1.1.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -20,26 +20,16 @@ NC='\033[0m' # No Color
 # GitHub raw URL base
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/components"
 
-# Script definitions
-declare -A SCRIPTS
-SCRIPTS["Reset APT Sources"]="reset_apt_source.sh"
-SCRIPTS["Setup DNS"]="setup_dns.sh"
-SCRIPTS["Fix Hostname"]="fix_hostname.sh"
-SCRIPTS["Configure IPv6"]="configure_ipv6.sh"
-
-# Order of menu items
-MENU_ITEMS=(
-    "Reset APT Sources"
-    "Setup DNS"
-    "Fix Hostname"
-    "Configure IPv6"
-    "Update CLiKader"
-    "Uninstall CLiKader"
-)
+# Script directory (works in bash and zsh)
+SCRIPT_PATH="$0"
+if [[ -n "${BASH_SOURCE:-}" ]]; then
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Logging functions
 log() {
-    echo -e "${GREEN}→${NC} $1"
+    echo -e "${GREEN}->${NC} $1"
 }
 
 error() {
@@ -54,367 +44,271 @@ info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}[ERROR]${NC} This script must be run as root" >&2
-    exit 1
-fi
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This command must be run as root"
+        echo "Please run with sudo, for example: sudo clikader $*"
+        exit 1
+    fi
+}
 
-# Function to show header
-show_header() {
-    clear
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║      CLIKADER - Server Manager        ║${NC}"
-    echo -e "${CYAN}${BOLD}║            v${CLIKADER_VERSION}                     ║${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+show_usage() {
+    echo -e "${CYAN}${BOLD}CLiKader v${CLIKADER_VERSION}${NC}"
     echo ""
+    echo "Usage:"
+    echo "  clikader [command]"
+    echo ""
+    echo "Commands:"
+    echo "  --help, -h, help            Show this help message"
+    echo "  update, upgrade             Update CLiKader"
+    echo "  dns                         Run DNS setup tool"
+    echo "  apt-reset, aptreset         Run APT source reset tool"
+    echo "  hostname                    Run hostname fix tool"
+    echo "  ipv6, 6                     Run IPv6 configuration tool"
+    echo "  uninstall, remove           Uninstall CLiKader"
+    echo "  --version, -v, version      Show CLiKader version"
+    echo ""
+    echo "Aliases:"
+    echo "  clikader                    Alias of 'clikader --help'"
+    echo "  clikader help               Alias of 'clikader --help'"
+    echo ""
+    echo "Examples:"
+    echo "  clikader --help"
+    echo "  clikader help"
+    echo "  sudo clikader update"
+    echo "  sudo clikader dns"
+    echo "  sudo clikader apt-reset"
+    echo "  sudo clikader aptreset"
+    echo "  sudo clikader hostname"
+    echo "  sudo clikader ipv6"
+    echo "  sudo clikader 6"
 }
 
-# Function to display menu
-display_menu() {
-    show_header >&2
-    
-    for i in "${!MENU_ITEMS[@]}"; do
-        echo "  $((i+1))) ${MENU_ITEMS[$i]}" >&2
-    done
-    
-    echo "  0) Exit" >&2
-    echo "" >&2
-}
+run_script() {
+    local script_name="$1"
+    local script_title="$2"
+    shift 2 || true
 
-# Function to get user selection
-get_selection() {
-    while true; do
-        display_menu
-        
-        echo -n "Enter your choice [0-${#MENU_ITEMS[@]}]: " >&2
-        read -r choice < /dev/tty
-        
-        # Trim whitespace
-        choice=$(echo "$choice" | xargs)
-        
-        # Check for empty input
-        if [[ -z "$choice" ]]; then
-            echo "Invalid input. Please enter a number." >&2
-            sleep 2
-            continue
-        fi
-        
-        # Validate input is a number
-        if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo "Invalid input. Please enter a number." >&2
-            sleep 2
-            continue
-        fi
-        
-        # Check if exit
-        if [[ $choice -eq 0 ]]; then
-            echo "" >&2
-            echo "Exiting..." >&2
-            exit 0
-        fi
-        
-        # Check if valid menu option
-        if (( choice >= 1 && choice <= ${#MENU_ITEMS[@]} )); then
-            echo $((choice - 1))
-            return 0
+    local local_script="${SCRIPT_DIR}/components/${script_name}"
+    local tmp_script="/tmp/${script_name}.clikader.$$"
+    local script_to_run=""
+    local downloaded=0
+
+    echo -e "${BLUE}Selected:${NC} ${BOLD}${script_title}${NC}"
+    echo ""
+
+    if [[ -f "$local_script" ]]; then
+        log "Found local script: ${local_script}"
+        script_to_run="$local_script"
+    else
+        warning "Local script not found, downloading from GitHub..."
+        info "URL: ${GITHUB_RAW_BASE}/${script_name}"
+        echo ""
+
+        if curl -fsSL "${GITHUB_RAW_BASE}/${script_name}" -o "$tmp_script"; then
+            log "Downloaded successfully"
+            script_to_run="$tmp_script"
+            downloaded=1
         else
-            echo "Invalid choice. Please try again." >&2
-            sleep 2
+            error "Failed to download script from GitHub"
+            warning "Please check your internet connection and try again"
+            return 1
         fi
-    done
+    fi
+
+    chmod +x "$script_to_run"
+    echo ""
+
+    if bash "$script_to_run" "$@"; then
+        echo ""
+        echo -e "${GREEN}Script completed successfully${NC}"
+    else
+        local exit_code=$?
+        echo ""
+        error "Script encountered an error (exit code: ${exit_code})"
+        if (( downloaded )); then
+            rm -f "$tmp_script"
+        fi
+        return "$exit_code"
+    fi
+
+    if (( downloaded )); then
+        rm -f "$tmp_script"
+    fi
 }
 
-# Update CLiKader function
 update_clikader() {
-    clear
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║      Update CLiKader                  ║${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}${BOLD}Update CLiKader${NC}"
     echo ""
-    
     echo -e "${BLUE}Current version:${NC} ${BOLD}${CLIKADER_VERSION}${NC}"
     echo ""
-    
-    # Check if installed or running from local file
+
     local install_path=""
-    if command -v clikader &> /dev/null; then
-        install_path=$(command -v clikader)
-        echo -e "${GREEN}→${NC} CLiKader is installed at: ${install_path}"
+    if command -v clikader &>/dev/null; then
+        install_path="$(command -v clikader)"
+        log "CLiKader is installed at: ${install_path}"
     else
-        echo -e "${YELLOW}→${NC} CLiKader is not installed (running from local file)"
+        warning "CLiKader is not installed system-wide (running from local file)"
         echo ""
         echo "To install CLiKader system-wide, run:"
         echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 1
     fi
-    
+
     echo ""
-    echo -e "${BLUE}→${NC} Checking for updates..."
-    
-    # Download latest version to temp file
+    info "Checking for updates..."
+
     local tmp_file="/tmp/clikader_latest.sh"
     if ! curl -fsSL "${GITHUB_RAW_BASE%/components}/clikader.sh" -o "$tmp_file" 2>/dev/null; then
-        echo -e "${RED}❌ Failed to check for updates${NC}"
+        error "Failed to check for updates"
         echo "Please check your internet connection"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 1
     fi
-    
-    # Extract version from downloaded file
-    local remote_version=$(grep '^CLIKADER_VERSION=' "$tmp_file" | head -n1 | cut -d'"' -f2)
-    
+
+    local remote_version
+    remote_version="$(grep '^CLIKADER_VERSION=' "$tmp_file" | head -n1 | cut -d'"' -f2)"
+
     if [[ -z "$remote_version" ]]; then
-        echo -e "${RED}❌ Could not determine remote version${NC}"
+        error "Could not determine remote version"
         rm -f "$tmp_file"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 1
     fi
-    
+
     echo -e "${BLUE}Latest version:${NC} ${BOLD}${remote_version}${NC}"
     echo ""
-    
-    # Compare versions
+
     if [[ "$CLIKADER_VERSION" == "$remote_version" ]]; then
-        echo -e "${GREEN}✅ CLiKader is up to date!${NC}"
+        echo -e "${GREEN}CLiKader is up to date${NC}"
         rm -f "$tmp_file"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 0
     fi
-    
-    # Update available
-    echo -e "${YELLOW}→${NC} Update available: ${CLIKADER_VERSION} → ${remote_version}"
+
+    echo -e "${YELLOW}Update available:${NC} ${CLIKADER_VERSION} -> ${remote_version}"
     echo ""
-    echo -n "Do you want to update CLiKader? (y/N): "
-    read -r confirm < /dev/tty
-    
+    read -r -p "Do you want to update CLiKader? (y/N): " confirm
+
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo ""
         echo "Update cancelled"
         rm -f "$tmp_file"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 0
     fi
-    
+
     echo ""
-    echo -e "${BLUE}→${NC} Installing update..."
-    
-    # Backup current version
+    info "Installing update..."
+
     cp "$install_path" "${install_path}.backup"
-    
-    # Install new version
+
     if mv "$tmp_file" "$install_path" && chmod +x "$install_path"; then
-        echo -e "${GREEN}✅ CLiKader updated successfully!${NC}"
-        echo ""
-        echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║   Updated to version ${remote_version}           ║${NC}"
-        echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
-        echo ""
+        echo -e "${GREEN}CLiKader updated successfully${NC}"
+        echo "Updated to version: ${remote_version}"
         echo "Backup saved to: ${install_path}.backup"
-        echo ""
-        echo "Please restart CLiKader to use the new version"
-        echo ""
-        echo -n "Exit now? (Y/n): "
-        read -r exit_confirm < /dev/tty
-        
-        if [[ ! "$exit_confirm" =~ ^[Nn]$ ]]; then
-            echo ""
-            echo "Exiting... Please run 'sudo clikader' again"
-            exit 0
-        fi
+        echo "Run 'clikader --version' to verify."
     else
-        echo -e "${RED}❌ Update failed${NC}"
+        error "Update failed"
         echo "Restoring backup..."
         mv "${install_path}.backup" "$install_path"
         rm -f "$tmp_file"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 1
     fi
-    
-    echo ""
-    echo "Press any key to return to menu..."
-    read -rsn1 < /dev/tty
 }
 
-# Uninstall CLiKader function
 uninstall_clikader() {
-    clear
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║      Uninstall CLiKader               ║${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}${BOLD}Uninstall CLiKader${NC}"
     echo ""
-    
-    # Check if installed
+
     local install_path=""
-    if command -v clikader &> /dev/null; then
-        install_path=$(command -v clikader)
-        echo -e "${BLUE}→${NC} CLiKader is installed at: ${install_path}"
+    if command -v clikader &>/dev/null; then
+        install_path="$(command -v clikader)"
+        info "CLiKader is installed at: ${install_path}"
     else
-        echo -e "${YELLOW}→${NC} CLiKader is not installed"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        warning "CLiKader is not installed"
+        return 1
     fi
-    
+
     echo ""
     warning "This will remove CLiKader from your system"
     echo ""
     echo "The following will be removed:"
-    echo "  • $install_path"
+    echo "  - ${install_path}"
     if [[ -f "${install_path}.backup" ]]; then
-        echo "  • ${install_path}.backup"
+        echo "  - ${install_path}.backup"
     fi
     echo ""
-    echo -n "Are you sure you want to uninstall CLiKader? (y/N): "
-    read -r confirm < /dev/tty
-    
+    read -r -p "Are you sure you want to uninstall CLiKader? (y/N): " confirm
+
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo ""
         echo "Uninstall cancelled"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        return 0
     fi
-    
+
     echo ""
-    echo -e "${BLUE}→${NC} Uninstalling CLiKader..."
-    
-    # Remove main file
+    info "Uninstalling CLiKader..."
+
     if rm -f "$install_path"; then
-        echo -e "${GREEN}✅${NC} Removed $install_path"
+        log "Removed ${install_path}"
     else
-        error "Failed to remove $install_path"
-        echo ""
-        echo "Press any key to return to menu..."
-        read -rsn1 < /dev/tty
-        return
+        error "Failed to remove ${install_path}"
+        return 1
     fi
-    
-    # Remove backup if exists
+
     if [[ -f "${install_path}.backup" ]]; then
         rm -f "${install_path}.backup"
-        echo -e "${GREEN}✅${NC} Removed backup file"
+        log "Removed backup file"
     fi
-    
+
     echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   CLiKader uninstalled successfully!  ║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
-    echo ""
-    echo "CLiKader has been removed from your system."
-    echo ""
-    info "To clear the command from your shell cache, run:"
+    echo -e "${GREEN}CLiKader uninstalled successfully${NC}"
+    echo "To clear the command from your shell cache, run:"
     echo -e "  ${BLUE}hash -d clikader${NC}"
-    echo ""
     echo "Or simply start a new shell session."
-    echo ""
-    echo "To reinstall, run:"
-    echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
-    echo ""
-    echo -n "Press any key to exit..."
-    read -rsn1 < /dev/tty
-    
-    echo ""
-    echo "Goodbye!"
-    exit 0
 }
 
-# Function to download and execute script
-run_script() {
-    local script_name="$1"
-    local script_title="$2"
-    local tmp_script="/tmp/${script_name}"
-    
-    show_header
-    echo -e "${BLUE}Selected:${NC} ${BOLD}${script_title}${NC}"
-    echo ""
-    
-    # Check if script exists locally first (in components folder)
-    local script_dir="$(dirname "$(readlink -f "$0")")"
-    local local_script="${script_dir}/components/${script_name}"
-    
-    if [[ -f "$local_script" ]]; then
-        echo -e "${GREEN}→${NC} Found local script: ${local_script}"
-        echo ""
-        
-        # Make it executable
-        chmod +x "$local_script"
-        
-        # Execute the script
-        if bash "$local_script"; then
-            echo ""
-            echo -e "${GREEN}✅ Script completed successfully${NC}"
-        else
-            echo ""
-            echo -e "${RED}❌ Script encountered an error${NC}"
-        fi
-    else
-        # Download from GitHub
-        echo -e "${YELLOW}→${NC} Local script not found, downloading from GitHub..."
-        echo -e "${BLUE}→${NC} URL: ${GITHUB_RAW_BASE}/${script_name}"
-        echo ""
-        
-        if curl -fsSL "${GITHUB_RAW_BASE}/${script_name}" -o "$tmp_script"; then
-            echo -e "${GREEN}✅ Downloaded successfully${NC}"
-            echo ""
-            
-            # Make it executable
-            chmod +x "$tmp_script"
-            
-            # Execute the script
-            if bash "$tmp_script"; then
-                echo ""
-                echo -e "${GREEN}✅ Script completed successfully${NC}"
-            else
-                echo ""
-                echo -e "${RED}❌ Script encountered an error${NC}"
-            fi
-            
-            # Clean up
-            rm -f "$tmp_script"
-        else
-            echo ""
-            echo -e "${RED}❌ Failed to download script from GitHub${NC}"
-            echo -e "${YELLOW}Please check your internet connection and try again${NC}"
-        fi
-    fi
-    
-    echo ""
-    echo "Press any key to return to menu..."
-    read -rsn1 < /dev/tty
-}
+dispatch_command() {
+    local command="${1:-}"
+    shift || true
 
-# Main menu loop
-main() {
-    while true; do
-        local selected=$(get_selection)
-        local selected_title="${MENU_ITEMS[$selected]}"
-        
-        # Handle special menu items
-        if [[ "$selected_title" == "Update CLiKader" ]]; then
+    case "$command" in
+        "" | "-h" | "--help" | "help")
+            show_usage
+            ;;
+        "-v" | "--version" | "version")
+            echo "$CLIKADER_VERSION"
+            ;;
+        "update" | "upgrade")
+            require_root "$command"
             update_clikader
-        elif [[ "$selected_title" == "Uninstall CLiKader" ]]; then
+            ;;
+        "dns")
+            require_root "$command"
+            run_script "setup_dns.sh" "Setup DNS" "$@"
+            ;;
+        "apt-reset" | "aptreset")
+            require_root "$command"
+            run_script "reset_apt_source.sh" "Reset APT Sources" "$@"
+            ;;
+        "hostname")
+            require_root "$command"
+            run_script "fix_hostname.sh" "Fix Hostname" "$@"
+            ;;
+        "ipv6" | "6")
+            require_root "$command"
+            run_script "configure_ipv6.sh" "Configure IPv6" "$@"
+            ;;
+        "uninstall" | "remove")
+            require_root "$command"
             uninstall_clikader
-        else
-            local selected_script="${SCRIPTS[$selected_title]}"
-            run_script "$selected_script" "$selected_title"
-        fi
-    done
+            ;;
+        *)
+            error "Unknown command: ${command}"
+            echo ""
+            show_usage
+            return 1
+            ;;
+    esac
+}
+
+main() {
+    dispatch_command "$@"
 }
 
 main "$@"
