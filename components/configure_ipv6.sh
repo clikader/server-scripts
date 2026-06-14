@@ -527,54 +527,40 @@ show_menu() {
     echo ""
 }
 
-# Main menu loop
+# Main entrypoint
 main() {
-    while true; do
-        show_menu
-        
-        echo -n "Enter your choice [0-4]: "
-        read -r choice < /dev/tty
-        
-        case "$choice" in
-            1)
-                enable_ipv6
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            2)
-                disable_ipv6
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            3)
-                configure_ipv6_address
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            4)
-                echo ""
-                log "Detailed IPv6 status:"
-                echo ""
-                sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            0)
-                echo ""
-                log "Exiting..."
-                echo ""
-                exit 0
-                ;;
-            *)
-                error "Invalid choice. Please enter 0-4."
-                sleep 2
-                ;;
-        esac
-    done
+    show_menu
+
+    echo -n "Enter your choice [0-4]: "
+    read -r choice < /dev/tty
+
+    case "$choice" in
+        1)
+            enable_ipv6
+            ;;
+        2)
+            disable_ipv6
+            ;;
+        3)
+            configure_ipv6_address
+            ;;
+        4)
+            echo ""
+            log "Detailed IPv6 status:"
+            echo ""
+            sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
+            echo ""
+            ;;
+        0)
+            echo ""
+            log "Exiting..."
+            echo ""
+            ;;
+        *)
+            error "Invalid choice. Please enter 0-4."
+            exit 1
+            ;;
+    esac
 }
 
 main "$@"

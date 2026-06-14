@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-# DNS Setup Script - Purifies and hardens DNS configuration with DNS-over-TLS
+# DNS Setup Script - Configures DNS using systemd-resolved
+# Defaults to plain direct-IP DNS; secure DNS (DNSSEC + DNS-over-TLS) is optional.
 # Primarily supports: Debian 12/13, Ubuntu 22.04/24.04
 # May work on: Debian 11, Ubuntu 20.04 (with limited testing)
 
@@ -17,7 +18,8 @@ primary_dns=""
 fallback_dns=""
 selected_names=()
 ipv6_support=false
-has_dot_support=true
+has_dot_support=false
+use_secure_dns=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -43,6 +45,30 @@ error() {
 
 warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+ask_secure_dns() {
+    echo ""
+    echo "=========================================="
+    echo "  Secure DNS Configuration"
+    echo "=========================================="
+    echo ""
+    echo "Secure DNS includes DNSSEC validation and DNS-over-TLS (DoT)."
+    echo "Some networks block these features or they may slow down resolution."
+    echo ""
+    echo -n "Enable secure DNS (DNSSEC + DNS-over-TLS)? (y/N): "
+    read -r secure_answer < /dev/tty
+
+    if [[ "$secure_answer" =~ ^[Yy]$ ]]; then
+        use_secure_dns=true
+        has_dot_support=true
+        log "Secure DNS: ENABLED"
+    else
+        use_secure_dns=false
+        has_dot_support=false
+        log "Secure DNS: DISABLED (using direct IP DNS)"
+    fi
+    echo ""
 }
 
 unlock_resolv_conf() {
@@ -96,7 +122,7 @@ get_custom_dns() {
     local custom_ipv4=""
     local custom_ipv6=""
     local custom_dot=""
-    
+
     echo ""
     echo "=========================================="
     echo "  Custom DNS Configuration"
@@ -104,26 +130,28 @@ get_custom_dns() {
     echo ""
     echo "Enter your custom DNS server details:"
     echo ""
-    
+
     # Get IPv4 DNS servers
     echo -n "IPv4 DNS servers (space-separated, e.g., '1.1.1.1 1.0.0.1'): "
     read -r custom_ipv4 < /dev/tty
-    
+
     if [[ -z "$custom_ipv4" ]]; then
         error "IPv4 DNS servers are required for custom DNS"
         return 1
     fi
-    
+
     # Get IPv6 DNS servers if IPv6 support is enabled
     if [[ "$ipv6_support" == true ]]; then
         echo -n "IPv6 DNS servers (space-separated, optional): "
         read -r custom_ipv6 < /dev/tty
     fi
-    
-    # Get DoT hostname
-    echo -n "DNS-over-TLS hostname (e.g., 'dns.example.com', leave empty if not supported): "
-    read -r custom_dot < /dev/tty
-    
+
+    # Get DoT hostname only when secure DNS is enabled
+    if [[ "$use_secure_dns" == true ]]; then
+        echo -n "DNS-over-TLS hostname (e.g., 'dns.example.com', leave empty if not supported): "
+        read -r custom_dot < /dev/tty
+    fi
+
     # Build the DNS configuration
     local dns_config_ipv4=""
     local dns_config_ipv6=""
@@ -165,16 +193,29 @@ get_custom_dns() {
 select_dns_providers() {
     echo ""
     echo "=========================================="
-    echo "  Select DNS Providers (DNS-over-TLS)"
+    if [[ "$use_secure_dns" == true ]]; then
+        echo "  Select DNS Providers (DNS-over-TLS)"
+    else
+        echo "  Select DNS Providers (Direct IP)"
+    fi
     echo "=========================================="
     echo ""
     echo "Available DNS providers:"
-    echo "  1) Cloudflare (1.1.1.1, 1.0.0.1) - DoT: cloudflare-dns.com"
-    echo "  2) Google (8.8.8.8, 8.8.4.4) - DoT: dns.google"
-    echo "  3) Quad9 (9.9.9.9, 149.112.112.112) - DoT: dns.quad9.net"
-    echo "  4) OpenDNS (208.67.222.222, 208.67.220.220) - DoT: dns.opendns.com"
-    echo "  5) AdGuard (94.140.14.14, 94.140.15.15) - DoT: dns.adguard.com"
-    echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9) - DoT: family-filter-dns.cleanbrowsing.org"
+    if [[ "$use_secure_dns" == true ]]; then
+        echo "  1) Cloudflare (1.1.1.1, 1.0.0.1) - DoT: cloudflare-dns.com"
+        echo "  2) Google (8.8.8.8, 8.8.4.4) - DoT: dns.google"
+        echo "  3) Quad9 (9.9.9.9, 149.112.112.112) - DoT: dns.quad9.net"
+        echo "  4) OpenDNS (208.67.222.222, 208.67.220.220) - DoT: dns.opendns.com"
+        echo "  5) AdGuard (94.140.14.14, 94.140.15.15) - DoT: dns.adguard.com"
+        echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9) - DoT: family-filter-dns.cleanbrowsing.org"
+    else
+        echo "  1) Cloudflare (1.1.1.1, 1.0.0.1)"
+        echo "  2) Google (8.8.8.8, 8.8.4.4)"
+        echo "  3) Quad9 (9.9.9.9, 149.112.112.112)"
+        echo "  4) OpenDNS (208.67.222.222, 208.67.220.220)"
+        echo "  5) AdGuard (94.140.14.14, 94.140.15.15)"
+        echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9)"
+    fi
     echo "  7) Custom DNS (define your own)"
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
@@ -227,40 +268,60 @@ select_dns_providers() {
     primary_dns=""
     fallback_dns=""
     selected_names=()
-    
+
     local first=true
     for choice in $selections; do
         if [[ -n "${dns_ipv4[$choice]:-}" ]]; then
+            local chosen_ipv4="${dns_ipv4[$choice]}"
+            local chosen_ipv6="${dns_ipv6[$choice]:-}"
+
+            # Strip DoT hostname when secure DNS is disabled
+            if [[ "$use_secure_dns" != true ]]; then
+                chosen_ipv4="$(echo "$chosen_ipv4" | sed 's/#[^ ]*//g')"
+                chosen_ipv6="$(echo "$chosen_ipv6" | sed 's/#[^ ]*//g')"
+            fi
+
             if $first; then
-                primary_dns="${dns_ipv4[$choice]}"
+                primary_dns="$chosen_ipv4"
                 if [[ "$ipv6_support" == true ]]; then
-                    primary_dns+=" ${dns_ipv6[$choice]}"
+                    primary_dns+=" $chosen_ipv6"
                 fi
                 selected_names+=("${dns_names[$choice]}")
                 first=false
             else
-                fallback_dns+=" ${dns_ipv4[$choice]}"
+                fallback_dns+=" $chosen_ipv4"
                 if [[ "$ipv6_support" == true ]]; then
-                    fallback_dns+=" ${dns_ipv6[$choice]}"
+                    fallback_dns+=" $chosen_ipv6"
                 fi
                 selected_names+=("${dns_names[$choice]}")
             fi
         fi
     done
-    
+
     if [[ -z "$primary_dns" ]]; then
-        warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
-        primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
-        fallback_dns="8.8.8.8#dns.google 8.8.4.4#dns.google 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
-        
-        if [[ "$ipv6_support" == true ]]; then
-            primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
-            fallback_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+        if [[ "$use_secure_dns" == true ]]; then
+            warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
+            primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
+            fallback_dns="8.8.8.8#dns.google 8.8.4.4#dns.google 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
+
+            if [[ "$ipv6_support" == true ]]; then
+                primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
+                fallback_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+            fi
+        else
+            warning "No valid selection made. Using default: Cloudflare, Google, AdGuard (direct IP)."
+            primary_dns="1.1.1.1 1.0.0.1"
+            fallback_dns="8.8.8.8 8.8.4.4 94.140.14.14 94.140.15.15"
+
+            if [[ "$ipv6_support" == true ]]; then
+                primary_dns+=" 2606:4700:4700::1111 2606:4700:4700::1001"
+                fallback_dns+=" 2001:4860:4860::8888 2001:4860:4860::8844 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+            fi
         fi
-        
+
         selected_names=("Cloudflare" "Google" "AdGuard")
     fi
-    
+
     fallback_dns=$(echo "$fallback_dns" | xargs)
     
     echo ""
@@ -269,16 +330,21 @@ select_dns_providers() {
 }
 
 generate_resolved_config() {
-    local dot_setting="opportunistic"
-    if [[ "$has_dot_support" == false ]]; then
-        dot_setting="no"
+    local dnssec_setting="no"
+    local dot_setting="no"
+
+    if [[ "$use_secure_dns" == true ]]; then
+        dnssec_setting="yes"
+        if [[ "$has_dot_support" == true ]]; then
+            dot_setting="opportunistic"
+        fi
     fi
 
     SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=$primary_dns
 FallbackDNS=$fallback_dns
 Domains=~.
-DNSSEC=yes
+DNSSEC=$dnssec_setting
 DNSOverTLS=$dot_setting
 Cache=yes
 CacheFromLocalhost=no
@@ -455,6 +521,7 @@ main() {
         log "Forcing DNS reconfiguration as requested..."
     fi
     
+    ask_secure_dns
     select_dns_providers
     purify_dns
     verify_dns
@@ -466,19 +533,24 @@ main() {
     echo ""
     echo "Your system is now using:"
     for name in "${selected_names[@]}"; do
-        if [[ "$has_dot_support" == true ]]; then
+        if [[ "$use_secure_dns" == true ]]; then
             echo "  • $name DNS (DNS-over-TLS)"
         else
-            echo "  • $name DNS"
+            echo "  • $name DNS (direct IP)"
         fi
     done
     echo ""
     echo "Security features enabled:"
-    echo "  • DNSSEC: Yes"
-    if [[ "$has_dot_support" == true ]]; then
-        echo "  • DNS-over-TLS: Opportunistic"
+    if [[ "$use_secure_dns" == true ]]; then
+        echo "  • DNSSEC: Yes"
+        if [[ "$has_dot_support" == true ]]; then
+            echo "  • DNS-over-TLS: Opportunistic"
+        else
+            echo "  • DNS-over-TLS: Disabled (custom DNS without DoT support)"
+        fi
     else
-        echo "  • DNS-over-TLS: Disabled (custom DNS without DoT support)"
+        echo "  • DNSSEC: No"
+        echo "  • DNS-over-TLS: No"
     fi
     if [[ "$ipv6_support" == true ]]; then
         echo "  • IPv6 support: Enabled"

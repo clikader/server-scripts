@@ -73,12 +73,13 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 ---
 
 ### 2. Setup DNS
-Configures DNS with DNS-over-TLS support using systemd-resolved.
+Configures DNS using systemd-resolved.
 
 **DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Custom
 
 **Features:**
-- DNS-over-TLS (DoT) and DNSSEC validation
+- Defaults to plain direct-IP DNS
+- Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation
 - IPv6 support (optional)
 - Multiple DNS providers with fallback
 - Automatic conflict resolution

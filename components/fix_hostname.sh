@@ -266,39 +266,30 @@ show_menu() {
     echo ""
 }
 
-# Main menu loop
+# Main entrypoint
 main() {
-    while true; do
-        show_menu
-        
-        echo -n "Enter your choice [0-2]: "
-        read -r choice < /dev/tty
-        
-        case "$choice" in
-            1)
-                fix_hostname_resolution
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            2)
-                change_hostname
-                echo ""
-                echo "Press any key to continue..."
-                read -rsn1 < /dev/tty
-                ;;
-            0)
-                echo ""
-                log "Exiting..."
-                echo ""
-                exit 0
-                ;;
-            *)
-                error "Invalid choice. Please enter 0, 1, or 2."
-                sleep 2
-                ;;
-        esac
-    done
+    show_menu
+
+    echo -n "Enter your choice [0-2]: "
+    read -r choice < /dev/tty
+
+    case "$choice" in
+        1)
+            fix_hostname_resolution
+            ;;
+        2)
+            change_hostname
+            ;;
+        0)
+            echo ""
+            log "Exiting..."
+            echo ""
+            ;;
+        *)
+            error "Invalid choice. Please enter 0, 1, or 2."
+            exit 1
+            ;;
+    esac
 }
 
 main "$@"
