@@ -589,7 +589,7 @@ manage_resolv_conf: false
 EOF
         log "✅ Disabled cloud-init resolver management"
     else
-        info "cloud-init not present (non-cloud image); skipping"
+        log "cloud-init not present (non-cloud image); skipping"
     fi
     
     # Phase 2: Configure systemd-resolved
