@@ -571,6 +571,26 @@ EOF
         chmod -x /etc/network/if-up.d/resolved 2>/dev/null || true
         log "✅ Removed execute permission from /etc/network/if-up.d/resolved"
     fi
+
+    # Disable cloud-init DNS management. cloud-init (present on virtually every
+    # cloud VPS image: AWS/GCP/Azure/Oracle/DigitalOcean) rewrites /etc/resolv.conf
+    # on boot per manage_resolv_conf, which silently rolls back this script's DNS
+    # setup after a reboot or provider maintenance. This is the #1 cause of "DNS
+    # works until reboot" reports. We scope the change narrowly: only stop the
+    # resolver overwrite, NOT cloud-init's NIC bring-up (some providers rely on it
+    # to configure the primary interface, so disabling network config entirely
+    # could leave the box offline after reboot).
+    log "Disabling cloud-init DNS management (prevents reboot rollback)..."
+    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+        cat > /etc/cloud/cloud.cfg.d/99-disable-dns-mgmt.cfg << 'EOF'
+# Managed by setup_dns.sh -- prevents cloud-init from overwriting DNS on boot.
+# This is what keeps the clikader DNS config from being rolled back after reboot.
+manage_resolv_conf: false
+EOF
+        log "✅ Disabled cloud-init resolver management"
+    else
+        info "cloud-init not present (non-cloud image); skipping"
+    fi
     
     # Phase 2: Configure systemd-resolved
     log "Phase 2: Configuring systemd-resolved..."

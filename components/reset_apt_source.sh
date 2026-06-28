@@ -73,10 +73,56 @@ backup_sources() {
     echo ""
 }
 
-# Generate Debian sources
+# Generate Debian sources in DEB822 format (.sources) — the Trixie default.
+# Includes Signed-By (required by modern apt), backports, and deb-src, giving
+# the full official mirror set (the "5-6 URLs" a provider image ships, vs. the
+# minimal 3 a hand-written sources.list shows).
+generate_debian_sources_deb822() {
+    local version="$1"
+    local suite
+
+    case "$version" in
+        13) suite="trixie" ;;
+        12) suite="bookworm" ;;
+        *) error "Unsupported Debian version for DEB822: $version"; return 1 ;;
+    esac
+
+    cat > /etc/apt/sources.list.d/debian.sources << EOF
+# Debian ${version} - Official Sources (DEB822 format)
+# Managed by reset_apt_source.sh
+
+Types: deb deb-src
+URIs: http://deb.debian.org/debian
+Suites: ${suite} ${suite}-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb deb-src
+URIs: http://deb.debian.org/debian
+Suites: ${suite}-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb deb-src
+URIs: http://deb.debian.org/debian-security
+Suites: ${suite}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    # The old sources.list is deprecated on Trixie; neutralize it so apt doesn't
+    # warn about duplicate sources. A pointer comment is the Debian/Ubuntu norm.
+    cat > /etc/apt/sources.list << 'EOF'
+# Debian sources have moved to /etc/apt/sources.list.d/debian.sources (DEB822).
+# Managed by reset_apt_source.sh.
+EOF
+    log "✅ Generated Debian ${version} sources (DEB822 format, full mirror set)"
+}
+
+# Legacy one-line sources.list format (fallback for Debian 11 or if DEB822
+# generation is refused). Kept for completeness; Debian 12/13 use DEB822 above.
 generate_debian_sources() {
     local version="$1"
-    
+
     case "$version" in
         13)
             cat > /etc/apt/sources.list << 'EOF'
@@ -431,10 +477,24 @@ main() {
     # Generate appropriate sources based on OS
     if [[ "$os_name" == "debian" ]]; then
         log "Resetting APT sources for Debian $os_version..."
-        generate_debian_sources "$os_version"
+        # Debian 12/13: use the modern DEB822 format (Trixie default; Bookworm
+        # also supports it). Falls back to legacy sources.list on older releases.
+        case "$os_version" in
+            13|12)
+                if generate_debian_sources_deb822 "$os_version"; then
+                    info "Using modern DEB822 format (debian.sources)"
+                else
+                    warning "DEB822 generation failed, falling back to legacy format"
+                    generate_debian_sources "$os_version"
+                fi
+                ;;
+            *)
+                generate_debian_sources "$os_version"
+                ;;
+        esac
     elif [[ "$os_name" == "ubuntu" ]]; then
         log "Resetting APT sources for Ubuntu $os_version..."
-        
+
         # Ubuntu 24.04+ uses DEB822 format by default
         if [[ "$os_version" == "24.04" ]] || [[ "$os_version" == "24.10" ]]; then
             if generate_ubuntu_sources_deb822 "$os_version" "$os_codename"; then
