@@ -2,8 +2,8 @@
 
 # DNS Setup Script - Configures DNS using systemd-resolved
 # Defaults to plain direct-IP DNS; secure DNS (DNSSEC + DNS-over-TLS) is optional.
-# Primarily supports: Debian 12/13, Ubuntu 22.04/24.04
-# May work on: Debian 11, Ubuntu 20.04 (with limited testing)
+# Officially supported: Debian 12/13, Ubuntu 22.04/24.04/26
+# Other OS versions may work but are user-tested, not officially supported.
 
 set -euo pipefail
 
@@ -15,11 +15,19 @@ NC='\033[0m' # No Color
 
 # Global variables for DNS configuration
 primary_dns=""
-fallback_dns=""
 selected_names=()
 ipv6_support=false
 has_dot_support=false
 use_secure_dns=false
+
+# --- Auto-ordering / reachability probe tunables (production defaults) ---
+# Probe each candidate server with one real DNS query; sort reachable ones by
+# measured RTT ascending and drop non-responders so a dead server never lands
+# on the DNS= line (would otherwise cost a full timeout on every resolution).
+PROBE_TIMEOUT=2          # seconds; per-server query timeout for the probe
+PROBE_QUERY="www.google.com"
+PROBE_QTYPE="A"
+LAST_RESORT_DNS="9.9.9.9 149.112.112.112"  # FallbackDNS: contacted only when every primary is down
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -45,6 +53,89 @@ error() {
 
 warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Measure latency (ms) to a single DNS server IP by sending one real query.
+# Uses plaintext DNS (port 53) for the probe regardless of secure-DNS mode:
+# we are measuring network route quality, not the TLS overhead. The chosen
+# servers are then applied with whatever transport the user selected.
+# Args: <ip>
+# Echoes "<ms>" on success, empty string on failure/timeout.
+probe_server() {
+    local ip="$1"
+    local ms=""
+    local t_start t_end
+    local out
+
+    if command -v dig &> /dev/null; then
+        t_start=$(date +%s%N)
+        if out=$(dig +short +time=${PROBE_TIMEOUT} +tries=1 @"$ip" "$PROBE_QUERY" "$PROBE_QTYPE" 2>/dev/null) \
+           && [[ -n "$out" ]]; then
+            t_end=$(date +%s%N)
+            ms=$(( (t_end - t_start) / 1000000 ))
+            echo "$ms"
+            return 0
+        fi
+    elif command -v nslookup &> /dev/null; then
+        t_start=$(date +%s%N)
+        if out=$(nslookup -timeout=$PROBE_TIMEOUT -type="$PROBE_QTYPE" "$PROBE_QUERY" "$ip" 2>/dev/null) \
+           && echo "$out" | grep -qi 'name:'; then
+            t_end=$(date +%s%N)
+            ms=$(( (t_end - t_start) / 1000000 ))
+            echo "$ms"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Probe each selected provider and reorder by measured latency (fastest first).
+# Non-responding providers are dropped. If every probe fails, the original
+# selection order is kept so the user's choices still apply (likely a captive
+# portal or no outbound DNS — the loud warning is intentional).
+# Reads dns_ipv4/dns_names via bash dynamic scoping from select_dns_providers.
+# Result is written to global SORTED_SELECTIONS.
+# Args: <space-separated choices>
+order_by_latency() {
+    local choices=($@)
+    local choice probe_ip ms name
+    local results=""
+    SORTED_SELECTIONS=""
+
+    echo ""
+    log "Probing selected providers (timeout ${PROBE_TIMEOUT}s each)..."
+
+    for choice in "${choices[@]}"; do
+        # Skip choices that have no entry (invalid index or already-handled).
+        [[ -z "${dns_ipv4[$choice]:-}" ]] && continue
+
+        # Probe the provider's first IPv4 (DoT suffix stripped) as a
+        # representative target; both IPs of a provider usually share routing.
+        probe_ip="$(echo "${dns_ipv4[$choice]}" | awk '{print $1}' | sed 's/#.*//')"
+
+        echo -n "  ${dns_names[$choice]} ($probe_ip)... "
+        if ms=$(probe_server "$probe_ip"); then
+            echo -e "${GREEN}${ms}ms${NC}"
+            results+="${ms}|${choice}|${dns_names[$choice]}"$'\n'
+        else
+            echo -e "${RED}no response${NC} -> dropped"
+        fi
+    done
+
+    if [[ -z "$results" ]]; then
+        warning "All probes failed. Keeping your selected order (network may block DNS)."
+        for choice in "${choices[@]}"; do
+            [[ -z "${dns_ipv4[$choice]:-}" ]] && continue
+            SORTED_SELECTIONS+="$choice "
+        done
+        return 0
+    fi
+
+    while IFS='|' read -r ms choice name; do
+        [[ -z "$choice" ]] && continue
+        SORTED_SELECTIONS+="$choice "
+    done < <(printf '%s' "$results" | sort -t'|' -k1,1n)
 }
 
 ask_secure_dns() {
@@ -97,20 +188,23 @@ else
     exit 1
 fi
 
-# Determine Debian version for compatibility
-debian_version=""
-if [[ "$os_name" == "debian" ]]; then
-    debian_version="$os_version"
-elif [[ "$os_name" == "ubuntu" ]]; then
-    case "$os_version" in
-        20.04) debian_version="10" ;;
-        22.04) debian_version="11" ;;
-        24.04) debian_version="12" ;;
-        *) debian_version="12" ;;
-    esac
+# Officially supported OS list. Others may work but are user-tested only, so we
+# warn (not block) and continue. Restricting to modern releases lets us assume
+# bash 4+, modern systemd-resolved, and current apt behaviour.
+supported=false
+case "$os_name/$os_version" in
+    debian/12|debian/13)            supported=true ;;
+    ubuntu/22.04|ubuntu/24.04|ubuntu/26|ubuntu/26.04) supported=true ;;
+esac
+
+if [[ "$supported" != true ]]; then
+    warning "OS '$os_name $os_version' is NOT officially supported."
+    warning "Officially supported: Debian 12/13, Ubuntu 22.04/24.04/26."
+    warning "Proceeding anyway — this is user-tested, not guaranteed to work."
+    echo ""
 fi
 
-log "Detected: $ID $VERSION_ID (Debian compatibility: $debian_version)"
+log "Detected: $ID $VERSION_ID"
 
 if [[ "$ipv6_support" == true ]]; then
     log "IPv6 support: ENABLED"
@@ -219,11 +313,11 @@ select_dns_providers() {
     echo "  7) Custom DNS (define your own)"
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
-    echo "The first choice will be your primary DNS provider."
+    echo "All selected providers are queried in order as primary DNS servers."
     echo -n "Selection (default: 1 2 5): "
-    
+
     read -r selections < /dev/tty
-    
+
     if [[ -z "$selections" ]]; then
         selections="1 2 5"
         log "Using default selection: Cloudflare, Google, AdGuard"
@@ -264,13 +358,34 @@ select_dns_providers() {
             exit 1
         fi
     fi
-    
+
+    # Probe each selected provider and reorder by measured latency (fastest
+    # first), dropping any that don't respond. Custom DNS (option 7) skips the
+    # probe — the user supplied the targets intentionally.
+    local probeable_selections=()
+    local has_custom=false
+    for c in $selections; do
+        if [[ "$c" == "7" ]]; then
+            has_custom=true
+        elif [[ -n "${dns_ipv4[$c]:-}" ]]; then
+            probeable_selections+=("$c")
+        fi
+    done
+
+    if [[ ${#probeable_selections[@]} -gt 0 ]]; then
+        order_by_latency "${probeable_selections[@]}"
+    else
+        SORTED_SELECTIONS=""
+    fi
+
+    # Final iteration order: latency-sorted providers, then custom (if any).
+    local final_order="$SORTED_SELECTIONS"
+    $has_custom && final_order+=" 7"
+
     primary_dns=""
-    fallback_dns=""
     selected_names=()
 
-    local first=true
-    for choice in $selections; do
+    for choice in $final_order; do
         if [[ -n "${dns_ipv4[$choice]:-}" ]]; then
             local chosen_ipv4="${dns_ipv4[$choice]}"
             local chosen_ipv6="${dns_ipv6[$choice]:-}"
@@ -281,20 +396,11 @@ select_dns_providers() {
                 chosen_ipv6="$(echo "$chosen_ipv6" | sed 's/#[^ ]*//g')"
             fi
 
-            if $first; then
-                primary_dns="$chosen_ipv4"
-                if [[ "$ipv6_support" == true ]]; then
-                    primary_dns+=" $chosen_ipv6"
-                fi
-                selected_names+=("${dns_names[$choice]}")
-                first=false
-            else
-                fallback_dns+=" $chosen_ipv4"
-                if [[ "$ipv6_support" == true ]]; then
-                    fallback_dns+=" $chosen_ipv6"
-                fi
-                selected_names+=("${dns_names[$choice]}")
+            primary_dns+=" $chosen_ipv4"
+            if [[ "$ipv6_support" == true ]]; then
+                primary_dns+=" $chosen_ipv6"
             fi
+            selected_names+=("${dns_names[$choice]}")
         fi
     done
 
@@ -302,30 +408,37 @@ select_dns_providers() {
         if [[ "$use_secure_dns" == true ]]; then
             warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
             primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
-            fallback_dns="8.8.8.8#dns.google 8.8.4.4#dns.google 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
+            primary_dns+=" 8.8.8.8#dns.google 8.8.4.4#dns.google"
+            primary_dns+=" 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
 
             if [[ "$ipv6_support" == true ]]; then
                 primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
-                fallback_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+                primary_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
+                primary_dns+=" 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
             fi
         else
             warning "No valid selection made. Using default: Cloudflare, Google, AdGuard (direct IP)."
             primary_dns="1.1.1.1 1.0.0.1"
-            fallback_dns="8.8.8.8 8.8.4.4 94.140.14.14 94.140.15.15"
+            primary_dns+=" 8.8.8.8 8.8.4.4"
+            primary_dns+=" 94.140.14.14 94.140.15.15"
 
             if [[ "$ipv6_support" == true ]]; then
                 primary_dns+=" 2606:4700:4700::1111 2606:4700:4700::1001"
-                fallback_dns+=" 2001:4860:4860::8888 2001:4860:4860::8844 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+                primary_dns+=" 2001:4860:4860::8888 2001:4860:4860::8844"
+                primary_dns+=" 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
             fi
         fi
 
         selected_names=("Cloudflare" "Google" "AdGuard")
     fi
 
-    fallback_dns=$(echo "$fallback_dns" | xargs)
-    
+    primary_dns=$(echo "$primary_dns" | xargs)
+
     echo ""
-    log "Selected providers: ${selected_names[*]}"
+    log "Final primary DNS order (fastest first): ${selected_names[*]}"
+    if [[ "$has_custom" == true ]]; then
+        log "Custom DNS appended last (skipped latency probe)"
+    fi
     echo ""
 }
 
@@ -342,7 +455,7 @@ generate_resolved_config() {
 
     SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=$primary_dns
-FallbackDNS=$fallback_dns
+FallbackDNS=$LAST_RESORT_DNS
 Domains=~.
 DNSSEC=$dnssec_setting
 DNSOverTLS=$dot_setting
@@ -413,18 +526,23 @@ purify_dns() {
     # Configure dhclient to ignore DHCP DNS
     log "Configuring DHCP client (dhclient)..."
     if [[ -f /etc/dhcp/dhclient.conf ]]; then
-        # Remove any existing supersede/prepend lines
+        # Remove any previously-added override block (idempotent re-runs). We
+        # strip everything between our markers, including the markers and the
+        # legacy unmarked supersede/prepend lines from older script versions.
+        sed -i '/^# BEGIN setup_dns.sh DNS override$/,/^# END setup_dns.sh DNS override$/d' /etc/dhcp/dhclient.conf
+        sed -i '/^# DNS override configuration - added by setup_dns.sh$/,/^prepend domain-name-servers 127\.0\.0\.53;$/d' /etc/dhcp/dhclient.conf
         sed -i '/^supersede domain-name-servers/d' /etc/dhcp/dhclient.conf
         sed -i '/^prepend domain-name-servers/d' /etc/dhcp/dhclient.conf
-        
-        # Add our configuration
+
+        # Add our configuration (marked so future runs can remove it cleanly)
         cat >> /etc/dhcp/dhclient.conf << 'EOF'
 
-# DNS override configuration - added by setup_dns.sh
+# BEGIN setup_dns.sh DNS override
 supersede domain-name-servers 127.0.0.53;
 prepend domain-name-servers 127.0.0.53;
+# END setup_dns.sh DNS override
 EOF
-        log "✅ Added 'ignore' directives to /etc/dhcp/dhclient.conf"
+        log "✅ Updated 'ignore' directives in /etc/dhcp/dhclient.conf"
     fi
     
     # Disable the if-up.d resolved script
@@ -507,18 +625,19 @@ verify_dns() {
 # Main execution
 main() {
     if health_check; then
-        echo "No action needed. System is already properly configured."
+        echo "Existing DNS configuration detected and healthy."
+        echo "Re-running will probe providers by latency and overwrite the current config."
         echo ""
-        echo -n "Do you want to force rerun the DNS configuration anyway? (Y/n): "
+        echo -n "Proceed with reconfiguration? (Y/n): "
         read -r force_rerun < /dev/tty
-        
+
         if [[ "$force_rerun" =~ ^[Nn]$ ]]; then
             echo "Exiting without changes."
             exit 0
         fi
-        
+
         echo ""
-        log "Forcing DNS reconfiguration as requested..."
+        log "Starting DNS reconfiguration..."
     fi
     
     ask_secure_dns

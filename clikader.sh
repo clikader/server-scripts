@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.2.0"
+CLIKADER_VERSION="1.3.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -58,15 +58,16 @@ show_usage() {
     echo "Usage:"
     echo "  clikader [command]"
     echo ""
-    echo "Commands:"
-    echo "  --help, -h, help            Show this help message"
-    echo "  update, upgrade             Update CLiKader"
-    echo "  dns                         Run DNS setup tool"
-    echo "  apt-reset, aptreset         Run APT source reset tool"
-    echo "  hostname                    Run hostname fix tool"
-    echo "  ipv6, 6                     Run IPv6 configuration tool"
-    echo "  uninstall, remove           Uninstall CLiKader"
-    echo "  --version, -v, version      Show CLiKader version"
+echo "Commands:"
+echo "  --help, -h, help            Show this help message"
+echo "  update, upgrade             Update CLiKader"
+echo "  dns                         Run DNS setup tool"
+echo "  tcp                         Run TCP/network optimization tool"
+echo "  apt-reset, aptreset         Run APT source reset tool"
+echo "  hostname                    Run hostname fix tool"
+echo "  ipv6, 6                     Run IPv6 configuration tool"
+echo "  uninstall, remove           Uninstall CLiKader"
+echo "  --version, -v, version      Show CLiKader version"
     echo ""
     echo "Aliases:"
     echo "  clikader                    Alias of 'clikader --help'"
@@ -77,6 +78,9 @@ show_usage() {
     echo "  clikader help"
     echo "  sudo clikader update"
     echo "  sudo clikader dns"
+    echo "  sudo clikader tcp"
+    echo "  sudo clikader tcp --dry-run"
+    echo "  sudo clikader tcp --revert"
     echo "  sudo clikader apt-reset"
     echo "  sudo clikader aptreset"
     echo "  sudo clikader hostname"
@@ -281,6 +285,10 @@ dispatch_command() {
         "dns")
             require_root "$command"
             run_script "setup_dns.sh" "Setup DNS" "$@"
+            ;;
+        "tcp")
+            require_root "$command"
+            run_script "optimize_tcp.sh" "TCP/Network Optimization" "$@"
             ;;
         "apt-reset" | "aptreset")
             require_root "$command"

@@ -73,7 +73,7 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 ---
 
 ### 2. Setup DNS
-Configures DNS using systemd-resolved.
+Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 22.04/24.04/26 (other OS versions may work but are user-tested).
 
 **DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Custom
 
@@ -81,7 +81,9 @@ Configures DNS using systemd-resolved.
 - Defaults to plain direct-IP DNS
 - Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation
 - IPv6 support (optional)
-- Multiple DNS providers with fallback
+- All selected DNS providers are queried in order as primary servers
+- Auto-orders selected providers by measured latency (fastest first) and drops unresponsive ones
+- Static last-resort `FallbackDNS` for when all primaries are down
 - Automatic conflict resolution
 
 **Files modified by this script:**
