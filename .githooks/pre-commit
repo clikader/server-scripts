@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# pre-commit hook: keep clikader.sh executable.
+#
+# Why: editing clikader.sh through some tools resets its mode to 0644, and that
+# silently lands in commits. clikader.sh is the entrypoint and must be 0755 so
+# `./clikader.sh` and run_script's invocation work. install.sh is curl-piped and
+# the components run via `bash <script>`, so only clikader.sh is enforced here.
+#
+# Behaviour: if a staged clikader.sh is 0644, restore the exec bit and re-stage
+# it, then allow the commit. This auto-heals the regression at the source.
+set -euo pipefail
+
+# Only act when clikader.sh is part of this commit.
+if ! git diff --cached --name-only | grep -qx 'clikader.sh'; then
+    exit 0
+fi
+
+mode="$(git ls-files --stage clikader.sh | awk '{print $1}')"
+if [[ "$mode" == "100644" ]]; then
+    echo "pre-commit: clikader.sh lost its executable bit; restoring +x and re-staging." >&2
+    chmod +x clikader.sh
+    git add clikader.sh
+fi
+
+exit 0

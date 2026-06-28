@@ -209,6 +209,20 @@ sudo clikader update
 
 ---
 
+## 🧑‍💻 Development
+
+### Git hooks (keeping `clikader.sh` executable)
+
+`clikader.sh` is the entrypoint and must keep its executable bit (`0755`). Some editors/tools reset it to `0644` on save, which would silently land in commits. A `pre-commit` hook in `.githooks/` auto-restores `+x` when a staged `clikader.sh` is detected as non-executable.
+
+After cloning, enable it once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+---
+
 ## 📝 License
 
 Apache License 2.0. See [LICENSE](./LICENSE) for full terms.
