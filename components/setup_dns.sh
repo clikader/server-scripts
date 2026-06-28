@@ -19,6 +19,7 @@ selected_names=()
 ipv6_support=false
 has_dot_support=false
 use_secure_dns=false
+non_interactive=false   # set by --yes: accept all defaults with no prompts
 
 # --- Auto-ordering / reachability probe tunables (production defaults) ---
 # Probe each candidate server with one real DNS query; sort reachable ones by
@@ -34,6 +35,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -6|--ipv6)
             ipv6_support=true
+            shift
+            ;;
+        -y|--yes)
+            non_interactive=true
             shift
             ;;
         *)
@@ -147,6 +152,15 @@ ask_secure_dns() {
     echo "Secure DNS includes DNSSEC validation and DNS-over-TLS (DoT)."
     echo "Some networks block these features or they may slow down resolution."
     echo ""
+
+    if [[ "$non_interactive" == true ]]; then
+        use_secure_dns=false
+        has_dot_support=false
+        log "Secure DNS: DISABLED (--yes: direct IP, fastest mode)"
+        echo ""
+        return
+    fi
+
     echo -n "Enable secure DNS (DNSSEC + DNS-over-TLS)? (y/N): "
     read -r secure_answer < /dev/tty
 
@@ -314,13 +328,19 @@ select_dns_providers() {
     echo ""
     echo "Enter your choices separated by spaces (e.g., '1 2 3')"
     echo "All selected providers are queried in order as primary DNS servers."
-    echo -n "Selection (default: 1 2 5): "
 
-    read -r selections < /dev/tty
-
-    if [[ -z "$selections" ]]; then
+    if [[ "$non_interactive" == true ]]; then
         selections="1 2 5"
+        echo "Selection (default: 1 2 5): $selections  [--yes]"
         log "Using default selection: Cloudflare, Google, AdGuard"
+    else
+        echo -n "Selection (default: 1 2 5): "
+        read -r selections < /dev/tty
+
+        if [[ -z "$selections" ]]; then
+            selections="1 2 5"
+            log "Using default selection: Cloudflare, Google, AdGuard"
+        fi
     fi
     
     declare -A dns_ipv4
@@ -628,12 +648,16 @@ main() {
         echo "Existing DNS configuration detected and healthy."
         echo "Re-running will probe providers by latency and overwrite the current config."
         echo ""
-        echo -n "Proceed with reconfiguration? (Y/n): "
-        read -r force_rerun < /dev/tty
 
-        if [[ "$force_rerun" =~ ^[Nn]$ ]]; then
-            echo "Exiting without changes."
-            exit 0
+        if [[ "$non_interactive" == true ]]; then
+            log "Proceeding with reconfiguration (--yes)."
+        else
+            echo -n "Proceed with reconfiguration? (Y/n): "
+            read -r force_rerun < /dev/tty
+            if [[ "$force_rerun" =~ ^[Nn]$ ]]; then
+                echo "Exiting without changes."
+                exit 0
+            fi
         fi
 
         echo ""

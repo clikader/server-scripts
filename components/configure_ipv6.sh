@@ -52,6 +52,22 @@ fi
 
 log "Detected: $ID $VERSION_ID"
 
+# --- Argument parsing (enables non-interactive use, e.g. from `clikader onboard`) ---
+# Flags: --enable / --disable / --status pick a mode and skip the menu;
+# --yes answers the disable confirm automatically.
+IPV6_MODE=""
+IPV6_ASSUME_YES=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --enable)  IPV6_MODE="enable";  shift ;;
+        --disable) IPV6_MODE="disable"; shift ;;
+        --status)  IPV6_MODE="status";  shift ;;
+        -y|--yes)  IPV6_ASSUME_YES=true; shift ;;
+        -h|--help) IPV6_MODE="help"; shift ;;
+        *) shift ;;
+    esac
+done
+
 # Check current IPv6 status
 check_ipv6_status() {
     local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
@@ -448,7 +464,7 @@ disable_ipv6() {
     echo "  Disable IPv6"
     echo "=========================================="
     echo ""
-    
+
     warning "Disabling IPv6 may affect some applications"
     echo ""
     echo "Services that may be affected:"
@@ -456,12 +472,17 @@ disable_ipv6() {
     echo "  • Web servers (if configured for IPv6)"
     echo "  • Some VPN clients"
     echo ""
-    echo -n "Are you sure you want to disable IPv6? (y/N): "
-    read -r confirm < /dev/tty
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        warning "IPv6 disable cancelled"
-        return 1
+
+    if [[ "$IPV6_ASSUME_YES" != true ]]; then
+        echo -n "Are you sure you want to disable IPv6? (y/N): "
+        read -r confirm < /dev/tty
+
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            warning "IPv6 disable cancelled"
+            return 1
+        fi
+    else
+        log "Proceeding (--yes)"
     fi
     
     echo ""
@@ -529,6 +550,21 @@ show_menu() {
 
 # Main entrypoint
 main() {
+    # Non-interactive mode: a flag was passed, so skip the menu.
+    case "$IPV6_MODE" in
+        enable)  enable_ipv6; return $? ;;
+        disable) disable_ipv6; return $? ;;
+        status)
+            check_ipv6_status || true
+            echo ""
+            log "Detailed IPv6 status:"
+            sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
+            return 0
+            ;;
+        help|"")
+            ;; # fall through to interactive menu below
+    esac
+
     show_menu
 
     echo -n "Enter your choice [0-4]: "

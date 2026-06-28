@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 
-# TCP / network-stack optimization for sing-box proxy + network relay.
+# Network-stack optimization for a sing-box proxy / network-relay VPS handling
+# web browsing, video streaming, and file downloads (high concurrent-conn load).
 # Officially supported: Debian 12/13, Ubuntu 24.04 (other modern kernels may work).
 #
-# Tuning scope: kernel network sysctls only.
+# Tuning scope: kernel network sysctls + file-descriptor limits (the #1 proxy
+# bottleneck) + routing needed for TUN/relay. Also scales conntrack if present.
 # Explicitly NOT touched: DNS, /etc/resolv.conf, systemd-resolved, sshd_config,
-# firewall (nftables/iptables rules). We only read firewall state to decide
-# whether conntrack tuning applies.
+# firewall RULES (nftables/iptables). We only read firewall/conntrack state to
+# decide whether conntrack tuning applies; ip_forward is kernel routing, not
+# firewall, and is required for the proxy to relay traffic.
 #
 # ===========================================================================
 #  SYSCTL LOAD-ORDER HANDLING (the part most scripts get wrong)
@@ -73,11 +76,24 @@ MARKER="disabled by clikader-tcp"             # tag for keys we neutralize in sy
 BACKUP_DIR="/etc/clikader-tcp-backup"
 BBR_MODULE_FILE="/etc/modules-load.d/clikader-tcp-bbr.conf"
 
+# File-descriptor limits (NOT sysctl-managed): a proxy must hold many open
+# sockets. fs.file-max is a global kernel cap (sysctl, below), but the per-process
+# soft/hard nofile lives in PAM limits, and a systemd *service* (like sing-box)
+# ignores PAM — so we also drop a systemd override so the daemon actually inherits it.
+LIMITS_FILE="/etc/security/limits.conf"
+SYSTEMD_OVERRIDE_DIR="/etc/systemd/system.conf.d"
+SYSTEMD_OVERRIDE="${SYSTEMD_OVERRIDE_DIR}/clikader-tcp-limits.conf"
+
 # Desired floor values for capacity/buffer keys that must never regress DOWNWARD.
 FLOOR_RMEM_MAX=33554432
 FLOOR_WMEM_MAX=33554432
 FLOOR_CONNTRACK_MAX=65536
+FLOOR_UDP_RMEM_MIN=8192
+FLOOR_UDP_WMEM_MIN=8192
 TUPLE_UPPER=33554432   # third element of tcp_rmem/tcp_wmem upper bound
+FILE_MAX_TARGET=1048576      # fs.file-max floor
+NR_OPEN_TARGET=1048576       # fs.nr_open (per-process ceiling) floor
+NOFILE_LIMIT=1048576         # nofile written to limits.conf + systemd override
 
 # --------------------------------------------------------------------------
 # Pre-flight
@@ -99,7 +115,7 @@ for arg in "$@"; do
         --dry-run|-n)            MODE="dryrun" ;;
         --status|-s)             MODE="status" ;;
         --help|-h)
-            sed -n '3,44p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) error "Unknown argument: $arg"; exit 2 ;;
@@ -188,12 +204,21 @@ build_desired() {
         "Handle PMTU blackholes on NAT'd/lossy paths (CN-ISP)"
     add net.ipv4.tcp_rfc1337 1 \
         "Safe TIME_WAIT reuse (resists duplicate-SYN attacks)"
+    add net.ipv4.tcp_syncookies 1 \
+        "SYN-flood resilience; keeps handshake alive under flood"
+    # WORKLOAD-DEPENDENT: synack_retries controls how long a half-open inbound
+    # connection is retried before giving up. Lower = faster cleanup of dead
+    # clients; raise if you serve clients on very lossy links.
+    add net.ipv4.tcp_synack_retries 2 \
+        "Fewer SYN-ACK retries -> faster half-open cleanup"
     add net.ipv4.tcp_congestion_control bbr \
         "BBR congestion control (pairs with fq qdisc)"
     add net.core.default_qdisc fq \
         "fq qdisc is the pacing partner BBR needs"
 
     # --- Capacity for short-lived connection churn (proxy fan-out) ---
+    add net.ipv4.tcp_tw_reuse 1 \
+        "Safe reuse of outbound TIME_WAIT sockets (NOT tcp_tw_recycle)"
     add net.ipv4.tcp_max_tw_buckets 32768 \
         "Headroom for TIME_WAIT churn from short-lived conns"
     add net.ipv4.tcp_max_syn_backlog 4096 \
@@ -206,6 +231,13 @@ build_desired() {
         "Reclaim FIN-WAIT-2 sockets faster"
     add net.core.somaxconn 4096 \
         "Accept queue depth for listeners"
+    # WORKLOAD-DEPENDENT: tcp_retries2 caps how long the kernel retransmits an
+    # unacknowledged segment before giving up (~default 15 -> ~924s/15min).
+    # Lower (e.g. 8) -> fail over to a healthier path/peer faster on lossy links;
+    # higher -> more patience for deep-buffer/long-haul paths. 10 is a balanced
+    # default for a relay/proxy.
+    add net.ipv4.tcp_retries2 10 \
+        "Retransmit cap; lower for faster failover, higher for patience"
 
     # --- Buffers & windowing (floors only: never lower an existing higher value) ---
     # WORKLOAD-DEPENDENT: these upper bounds assume a box with >=1GB RAM doing
@@ -222,6 +254,19 @@ build_desired() {
     add net.ipv4.tcp_window_scaling 1 "Allow large windows beyond 64KB"
     add net.ipv4.tcp_sack 1          "Selective ACKs for faster loss recovery"
     add net.ipv4.tcp_moderate_rcvbuf 1 "Kernel autotunes recv buffer per socket"
+    # WORKLOAD-DEPENDENT: notsent_lowat caps bytes cached in the kernel send
+    # queue before blocking the app. Lower (e.g. 131072) cuts bufferbloat and
+    # improves latency on interactive/relay streams at the cost of some
+    # throughput; set to a large value (or 0x200000=2MB) for pure bulk.
+    add net.ipv4.tcp_notsent_lowat 131072 \
+        "Send-queue floor; lower = less bufferbloat / lower latency"
+    # UDP floors matter for QUIC and SOCKS5-UDP relay; never lower existing.
+    add net.ipv4.udp_rmem_min \
+        "$(floor_numeric net.ipv4.udp_rmem_min "$FLOOR_UDP_RMEM_MIN")" \
+        "Min recv buffer per UDP socket (floor only)"
+    add net.ipv4.udp_wmem_min \
+        "$(floor_numeric net.ipv4.udp_wmem_min "$FLOOR_UDP_WMEM_MIN")" \
+        "Min send buffer per UDP socket (floor only)"
 
     # --- Faster dead-peer detection (kernel TCP keepalive; NOT sshd) ---
     # WORKLOAD-DEPENDENT: aggressive keepalives detect dead NAT'd peers in
@@ -234,6 +279,51 @@ build_desired() {
     # --- RX headroom ---
     add net.core.netdev_max_backlog 5000 \
         "NIC->kernel queue depth before packets dropped under burst"
+
+    # --- Routing & relay correctness (sing-box TUN / transparent proxy needs this) ---
+    # ip_forward is KERNEL ROUTING, not firewall — required so the box forwards
+    # packets between interfaces/TUN and the real NIC. Does NOT touch nft/iptables.
+    add net.ipv4.ip_forward 1 \
+        "Forward packets between interfaces (required by TUN/relay proxying)"
+    # rp_filter=2 (loose mode): asymmetric paths (NAT, CN-ISP multi-route) would
+    # be DROPPED by the strict default (1). Loose mode accepts them, which is what
+    # a relay/proxy on a variable route needs.
+    add net.ipv4.conf.all.rp_filter 2 \
+        "Loose reverse-path filter -> keeps asymmetric-path relay traffic flowing"
+    add net.ipv4.conf.default.rp_filter 2 \
+        "Loose rp_filter for future interfaces"
+    # Hardening that protects connectivity on a public box: ICMP redirects let a
+    # MITM reroute traffic; disabling them is standard and never hurts a proxy.
+    add net.ipv4.conf.all.accept_redirects 0  "Reject ICMP redirects (hardening)"
+    add net.ipv4.conf.all.secure_redirects 0  "Reject 'secure' ICMP redirects"
+    add net.ipv4.conf.all.send_redirects 0    "Don't emit ICMP redirects (not a router)"
+
+    # --- Neighbor / ARP cache headroom (high dest-IP fan-out) ---
+    # A proxy opening many concurrent streams to many sites can exhaust the
+    # neighbor cache; raising gc_thresh prevents stalls/lookup failures.
+    # WORKLOAD-DEPENDENT: scale these up further on boxes fanning out to tens of
+    # thousands of distinct destinations.
+    add net.ipv4.neigh.default.gc_thresh1 2048 "Neighbor-cache soft limit (parallel dests)"
+    add net.ipv4.neigh.default.gc_thresh2 4096 "Neighbor-cache hard limit (warn)"
+    add net.ipv4.neigh.default.gc_thresh3 8192 "Neighbor-cache absolute limit"
+
+    # --- Per-socket auxiliary memory ---
+    # optmem_max backs ancillary data (e.g. recvmsg control) at high conn counts;
+    # not autotuned, so give it headroom.
+    add net.core.optmem_max 4194304 "Per-socket ancillary buffer ceiling (high conn count)"
+
+    # --- File descriptors (the #1 proxy bottleneck) ---
+    # fs.file-max is the global kernel-wide open-file ceiling. With many relay
+    # streams + downloads open at once the default (~80k-925k) can be hit.
+    # Floor only: never lower an existing higher value.
+    add fs.file-max \
+        "$(floor_numeric fs.file-max "$FILE_MAX_TARGET")" \
+        "System-wide open-file cap (floor only; high concurrent-conn proxy)"
+    # nr_open is the per-process upper bound; must be >= the nofile limit we set
+    # in limits.conf/systemd or raising nofile would be refused.
+    add fs.nr_open \
+        "$(floor_numeric fs.nr_open "$NR_OPEN_TARGET")" \
+        "Per-process open-file ceiling (floor; must be >= nofile)"
 
     # --- Conntrack hygiene (only if the connection tracker is in use) ---
     if conntrack_present; then
@@ -332,6 +422,68 @@ apply_live() {
     sysctl -p "$DROPIN" >/dev/null 2>&1 || true
 }
 
+# --- Non-sysctl file-descriptor limits -------------------------------------
+# A proxy daemon holds many sockets; the default per-process nofile (~1024) is
+# the single biggest real-world bottleneck for streaming/downloads. fs.file-max
+# (sysctl, above) raises the global cap, but the per-process soft/hard nofile is
+# governed by PAM limits — and a systemd *service* ignores PAM entirely, so we
+# also drop a system-wide systemd override (DefaultLimitNOFILE) so sing-box etc.
+# actually inherit the higher limit on restart. See revert_files() for restore.
+apply_limits_files() {
+    local ts
+    ts="$(date +%Y%m%d_%H%M%S)"
+
+    # 1) /etc/security/limits.conf — for interactive/PAM sessions.
+    if [[ -f "$LIMITS_FILE" ]] && [[ ! -f "${BACKUP_DIR}/limits.conf.orig" ]]; then
+        cp -a "$LIMITS_FILE" "${BACKUP_DIR}/limits.conf.orig"
+    fi
+    # Remove any prior clikader block (idempotent), then append a fresh one.
+    if [[ -f "$LIMITS_FILE" ]]; then
+        sed -i '/# BEGIN clikader-tcp limits/,/# END clikader-tcp limits/d' "$LIMITS_FILE"
+        cat >> "$LIMITS_FILE" <<EOF
+
+# BEGIN clikader-tcp limits
+*    soft   nofile   ${NOFILE_LIMIT}
+*    hard   nofile   ${NOFILE_LIMIT}
+root soft   nofile   ${NOFILE_LIMIT}
+root hard   nofile   ${NOFILE_LIMIT}
+# END clikader-tcp limits
+EOF
+        log "Updated ${LIMITS_FILE} (nofile=${NOFILE_LIMIT})"
+    fi
+
+    # 2) systemd system-wide override — for daemons (sing-box) which skip PAM.
+    mkdir -p "$SYSTEMD_OVERRIDE_DIR"
+    cat > "$SYSTEMD_OVERRIDE" <<EOF
+# Managed by clikader tcp -- do not edit.
+# Sets the default nofile for systemd services so proxy daemons (sing-box etc.)
+# inherit a high open-file limit without per-service edits.
+[Manager]
+DefaultLimitNOFILE=${NOFILE_LIMIT}
+EOF
+    log "Wrote systemd override ${SYSTEMD_OVERRIDE}"
+    # Best effort: reload manager. Won't affect already-running services until
+    # they restart, which is expected — the override is for the next start.
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# Scale the conntrack hash table so it doesn't collide at high max. nf_conntrack
+# hashes best when hashsize ~= nf_conntrack_max / 4. Writing the module param
+# resizes live (kernel supports this since 2.6); safe no-op if unavailable.
+apply_conntrack_hashsize() {
+    local param="/sys/module/nf_conntrack/parameters/hashsize"
+    local max target
+    max="$(get_live net.netfilter.nf_conntrack_max)"
+    max="${max//[!0-9]/}"
+    [[ -n "$max" ]] || return 0
+    target=$(( max / 4 ))
+    (( target >= 1024 )) || target=1024
+    if [[ -w "$param" ]]; then
+        echo "$target" > "$param" 2>/dev/null && \
+            log "Set nf_conntrack hashsize=${target} (max=${max})"
+    fi
+}
+
 # --------------------------------------------------------------------------
 # Modes
 # --------------------------------------------------------------------------
@@ -362,13 +514,19 @@ do_apply() {
     neutralize_sysctl_conf
     write_dropin
     apply_live
+    apply_limits_files
+    if conntrack_present; then
+        apply_conntrack_hashsize
+    fi
 
     local n
     n="$(count_neutralized)"
     echo ""
     log "Wrote ${DROPIN} (${#DK_KEYS[@]} keys)"
     log "Neutralized ${n} conflicting key(s) in ${SYSCONF}"
+    log "Set per-process nofile=${NOFILE_LIMIT} (limits.conf + systemd override)"
     echo -e "${GREEN}Done. Boot-time order is correct: zz- drop-in wins.${NC}"
+    info "Proxy daemons (sing-box) must be restarted to pick up the new nofile limit."
 }
 
 do_revert() {
@@ -412,7 +570,22 @@ do_revert() {
     # 4. Reload from files so any non-snapshot drop-ins reassert themselves.
     sysctl --system >/dev/null 2>&1 || true
 
-    # 5. Best-effort cleanup of the BBR module-load hint (leave the module
+    # 5. Restore file-descriptor limits (limits.conf + systemd override).
+    if [[ -f "${BACKUP_DIR}/limits.conf.orig" ]]; then
+        cp -a "${BACKUP_DIR}/limits.conf.orig" "$LIMITS_FILE"
+        log "Restored original ${LIMITS_FILE}"
+    elif [[ -f "$LIMITS_FILE" ]]; then
+        # No backup: just strip our tagged block.
+        sed -i '/# BEGIN clikader-tcp limits/,/# END clikader-tcp limits/d' "$LIMITS_FILE"
+        log "Removed clikader-tcp block from ${LIMITS_FILE}"
+    fi
+    if [[ -f "$SYSTEMD_OVERRIDE" ]]; then
+        rm -f "$SYSTEMD_OVERRIDE"
+        log "Removed systemd override ${SYSTEMD_OVERRIDE}"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # 6. Best-effort cleanup of the BBR module-load hint (leave the module
     #    loaded; rmmod could disrupt live flows).
     rm -f "$BBR_MODULE_FILE" 2>/dev/null || true
 

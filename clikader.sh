@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.3.0"
+CLIKADER_VERSION="1.5.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -61,6 +61,7 @@ show_usage() {
 echo "Commands:"
 echo "  --help, -h, help            Show this help message"
 echo "  update, upgrade             Update CLiKader"
+echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off + hostname"
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
 echo "  apt-reset, aptreset         Run APT source reset tool"
@@ -77,6 +78,7 @@ echo "  --version, -v, version      Show CLiKader version"
     echo "  clikader --help"
     echo "  clikader help"
     echo "  sudo clikader update"
+    echo "  sudo clikader onboard"
     echo "  sudo clikader dns"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
@@ -267,6 +269,70 @@ uninstall_clikader() {
     echo "Or simply start a new shell session."
 }
 
+# Run a single onboarding step. Wraps run_script with a pass/fail banner so the
+# sequence continues even if one step fails (we just report it at the end).
+# Args: step_number script title [extra args...]
+onboard_step() {
+    local num="$1"; shift
+    local script="$1"; shift
+    local title="$1"; shift
+
+    echo ""
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║ Step ${num}/5: ${title}                 ${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if run_script "$script" "$title" "$@"; then
+        ONBOARD_RESULTS+=("Step $num ($title): ${GREEN}OK${NC}")
+        return 0
+    else
+        ONBOARD_RESULTS+=("Step $num ($title): ${RED}FAILED${NC}")
+        warning "Step $num ($title) failed; continuing with remaining steps."
+        return 1
+    fi
+}
+
+onboard_clikader() {
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║       CLiKader Onboarding (5 steps)     ${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    info "Runs all setup steps non-interactively with production defaults:"
+    info "  1. DNS   (direct-IP, default providers, latency-ordered)"
+    info "  2. TCP   (network-stack optimization)"
+    info "  3. APT   (reset to official sources)"
+    info "  4. IPv6  (disabled)"
+    info "  5. Hostname (fix to 127.0.0.1 if not already)"
+    echo ""
+
+    ONBOARD_RESULTS=()
+
+    # 1. DNS — --yes uses direct-IP mode + default providers + proceeds past rerun
+    onboard_step 1 "setup_dns.sh"        "Setup DNS"            "--yes"
+
+    # 2. TCP — non-interactive, apply tuning
+    onboard_step 2 "optimize_tcp.sh"     "TCP/Network Optimization"
+
+    # 3. APT — already non-interactive
+    onboard_step 3 "reset_apt_source.sh" "Reset APT Sources"
+
+    # 4. IPv6 — disable, skip confirm
+    onboard_step 4 "configure_ipv6.sh"   "Disable IPv6"         "--disable" "--yes"
+
+    # 5. Hostname — auto-fix if not pointing to localhost
+    onboard_step 5 "fix_hostname.sh"     "Fix Hostname"         "--fix"
+
+    echo ""
+    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║       Onboarding Summary                ${NC}"
+    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+    for r in "${ONBOARD_RESULTS[@]}"; do
+        echo -e "  • $r"
+    done
+    echo ""
+}
+
 dispatch_command() {
     local command="${1:-}"
     shift || true
@@ -301,6 +367,10 @@ dispatch_command() {
         "ipv6" | "6")
             require_root "$command"
             run_script "configure_ipv6.sh" "Configure IPv6" "$@"
+            ;;
+        "onboard" | "o")
+            require_root "$command"
+            onboard_clikader
             ;;
         "uninstall" | "remove")
             require_root "$command"
