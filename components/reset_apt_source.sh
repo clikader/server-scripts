@@ -449,11 +449,14 @@ verify_sources() {
             done
             
             echo ""
-            log "Content of ubuntu.sources (if exists):"
-            if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-                echo ""
-                grep -v '^#' /etc/apt/sources.list.d/ubuntu.sources | grep -v '^$' || true
-            fi
+            log "Content of the main .sources file (if exists):"
+            for sf in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources; do
+                if [[ -f "$sf" ]]; then
+                    echo ""
+                    log "$(basename "$sf"):"
+                    grep -v '^#' "$sf" | grep -v '^$' || true
+                fi
+            done
             echo ""
         fi
     fi
@@ -473,7 +476,12 @@ main() {
     echo ""
     
     backup_sources
-    
+
+    # Sweep the slate clean BEFORE generating: remove stale third-party .list /
+    # .sources / .save / .gpg files so only our official config remains.
+    # (Must run before generation, otherwise it deletes the file we just wrote.)
+    clean_sources_list_d
+
     # Generate appropriate sources based on OS
     if [[ "$os_name" == "debian" ]]; then
         log "Resetting APT sources for Debian $os_version..."
@@ -511,8 +519,7 @@ main() {
         error "Unsupported OS: $os_name"
         exit 1
     fi
-    
-    clean_sources_list_d
+
     update_apt_cache
     verify_sources
     
