@@ -21,6 +21,14 @@ has_dot_support=false
 use_secure_dns=false
 non_interactive=false   # set by --yes: accept all defaults with no prompts
 
+# Provider data arrays (associative, keyed by 1-based menu index). Populated by
+# load_provider_table from DNS_PROVIDERS; the Custom entry (CUSTOM_DNS_INDEX) is
+# filled on demand by get_custom_dns. Declared at global scope so the latency
+# probe (order_by_latency) and selection code can read them.
+declare -A dns_ipv4
+declare -A dns_ipv6
+declare -A dns_names
+
 # --- Auto-ordering / reachability probe tunables (production defaults) ---
 # Probe each candidate server with one real DNS query; sort reachable ones by
 # measured RTT ascending and drop non-responders so a dead server never lands
@@ -29,6 +37,32 @@ PROBE_TIMEOUT=2          # seconds; per-server query timeout for the probe
 PROBE_QUERY="www.google.com"
 PROBE_QTYPE="A"
 LAST_RESORT_DNS="9.9.9.9 149.112.112.112"  # FallbackDNS: contacted only when every primary is down
+
+# How many providers "auto" mode keeps after probing the whole pool.
+AUTO_PICK_TOP=3
+
+# --- Provider catalogue (single source of truth) ---
+# Ordered array of "name|ipv4-with-DoT|ipv6-with-DoT" records. The menu, the
+# latency probe, and the auto-pick all read from this table, so adding or
+# reordering a provider only changes one place. The index in the array + 1 is
+# the menu number shown to the user (1-based, matching the original script).
+#
+# DoT hostname is embedded as "<ip>#<hostname>" per systemd-resolved syntax.
+# Direct-IP mode strips the "#hostname" suffix before applying (see select_dns_providers).
+#
+# Verified 2026-07: each provider offers public DoT on port 853.
+DNS_PROVIDERS=(
+    "Cloudflare|1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com|2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
+    "Google|8.8.8.8#dns.google 8.8.4.4#dns.google|2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
+    "Quad9|9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net|2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
+    "OpenDNS|208.67.222.222#dns.opendns.com 208.67.220.220#dns.opendns.com|2620:119:35::35#dns.opendns.com 2620:119:53::53#dns.opendns.com"
+    "AdGuard|94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com|2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+    "CleanBrowsing|185.228.168.9#family-filter-dns.cleanbrowsing.org 185.228.169.9#family-filter-dns.cleanbrowsing.org|2a0d:2a00:1::#family-filter-dns.cleanbrowsing.org 2a0d:2a00:2::#family-filter-dns.cleanbrowsing.org"
+    "Control D|76.76.2.0#p0.freedns.controld.com 76.76.10.0#p0.freedns.controld.com|2606:1a40::0#p0.freedns.controld.com 2606:1a40:1::0#p0.freedns.controld.com"
+    "DNS.SB|185.222.222.222#dot.dns.sb 45.11.45.11#dot.dns.sb|2a09::#dot.dns.sb 2a11::#dot.dns.sb"
+)
+# Index of the "Custom DNS" menu entry (always last, after the catalogue).
+CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -58,6 +92,46 @@ error() {
 
 warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# --- Provider catalogue accessors ---
+# All take a 1-based index (1 = first provider in DNS_PROVIDERS).
+
+# Echo the human-readable provider name at index <n>.
+provider_name() {
+    local idx="$1"
+    printf '%s' "${DNS_PROVIDERS[$(( idx - 1 ))]%%|*}"
+}
+
+# Echo the raw IPv4 field (with DoT suffixes) at index <n>.
+provider_ipv4() {
+    local idx="$1"
+    local rec="${DNS_PROVIDERS[$(( idx - 1 ))]}"
+    rec="${rec#*|}"          # drop name
+    printf '%s' "${rec%%|*}" # drop ipv6
+}
+
+# Echo the raw IPv6 field (with DoT suffixes) at index <n>.
+provider_ipv6() {
+    local idx="$1"
+    local rec="${DNS_PROVIDERS[$(( idx - 1 ))]}"
+    rec="${rec#*|}"          # drop name
+    printf '%s' "${rec#*|}"  # drop ipv4
+}
+
+# Populate the legacy dns_ipv4/dns_ipv6/dns_names associative arrays from the
+# catalogue so the existing probe and selection code reads one source of truth.
+# Indexing is 1-based and matches the menu numbers.
+load_provider_table() {
+    dns_ipv4=()
+    dns_ipv6=()
+    dns_names=()
+    local i
+    for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
+        dns_ipv4[$i]="$(provider_ipv4 "$i")"
+        dns_ipv6[$i]="$(provider_ipv6 "$i")"
+        dns_names[$i]="$(provider_name "$i")"
+    done
 }
 
 # Measure latency (ms) to a single DNS server IP by sending one real query.
@@ -101,6 +175,10 @@ probe_server() {
 # portal or no outbound DNS — the loud warning is intentional).
 # Reads dns_ipv4/dns_names via bash dynamic scoping from select_dns_providers.
 # Result is written to global SORTED_SELECTIONS.
+#
+# Probes run in PARALLEL (one background subshell per provider) so wall time
+# stays ~PROBE_TIMEOUT regardless of how many providers are tested — important
+# now that "auto" mode probes the whole 8-provider pool.
 # Args: <space-separated choices>
 order_by_latency() {
     local choices=($@)
@@ -109,7 +187,12 @@ order_by_latency() {
     SORTED_SELECTIONS=""
 
     echo ""
-    log "Probing selected providers (timeout ${PROBE_TIMEOUT}s each)..."
+    log "Probing ${#choices[@]} provider(s) in parallel (timeout ${PROBE_TIMEOUT}s each)..."
+
+    # One temp file per choice so background subshells can write concurrently.
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    local pids=()
 
     for choice in "${choices[@]}"; do
         # Skip choices that have no entry (invalid index or already-handled).
@@ -119,14 +202,40 @@ order_by_latency() {
         # representative target; both IPs of a provider usually share routing.
         probe_ip="$(echo "${dns_ipv4[$choice]}" | awk '{print $1}' | sed 's/#.*//')"
 
-        echo -n "  ${dns_names[$choice]} ($probe_ip)... "
-        if ms=$(probe_server "$probe_ip"); then
+        # Background probe: write the measured ms to the temp file on success,
+        # leave it empty on failure. probe_server is inherited via subshell.
+        (
+            if ms=$(probe_server "$probe_ip"); then
+                printf '%s' "$ms" > "${tmpdir}/${choice}.ms"
+            else
+                : > "${tmpdir}/${choice}.ms"
+            fi
+        ) &
+        pids+=("$!")
+    done
+
+    # Wait for every probe to finish before collecting.
+    local pid
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # Collect results in the original (input) order for readable output.
+    for choice in "${choices[@]}"; do
+        [[ -z "${dns_ipv4[$choice]:-}" ]] && continue
+        probe_ip="$(echo "${dns_ipv4[$choice]}" | awk '{print $1}' | sed 's/#.*//')"
+        ms="$(cat "${tmpdir}/${choice}.ms" 2>/dev/null || true)"
+
+        printf '  %-16s (%s)... ' "${dns_names[$choice]}" "$probe_ip"
+        if [[ -n "$ms" ]]; then
             echo -e "${GREEN}${ms}ms${NC}"
             results+="${ms}|${choice}|${dns_names[$choice]}"$'\n'
         else
             echo -e "${RED}no response${NC} -> dropped"
         fi
     done
+
+    rm -rf "$tmpdir"
 
     if [[ -z "$results" ]]; then
         warning "All probes failed. Keeping your selected order (network may block DNS)."
@@ -288,10 +397,11 @@ get_custom_dns() {
         has_dot_support=true
     fi
 
-    # Return the configuration via global variables
-    dns_ipv4[7]="$dns_config_ipv4"
-    dns_ipv6[7]="$dns_config_ipv6"
-    dns_names[7]="Custom"
+    # Return the configuration via global variables.
+    # CUSTOM_DNS_INDEX is the catalogue length + 1 (9 with the current 8-provider pool).
+    dns_ipv4[$CUSTOM_DNS_INDEX]="$dns_config_ipv4"
+    dns_ipv6[$CUSTOM_DNS_INDEX]="$dns_config_ipv6"
+    dns_names[$CUSTOM_DNS_INDEX]="Custom"
 
     log "Custom DNS configured successfully"
     echo ""
@@ -309,84 +419,74 @@ select_dns_providers() {
     echo "=========================================="
     echo ""
     echo "Available DNS providers:"
-    if [[ "$use_secure_dns" == true ]]; then
-        echo "  1) Cloudflare (1.1.1.1, 1.0.0.1) - DoT: cloudflare-dns.com"
-        echo "  2) Google (8.8.8.8, 8.8.4.4) - DoT: dns.google"
-        echo "  3) Quad9 (9.9.9.9, 149.112.112.112) - DoT: dns.quad9.net"
-        echo "  4) OpenDNS (208.67.222.222, 208.67.220.220) - DoT: dns.opendns.com"
-        echo "  5) AdGuard (94.140.14.14, 94.140.15.15) - DoT: dns.adguard.com"
-        echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9) - DoT: family-filter-dns.cleanbrowsing.org"
-    else
-        echo "  1) Cloudflare (1.1.1.1, 1.0.0.1)"
-        echo "  2) Google (8.8.8.8, 8.8.4.4)"
-        echo "  3) Quad9 (9.9.9.9, 149.112.112.112)"
-        echo "  4) OpenDNS (208.67.222.222, 208.67.220.220)"
-        echo "  5) AdGuard (94.140.14.14, 94.140.15.15)"
-        echo "  6) CleanBrowsing (185.228.168.9, 185.228.169.9)"
-    fi
-    echo "  7) Custom DNS (define your own)"
+    echo "  auto) Automatically test ALL providers and pick the ${AUTO_PICK_TOP} fastest (recommended)"
+
+    # Generate the numbered list from the catalogue so the menu and the data
+    # can never drift apart. Show the DoT hostname only in secure-DNS mode.
+    local i name ipv4_display dot
+    for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
+        name="$(provider_name "$i")"
+        # First IPv4 without the DoT suffix, for display.
+        ipv4_display="$(provider_ipv4 "$i" | awk '{print $1}' | sed 's/#.*//')"
+        if [[ "$use_secure_dns" == true ]]; then
+            dot="$(provider_ipv4 "$i" | awk '{print $1}' | sed 's/.*#//')"
+            printf '  %2d) %s (%s) - DoT: %s\n' "$i" "$name" "$ipv4_display" "$dot"
+        else
+            printf '  %2d) %s (%s)\n' "$i" "$name" "$ipv4_display"
+        fi
+    done
+    echo "  ${CUSTOM_DNS_INDEX}) Custom DNS (define your own)"
     echo ""
-    echo "Enter your choices separated by spaces (e.g., '1 2 3')"
-    echo "All selected providers are queried in order as primary DNS servers."
+    echo "Enter 'auto' to auto-pick the fastest ${AUTO_PICK_TOP}, or your choices"
+    echo "separated by spaces (e.g., '1 2 3'). Selected providers are queried in order."
 
+    # Load the catalogue into the legacy associative arrays the probe/selection
+    # code reads. Custom (index CUSTOM_DNS_INDEX) is filled on demand below.
+    load_provider_table
+
+    local selections=""
     if [[ "$non_interactive" == true ]]; then
-        selections="1 2 5"
-        echo "Selection (default: 1 2 5): $selections  [--yes]"
-        log "Using default selection: Cloudflare, Google, AdGuard"
+        selections="auto"
+        echo "Selection (default: auto): auto  [--yes]"
+        log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
     else
-        echo -n "Selection (default: 1 2 5): "
+        echo -n "Selection (default: auto): "
         read -r selections < /dev/tty
-
         if [[ -z "$selections" ]]; then
-            selections="1 2 5"
-            log "Using default selection: Cloudflare, Google, AdGuard"
+            selections="auto"
+            log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
         fi
     fi
-    
-    declare -A dns_ipv4
-    declare -A dns_ipv6
-    declare -A dns_names
-    
-    dns_ipv4[1]="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
-    dns_ipv6[1]="2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
-    dns_names[1]="Cloudflare"
-    
-    dns_ipv4[2]="8.8.8.8#dns.google 8.8.4.4#dns.google"
-    dns_ipv6[2]="2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
-    dns_names[2]="Google"
-    
-    dns_ipv4[3]="9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net"
-    dns_ipv6[3]="2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
-    dns_names[3]="Quad9"
-    
-    dns_ipv4[4]="208.67.222.222#dns.opendns.com 208.67.220.220#dns.opendns.com"
-    dns_ipv6[4]="2620:119:35::35#dns.opendns.com 2620:119:53::53#dns.opendns.com"
-    dns_names[4]="OpenDNS"
-    
-    dns_ipv4[5]="94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
-    dns_ipv6[5]="2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
-    dns_names[5]="AdGuard"
-    
-    dns_ipv4[6]="185.228.168.9#family-filter-dns.cleanbrowsing.org 185.228.169.9#family-filter-dns.cleanbrowsing.org"
-    dns_ipv6[6]="2a0d:2a00:1::#family-filter-dns.cleanbrowsing.org 2a0d:2a00:2::#family-filter-dns.cleanbrowsing.org"
-    dns_names[6]="CleanBrowsing"
-    
-    # Check if custom DNS (option 7) is selected
-    if echo "$selections" | grep -qw "7"; then
+
+    # Normalize the selection: lowercase the first token to detect 'auto'.
+    local is_auto=false
+    local first_token="${selections%% *}"
+    if [[ "${first_token,,}" == "auto" || "${first_token,,}" == "a" ]]; then
+        is_auto=true
+        # In auto mode, probe the entire pool and keep the fastest N.
+        selections=""
+        for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
+            selections+="$i "
+        done
+    fi
+
+    # Check if custom DNS is selected; if so, collect its details.
+    local has_custom=false
+    if echo "$selections" | grep -qw "$CUSTOM_DNS_INDEX"; then
         if ! get_custom_dns; then
             error "Failed to configure custom DNS. Aborting."
             exit 1
         fi
+        has_custom=true
     fi
 
     # Probe each selected provider and reorder by measured latency (fastest
-    # first), dropping any that don't respond. Custom DNS (option 7) skips the
-    # probe — the user supplied the targets intentionally.
+    # first), dropping any that don't respond. Custom DNS skips the probe — the
+    # user supplied the targets intentionally.
     local probeable_selections=()
-    local has_custom=false
     for c in $selections; do
-        if [[ "$c" == "7" ]]; then
-            has_custom=true
+        if [[ "$c" == "$CUSTOM_DNS_INDEX" ]]; then
+            continue
         elif [[ -n "${dns_ipv4[$c]:-}" ]]; then
             probeable_selections+=("$c")
         fi
@@ -398,9 +498,24 @@ select_dns_providers() {
         SORTED_SELECTIONS=""
     fi
 
+    # In auto mode, keep only the fastest AUTO_PICK_TOP providers.
+    if [[ "$is_auto" == true ]]; then
+        local trimmed=""
+        local kept=0
+        for c in $SORTED_SELECTIONS; do
+            (( kept >= AUTO_PICK_TOP )) && break
+            trimmed+="$c "
+            (( kept++ ))
+        done
+        if (( kept < AUTO_PICK_TOP )); then
+            warning "Only ${kept} of ${AUTO_PICK_TOP} providers responded; using those."
+        fi
+        SORTED_SELECTIONS="$trimmed"
+    fi
+
     # Final iteration order: latency-sorted providers, then custom (if any).
     local final_order="$SORTED_SELECTIONS"
-    $has_custom && final_order+=" 7"
+    $has_custom && final_order+=" $CUSTOM_DNS_INDEX"
 
     primary_dns=""
     selected_names=()

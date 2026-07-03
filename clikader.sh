@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.5.3"
+CLIKADER_VERSION="1.7.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -61,6 +61,7 @@ show_usage() {
 echo "Commands:"
 echo "  --help, -h, help            Show this help message"
 echo "  update, upgrade             Update CLiKader"
+echo "  setup, vpssetup             Full fresh-server setup (upgrade, ssh, ufw, fail2ban, onboard)"
 echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off + hostname"
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
@@ -74,11 +75,13 @@ echo "  --version, -v, version      Show CLiKader version"
     echo "  clikader                    Alias of 'clikader --help'"
     echo "  clikader help               Alias of 'clikader --help'"
     echo ""
-    echo "Examples:"
-    echo "  clikader --help"
-    echo "  clikader help"
-    echo "  sudo clikader update"
-    echo "  sudo clikader onboard"
+echo "Examples:"
+echo "  clikader --help"
+echo "  clikader help"
+echo "  sudo clikader update"
+echo "  sudo clikader setup"
+echo "  sudo clikader vpssetup --force"
+echo "  sudo clikader onboard"
     echo "  sudo clikader dns"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
@@ -347,6 +350,10 @@ dispatch_command() {
         "update" | "upgrade")
             require_root "$command"
             update_clikader
+            ;;
+        "setup" | "vpssetup")
+            require_root "$command"
+            run_script "setup_vps.sh" "VPS Setup" "$@"
             ;;
         "dns")
             require_root "$command"

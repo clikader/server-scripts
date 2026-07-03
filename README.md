@@ -39,6 +39,8 @@ Master entrypoint with direct sub-commands for all server management tasks.
 **Commands:**
 - `clikader --help` / `clikader help` / `clikader`
 - `clikader update` / `clikader upgrade`
+- `clikader setup` / `clikader vpssetup`
+- `clikader onboard` / `clikader o`
 - `clikader dns`
 - `clikader apt-reset` / `clikader aptreset`
 - `clikader hostname`
@@ -50,7 +52,57 @@ Master entrypoint with direct sub-commands for all server management tasks.
 
 All component scripts are in the `components/` folder and accessed through `clikader.sh`.
 
-### 1. Reset APT Sources
+### 1. VPS Setup (`setup` / `vpssetup`)
+One-shot setup for a freshly installed Debian server. Runs the full baseline:
+
+1. Upgrade to Debian 13 (Trixie) — one release hop at a time, with a reboot in between
+2. Prefer IPv4 (`/etc/gai.conf`)
+3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq ufw`)
+4. Enable chrony for NTP time sync
+5. SSH hardening — custom port, `PermitRootLogin prohibit-password`, add your public key
+6. Configure UFW (SSH port + custom ports)
+7. Configure fail2ban to protect sshd
+8. Run `clikader o` for the remaining onboarding (DNS, TCP, APT, IPv6, hostname)
+
+Prompts for the SSH port, your public key, and any extra ports to open — or pass them
+as flags for a fully non-interactive run. Survives the release-upgrade reboot: answers
+and progress are saved to `/etc/clikader/setup.state`, so re-running `clikader setup`
+after the reboot resumes from where it stopped.
+
+**Parameters** (omit any to be prompted for it interactively):
+- `--ssh-port <port>` — SSH port to configure (1-65535)
+- `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`)
+- `--additional-ports <ports>` — extra UFW ports, comma/space separated (e.g. `36158,443`)
+
+**Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
+will refuse to run again. Use `--force` to re-run the whole flow or `--reset` to wipe
+state and start over.
+
+```bash
+# Interactive (prompts for everything)
+sudo clikader setup
+
+# Fully non-interactive
+sudo clikader setup --ssh-port 14419 --ssh-key "ssh-ed25519 AAAA... me@host" --additional-ports 36158,443
+
+# After the upgrade reboot (auto-resumes from where it stopped)
+sudo clikader setup
+
+sudo clikader setup --force    # re-run on an already-configured server
+sudo clikader setup --reset    # wipe state and start fresh
+```
+
+**Files modified by this script:**
+- `/etc/apt/sources.list` and `/etc/apt/sources.list.d/*` (codename rewrite during upgrade)
+- `/etc/gai.conf` (IPv4 preference)
+- `/etc/ssh/sshd_config` (Port, PermitRootLogin) + `.backup_<timestamp>`
+- `/root/.ssh/authorized_keys` (your public key)
+- `/etc/fail2ban/jail.local`
+- `/etc/clikader/setup.state` (saved answers + progress)
+
+---
+
+### 2. Reset APT Sources
 Resets APT sources to official repositories for Debian and Ubuntu systems.
 
 **Supported Systems:**
@@ -72,15 +124,17 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 
 ---
 
-### 2. Setup DNS
+### 3. Setup DNS
 Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 22.04/24.04/26 (other OS versions may work but are user-tested).
 
-**DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Custom
+**DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Control D, DNS.SB, Custom
 
 **Features:**
 - Defaults to plain direct-IP DNS
 - Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation
 - IPv6 support (optional)
+- **Auto mode (default):** probes all 8 providers in parallel and picks the 3 fastest — ideal when regional latency varies
+- Manually select specific providers if preferred
 - All selected DNS providers are queried in order as primary servers
 - Auto-orders selected providers by measured latency (fastest first) and drops unresponsive ones
 - Static last-resort `FallbackDNS` for when all primaries are down
@@ -94,7 +148,7 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 
 ---
 
-### 3. Fix Hostname
+### 4. Fix Hostname
 Fixes hostname resolution issues and allows changing the system hostname.
 
 **Common VPS Issue:**
@@ -115,7 +169,7 @@ sudo: unable to resolve host your-hostname
 
 ---
 
-### 4. Configure IPv6
+### 5. Configure IPv6
 Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addresses.
 
 **Features:**
