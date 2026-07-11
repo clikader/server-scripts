@@ -499,13 +499,18 @@ select_dns_providers() {
     fi
 
     # In auto mode, keep only the fastest AUTO_PICK_TOP providers.
+    # Note: do not use bare `(( kept++ ))` under `set -e` — post-increment from
+    # 0 evaluates to 0 and returns exit status 1, aborting the script right
+    # after a successful probe run (exactly when auto mode should keep going).
     if [[ "$is_auto" == true ]]; then
         local trimmed=""
         local kept=0
         for c in $SORTED_SELECTIONS; do
-            (( kept >= AUTO_PICK_TOP )) && break
+            if (( kept >= AUTO_PICK_TOP )); then
+                break
+            fi
             trimmed+="$c "
-            (( kept++ ))
+            kept=$((kept + 1))
         done
         if (( kept < AUTO_PICK_TOP )); then
             warning "Only ${kept} of ${AUTO_PICK_TOP} providers responded; using those."
@@ -515,7 +520,9 @@ select_dns_providers() {
 
     # Final iteration order: latency-sorted providers, then custom (if any).
     local final_order="$SORTED_SELECTIONS"
-    $has_custom && final_order+=" $CUSTOM_DNS_INDEX"
+    if [[ "$has_custom" == true ]]; then
+        final_order+=" $CUSTOM_DNS_INDEX"
+    fi
 
     primary_dns=""
     selected_names=()
