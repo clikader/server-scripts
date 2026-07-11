@@ -7,6 +7,10 @@
 
 set -euo pipefail
 
+# Bump whenever this component's behavior changes so downloaded runs are
+# identifiable in logs (clikader itself may be a different version).
+SETUP_DNS_REVISION="1.7.2"
+
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -246,10 +250,16 @@ order_by_latency() {
         return 0
     fi
 
+    # Explicit return 0 so a `while read` that ends on EOF cannot leak a
+    # non-zero status into the caller under `set -e`.
     while IFS='|' read -r ms choice name; do
-        [[ -z "$choice" ]] && continue
+        if [[ -z "${choice:-}" ]]; then
+            continue
+        fi
         SORTED_SELECTIONS+="$choice "
     done < <(printf '%s' "$results" | sort -t'|' -k1,1n)
+
+    return 0
 }
 
 ask_secure_dns() {
@@ -327,6 +337,7 @@ if [[ "$supported" != true ]]; then
     echo ""
 fi
 
+log "setup_dns revision ${SETUP_DNS_REVISION}"
 log "Detected: $ID $VERSION_ID"
 
 if [[ "$ipv6_support" == true ]]; then
@@ -721,22 +732,32 @@ EOF
     
     if ! command -v resolvectl &> /dev/null; then
         log "Installing systemd-resolved..."
-        apt-get update -qq > /dev/null 2>&1
-        apt-get install -y systemd-resolved > /dev/null 2>&1
+        # Keep apt output on failure visible; never let a quiet non-zero exit
+        # abort the script with no explanation under `set -e`.
+        if ! apt-get update -qq; then
+            error "apt-get update failed while installing systemd-resolved"
+            return 1
+        fi
+        if ! apt-get install -y systemd-resolved; then
+            error "Failed to install systemd-resolved"
+            return 1
+        fi
     fi
     
     # Remove resolvconf if present (common on older Debian/Ubuntu)
     if dpkg -s resolvconf &> /dev/null 2>&1; then
         log "Detected 'resolvconf' package, uninstalling..."
-        apt-get remove -y resolvconf > /dev/null 2>&1
+        apt-get remove -y resolvconf || true
         rm -f /etc/resolv.conf
         log "✅ 'resolvconf' successfully uninstalled"
     fi
     
     log "Enabling and starting systemd-resolved service..."
+    # systemctl returns non-zero in several non-fatal cases (already enabled,
+    # masked edge cases, etc.). Never let that kill the script under set -e.
     systemctl unmask systemd-resolved 2>/dev/null || true
-    systemctl enable systemd-resolved 2>/dev/null
-    systemctl start systemd-resolved 2>/dev/null
+    systemctl enable systemd-resolved 2>/dev/null || true
+    systemctl start systemd-resolved 2>/dev/null || true
     
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
     generate_resolved_config
@@ -744,7 +765,10 @@ EOF
     unlock_resolv_conf
     rm -f /etc/resolv.conf 2>/dev/null || true
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    systemctl restart systemd-resolved
+    systemctl restart systemd-resolved || {
+        error "Failed to restart systemd-resolved"
+        return 1
+    }
     sleep 2
     
     log "✅ DNS purification and hardening complete!"

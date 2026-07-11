@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.7.1"
+CLIKADER_VERSION="1.7.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -111,10 +111,16 @@ run_script() {
         script_to_run="$local_script"
     else
         warning "Local script not found, downloading from GitHub..."
-        info "URL: ${GITHUB_RAW_BASE}/${script_name}"
+        # Cache-bust: raw.githubusercontent.com is CDN-cached (max-age=300).
+        # A query string keeps VPS downloads aligned with this clikader version.
+        local download_url="${GITHUB_RAW_BASE}/${script_name}?v=${CLIKADER_VERSION}"
+        info "URL: ${download_url}"
         echo ""
 
-        if curl -fsSL "${GITHUB_RAW_BASE}/${script_name}" -o "$tmp_script"; then
+        if curl -fsSL \
+            -H 'Cache-Control: no-cache' \
+            -H 'Pragma: no-cache' \
+            "$download_url" -o "$tmp_script"; then
             log "Downloaded successfully"
             script_to_run="$tmp_script"
             downloaded=1
@@ -168,7 +174,12 @@ update_clikader() {
     info "Checking for updates..."
 
     local tmp_file="/tmp/clikader_latest.sh"
-    if ! curl -fsSL "${GITHUB_RAW_BASE%/components}/clikader.sh" -o "$tmp_file" 2>/dev/null; then
+    # Cache-bust so update checks are not stuck on a stale CDN object.
+    if ! curl -fsSL \
+        -H 'Cache-Control: no-cache' \
+        -H 'Pragma: no-cache' \
+        "${GITHUB_RAW_BASE%/components}/clikader.sh?v=$(date +%s)" \
+        -o "$tmp_file" 2>/dev/null; then
         error "Failed to check for updates"
         echo "Please check your internet connection"
         return 1
