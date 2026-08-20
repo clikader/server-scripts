@@ -437,7 +437,7 @@ step_prefer_ipv4() {
 # --- Step 3: Install base packages ---
 step_install_packages() {
     step_banner 3 "Install base packages"
-    local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq ufw)
+    local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq ufw fping)
     log "Installing: ${pkgs[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y "${pkgs[@]}"
