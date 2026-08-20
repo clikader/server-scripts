@@ -198,6 +198,8 @@ build_desired() {
     # --- Ramp-up & reuse: fast resume of idle relay streams + TFO reconnect ---
     add net.ipv4.tcp_slow_start_after_idle 0 \
         "Don't reset cwnd after idle -> long-lived relay streams resume at speed"
+    add net.ipv4.tcp_no_metrics_save 1 \
+        "Don't cache dst metrics -> lossy conns can't poison next conn's slow start"
     add net.ipv4.tcp_fastopen 3 \
         "TFO client+server -> 1 RTT saved on reconnect"
     add net.ipv4.tcp_mtu_probing 1 \
