@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.7.2"
+CLIKADER_VERSION="1.7.4"
 
 # Color codes for output
 RED='\033[0;31m'
