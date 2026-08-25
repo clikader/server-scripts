@@ -4,7 +4,7 @@
 #
 # Brings a freshly installed Debian 11/12/13 box to the clikader baseline:
 # upgrade to Debian 13, prefer IPv4, install base packages, chrony, SSH
-# hardening, UFW, fail2ban, then run `clikader o` for the remaining onboarding.
+# hardening, nftables, fail2ban, then run `clikader o` for the remaining onboarding.
 #
 # Survives the reboot a major-version upgrade requires: answers and progress
 # are persisted to /etc/clikader/setup.state, so re-running `clikader setup`
@@ -94,12 +94,12 @@ Usage: clikader setup [options]
 
 Full fresh-server setup for Debian 11/12/13:
   upgrade to Debian 13, prefer IPv4, base packages, chrony, SSH hardening,
-  UFW, fail2ban, then \`clikader o\`.
+  nftables, fail2ban, then \`clikader o\`.
 
 Setup parameters (omit any to be prompted for it interactively):
   --ssh-port <port>            SSH port to configure (1-65535)
   --ssh-key <key>              Public key line for root (e.g. "ssh-ed25519 AAAA... me@h")
-  --additional-ports <ports>   Extra UFW ports, comma/space separated (e.g. "36158,443")
+  --additional-ports <ports>   Extra ports to open in nftables, comma/space separated (e.g. "36158,443")
 
 Run modes:
   --force   Re-run the entire flow even if already completed.
@@ -306,7 +306,7 @@ collect_inputs() {
         log "Additional ports already set: ${extra_ports:-none}"
     else
         while true; do
-            echo -n "Additional ports to open in UFW (space/comma separated, blank for none): "
+            echo -n "Additional ports to open in the firewall (space/comma separated, blank for none): "
             read -r raw_extra < /dev/tty
             if extra_ports="$(normalize_port_list "$raw_extra")"; then
                 break
@@ -437,7 +437,7 @@ step_prefer_ipv4() {
 # --- Step 3: Install base packages ---
 step_install_packages() {
     step_banner 3 "Install base packages"
-    local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq ufw fping)
+    local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables fping)
     log "Installing: ${pkgs[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y "${pkgs[@]}"
@@ -456,36 +456,87 @@ step_enable_chrony() {
 }
 
 # --- Step 5: SSH hardening + authorized_keys ---
+#
+# Provider images routinely defeat a plain "change Port in /etc/ssh/sshd_config":
+#   * /etc/ssh/sshd_config.d/*.conf drop-ins: Debian's Include sits at the TOP
+#     of sshd_config and sshd is first-value-wins, so a provider drop-in beats
+#     anything appended at the bottom — and multiple Port lines make sshd
+#     listen on ALL of them. cloud-init drop-ins commonly set
+#     PasswordAuthentication yes; some providers even set PubkeyAuthentication
+#     no, which combined with prohibit-password locks root out entirely.
+#   * ssh.socket activation (Debian 12/13): systemd holds the listener on
+#     ListenStream=22 and Port in sshd_config is ignored completely.
+# So this step scrubs the drop-ins, puts a managed block at the very top of
+# the main config, disables socket activation, then VERIFIES the effective
+# config and the actual listener instead of trusting the sshd -t syntax check.
 step_ssh_hardening() {
     step_banner 5 "SSH hardening + authorized key"
 
     local sshd_config="/etc/ssh/sshd_config"
-    local ts
+    local sshd_conf_dir="/etc/ssh/sshd_config.d"
+    local ts f
     ts="$(date +%Y%m%d_%H%M%S)"
+
+    # Directives this step owns, wherever sshd reads them from.
+    local managed_keywords='Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication'
+
+    # --- Recon: what is effectively running right now? ---
+    local current_ports
+    current_ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | tr '\n' ' ' | sed 's/ $//')"
+    info "Effective sshd port(s) before hardening: ${current_ports:-unknown}"
+    if [[ -n "$current_ports" && " ${current_ports} " != *" ${ssh_port} "* ]]; then
+        warning "Provider SSH port (${current_ports}) differs from the requested ${ssh_port}."
+    fi
+    local drop_ins=()
+    while IFS= read -r f; do
+        drop_ins+=("$f")
+    done < <(compgen -G "${sshd_conf_dir}/*.conf" || true)
+    if (( ${#drop_ins[@]} )); then
+        info "sshd drop-ins present: ${drop_ins[*]}"
+    fi
+
     cp "$sshd_config" "${sshd_config}.backup_${ts}"
     log "Backed up ${sshd_config} to ${sshd_config}.backup_${ts}"
 
-    # Remove any existing Port directives, then append our single Port line.
-    sed -i -E '/^[[:space:]]*Port[[:space:]]+/d' "$sshd_config"
-    echo "Port ${ssh_port}" >> "$sshd_config"
+    # --- Drop-ins: comment out our directives so they cannot override us. ---
+    for f in "${drop_ins[@]}"; do
+        if grep -qE "^[[:space:]]*(${managed_keywords})[[:space:]]" "$f"; then
+            cp "$f" "${f}.backup_${ts}"
+            sed -i -E "s@^([[:space:]]*)(${managed_keywords})([[:space:]].*)?@\1# [clikader setup] superseded: \2\3@" "$f"
+            log "Neutralized provider directives in ${f} (backup: ${f}.backup_${ts})"
+        fi
+    done
 
-    # Force PermitRootLogin to prohibit-password (key-only root login).
-    if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+' "$sshd_config"; then
-        sed -i -E "s|^[[:space:]]*PermitRootLogin.*|PermitRootLogin prohibit-password|" "$sshd_config"
-    else
-        echo "PermitRootLogin prohibit-password" >> "$sshd_config"
-    fi
+    # --- Main config: replace previous managed block, then re-add at the top ---
+    # (top placement wins under sshd's first-value-wins rule, ahead of the
+    # Include line and anything a provider may add later)
+    sed -i '/^# --- BEGIN clikader sshd settings ---$/,/^# --- END clikader sshd settings ---$/d' "$sshd_config"
+    sed -i -E "/^[[:space:]]*(${managed_keywords})[[:space:]]/d" "$sshd_config"
+    {
+        echo "# --- BEGIN clikader sshd settings ---"
+        echo "# Managed by clikader setup; supersedes the provider defaults below"
+        echo "# and in sshd_config.d/*.conf (first obtained value wins in sshd)."
+        echo "Port ${ssh_port}"
+        echo "PermitRootLogin prohibit-password"
+        echo "PasswordAuthentication no"
+        echo "PubkeyAuthentication yes"
+        echo "KbdInteractiveAuthentication no"
+        echo "# --- END clikader sshd settings ---"
+    } | cat - "$sshd_config" > "${sshd_config}.new"
+    chmod --reference="$sshd_config" "${sshd_config}.new"
+    mv "${sshd_config}.new" "$sshd_config"
 
     # Validate config before restarting so a bad edit doesn't lock us out.
-    if ! sshd -t 2>/dev/null; then
+    local sshd_test
+    if ! sshd_test="$(sshd -t 2>&1)"; then
         error "sshd config validation failed; NOT restarting sshd."
+        [[ -n "$sshd_test" ]] && error "$sshd_test"
         error "Inspect ${sshd_config} and its .backup_${ts} before continuing."
         return 1
     fi
-    systemctl restart sshd
-    log "sshd restarted on port ${ssh_port} (root login: prohibit-password)"
 
-    # authorized_keys: create with correct perms, add key only if missing.
+    # authorized_keys BEFORE any restart: password auth is about to be turned
+    # off, so the key must already be in place or root gets locked out.
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
     touch /root/.ssh/authorized_keys
@@ -497,34 +548,205 @@ step_ssh_hardening() {
         log "Public key already present in /root/.ssh/authorized_keys"
     fi
 
+    # Socket activation: while ssh.socket holds the listener, Port in
+    # sshd_config is ignored. Fall back to the classic always-running daemon.
+    if systemctl is-active ssh.socket &>/dev/null || systemctl is-enabled ssh.socket &>/dev/null; then
+        log "ssh.socket activation is in use; Port in sshd_config would be ignored."
+        log "Disabling ssh.socket, enabling ssh.service so our Port takes effect."
+        systemctl disable --now ssh.socket
+        systemctl enable ssh.service >/dev/null 2>&1
+    fi
+    systemctl restart sshd
+
+    # --- Verify: effective config AND real listener, not just exit codes. ---
+    local effective eff_ports eff_pw eff_pk eff_prl fail=0
+    effective="$(sshd -T 2>/dev/null)"
+    eff_ports="$(awk '$1 == "port" {print $2}' <<<"$effective" | tr '\n' ' ' | sed 's/ $//')"
+    eff_pw="$(awk '$1 == "passwordauthentication" {print $2}' <<<"$effective")"
+    eff_pk="$(awk '$1 == "pubkeyauthentication" {print $2}' <<<"$effective")"
+    eff_prl="$(awk '$1 == "permitrootlogin" {print $2}' <<<"$effective")"
+
+    if [[ -z "$effective" ]]; then
+        error "Cannot read effective sshd config (sshd -T failed); verify manually."
+        fail=1
+    fi
+    if [[ "$eff_ports" != "$ssh_port" ]]; then
+        error "Effective sshd port is '${eff_ports:-unset}', expected '${ssh_port}'."
+        error "A drop-in or ssh.socket may still override sshd_config — check:"
+        error "  grep -r 'Port' ${sshd_conf_dir}/ ; systemctl status ssh.socket"
+        fail=1
+    fi
+    if [[ "$eff_pw" != "no" ]]; then
+        error "Effective PasswordAuthentication is '${eff_pw}', expected 'no'."
+        fail=1
+    fi
+    if [[ "$eff_pk" != "yes" ]]; then
+        error "Effective PubkeyAuthentication is '${eff_pk}', expected 'yes'."
+        fail=1
+    fi
+    if [[ "$eff_prl" != "prohibit-password" ]]; then
+        error "Effective PermitRootLogin is '${eff_prl}', expected 'prohibit-password'."
+        fail=1
+    fi
+
+    # Actual listener state (ss -tlnp): is anything really bound to our port?
+    local sshd_listeners
+    sshd_listeners="$(ss -tlnp 2>/dev/null | grep -i sshd || true)"
+    if grep -qE ":${ssh_port}\b" <<<"$sshd_listeners"; then
+        log "sshd is listening on port ${ssh_port}"
+    else
+        error "No sshd listener found on port ${ssh_port} (ss -tlnp)."
+        fail=1
+    fi
+    local stray
+    stray="$(grep -vE ":${ssh_port}\b" <<<"$sshd_listeners" || true)"
+    if [[ -n "$stray" ]]; then
+        warning "sshd also listening on another port (leftover provider config?):"
+        echo "$stray"
+    fi
+    if (( fail )); then
+        error "SSH hardening verification FAILED. Your current session stays alive,"
+        error "but fix the above before disconnecting (backups: *.backup_${ts})."
+        return 1
+    fi
+    log "sshd verified: port ${ssh_port}, key-only root (password auth disabled)"
+
     last_step=5
     save_state
 }
 
-# --- Step 6: UFW firewall ---
-step_configure_ufw() {
-    step_banner 6 "Configure UFW firewall"
-    ufw allow "${ssh_port}/tcp"
-    log "Allowed SSH port ${ssh_port}/tcp"
+# --- Step 6: nftables firewall ---
+# Plain nftables (no ufw) so future port forwarding (DNAT + forward to another
+# machine) is just a rule away instead of a firewall-stack migration. Only
+# clikader-owned tables are managed — never 'flush ruleset', which would also
+# wipe fail2ban's f2b-table while the service is running. fail2ban's nftables
+# ban action hooks its own drop chain in ahead of this filter table.
+step_configure_nftables() {
+    step_banner 6 "Configure nftables firewall"
+
+    # Migrate servers set up by older clikader versions that used ufw.
+    if command -v ufw &>/dev/null; then
+        warning "ufw is installed; migrating its rules to nftables."
+        ufw --force disable 2>/dev/null || true
+        apt-get purge -y ufw || true
+        log "ufw disabled and removed"
+    fi
+
+    local nft_conf="/etc/nftables.conf"
+    local ts
+    ts="$(date +%Y%m%d_%H%M%S)"
+    # Keep the distro-shipped file once; never back up our own generated one.
+    if [[ -f "$nft_conf" ]] && ! grep -q 'Managed by clikader setup' "$nft_conf"; then
+        cp "$nft_conf" "${nft_conf}.backup_${ts}"
+        log "Backed up original ${nft_conf} to ${nft_conf}.backup_${ts}"
+    fi
+
+    # Port sets: SSH over tcp; extra ports get both tcp and udp (parity with
+    # the old `ufw allow <port>` behavior).
+    local tcp_list="${ssh_port}" udp_list="" p
     if [[ -n "$extra_ports" ]]; then
         for p in $extra_ports; do
-            ufw allow "${p}"
-            log "Allowed port ${p}"
+            tcp_list+=", ${p}"
         done
+        udp_list="${extra_ports// /, }"
     fi
-    ufw --force enable
-    log "UFW enabled"
-    ufw status
+    local udp_rule=""
+    [[ -n "$udp_list" ]] && udp_rule="        udp dport { ${udp_list} } accept comment \"extra udp ports\""
+
+    cat > "$nft_conf" <<EOF
+#!/usr/sbin/nft -f
+#
+# Managed by clikader setup; regenerated by 'clikader setup --force'.
+#
+# clikader-owned tables only. The add+delete pairs make re-applying this file
+# idempotent (and work on old nft versions that lack 'destroy table').
+add table inet clikader_filter
+delete table inet clikader_filter
+add table inet clikader_nat
+delete table inet clikader_nat
+
+table inet clikader_filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+        ct state invalid drop
+        ct state { established, related } accept
+        ip protocol icmp accept
+        meta l4proto ipv6-icmp accept
+        udp sport bootps dport bootpc accept comment "DHCP client replies"
+
+        tcp dport { ${tcp_list} } accept comment "ssh + extra tcp ports"
+${udp_rule}
+
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state { established, related } accept
+        # Future port forwarding: permit DNAT'd traffic here, e.g.
+        #   ip daddr 10.0.0.5 tcp dport 443 accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+
+table inet clikader_nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        # Future port forwarding — send inbound traffic to another machine:
+        #   ip daddr <this-server-ip> tcp dport 443 dnat to 10.0.0.5:443
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        # Future port forwarding — masquerade forwarded traffic back out:
+        #   ip saddr 10.0.0.0/24 oifname "eth0" masquerade
+    }
+}
+EOF
+    log "Wrote ${nft_conf} (ssh ${ssh_port}/tcp, extra ports: ${extra_ports:-none})"
+
+    # Validate before applying so a syntax error can't cut this session off.
+    local nft_check
+    if ! nft_check="$(nft -c -f "$nft_conf" 2>&1)"; then
+        error "nftables ruleset failed validation; NOT applying."
+        [[ -n "$nft_check" ]] && error "$nft_check"
+        return 1
+    fi
+    log "nftables ruleset validated (nft -c)"
+
+    systemctl enable nftables >/dev/null 2>&1
+    if systemctl is-active nftables &>/dev/null; then
+        systemctl restart nftables
+    else
+        systemctl start nftables
+    fi
+
+    # Verify the table actually loaded (service exit code alone is not proof).
+    if ! nft list table inet clikader_filter &>/dev/null; then
+        error "nftables service is running but clikader_filter is not loaded."
+        error "Inspect: systemctl status nftables ; nft -c -f ${nft_conf}"
+        return 1
+    fi
+    log "nftables enabled and clikader_filter loaded"
+    nft list table inet clikader_filter
     last_step=6
     save_state
 }
 
 # --- Step 7: fail2ban (SSH protection) ---
-# Config targets Debian 13's fail2ban 1.1.0 defaults: systemd journal backend
-# (so no logpath needed) and nftables ban action. On the [sshd] jail the
-# systemd backend auto-detects the ssh.service journal match, so we only pin
-# the port (must match the custom sshd port; the default `port = ssh` token
-# resolves to 22 and would watch the wrong port).
+# Pinned explicitly so the jail cannot silently fail:
+#   * backend = systemd reads auth failures straight from the journal (no
+#     logpath); journalmatch covers both unit names (Debian runs ssh.service,
+#     not sshd.service — a mismatch is the classic "never bans" failure).
+#   * banaction = nftables-native actions, matching the step-6 firewall;
+#     fail2ban manages its own f2b-table independent of clikader_filter.
+#   * port must match the custom sshd port; the default `port = ssh` token
+#     resolves to 22 and would watch the wrong port.
+# A test ban at the end proves the journal->jail->nftables path really works.
 step_setup_fail2ban() {
     step_banner 7 "Configure fail2ban for SSH"
     cat > /etc/fail2ban/jail.local <<EOF
@@ -534,13 +756,20 @@ ignoreip = 127.0.0.1/8 ::1
 bantime = 3600
 findtime = 600
 maxretry = 5
+# Native nftables ban actions (keeps fail2ban aligned with the clikader
+# firewall; it creates its own f2b-table, not clikader_filter).
+banaction = nftables-multiport
+banaction_allports = nftables-allports
 
 [sshd]
 enabled = true
 port = ${ssh_port}
 backend = systemd
+# Debian's unit is ssh.service; sshd.service is the upstream name. The '+'
+# ORs the two journal matches so either journal name is picked up.
+journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service
 EOF
-    log "Wrote /etc/fail2ban/jail.local (sshd port ${ssh_port}, backend systemd)"
+    log "Wrote /etc/fail2ban/jail.local (sshd port ${ssh_port}, backend systemd, nftables bans)"
 
     # Validate config before touching the running service.
     if ! fail2ban-client -t >/dev/null 2>&1; then
@@ -554,7 +783,24 @@ EOF
     sleep 2
     systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban
     sleep 2
-    fail2ban-client status
+    fail2ban-client status sshd
+
+    # End-to-end self-test: prove a ban actually lands in nftables.
+    # 192.0.2.1 is TEST-NET-1 (RFC 5737 documentation range, never routable).
+    local test_ip="192.0.2.1"
+    if fail2ban-client set sshd banip "$test_ip" >/dev/null 2>&1; then
+        if nft list ruleset 2>/dev/null | grep -q "$test_ip"; then
+            log "Self-test passed: test ban ${test_ip} appeared in the nftables ruleset"
+        else
+            warning "Self-test: ${test_ip} was banned but NOT found in 'nft list ruleset'."
+            warning "The banaction is broken; bans would be invisible to the firewall."
+        fi
+        fail2ban-client set sshd unbanip "$test_ip" >/dev/null 2>&1 || true
+    else
+        warning "Self-test: 'fail2ban-client set sshd banip' failed; the sshd jail"
+        warning "may not be running. Check: systemctl status fail2ban"
+    fi
+    info "Bans are logged to /var/log/fail2ban.log; live view: fail2ban-client get sshd banned"
     last_step=7
     save_state
 }
@@ -587,7 +833,7 @@ run_step_if_needed() {
         3) step_install_packages ;;
         4) step_enable_chrony ;;
         5) step_ssh_hardening ;;
-        6) step_configure_ufw ;;
+        6) step_configure_nftables ;;
         7) step_setup_fail2ban ;;
         8) step_run_onboard ;;
         *) error "Unknown step ${num}"; return 1 ;;
@@ -676,10 +922,10 @@ main() {
     echo ""
     info "Summary:"
     echo "  • OS:           Debian ${debian_major} (${debian_codename})"
-    echo "  • SSH port:     ${ssh_port} (root login: prohibit-password)"
+    echo "  • SSH port:     ${ssh_port} (key-only root, password auth disabled)"
     echo "  • Extra ports:  ${extra_ports:-none}"
-    echo "  • fail2ban:     protecting sshd on port ${ssh_port}"
-    echo "  • UFW:          enabled"
+    echo "  • fail2ban:     protecting sshd on port ${ssh_port} (nftables bans)"
+    echo "  • Firewall:     nftables (input policy drop)"
     echo "  • chrony:       time sync active"
     echo ""
     if [[ "$ssh_port" != "22" ]]; then

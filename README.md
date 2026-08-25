@@ -57,11 +57,11 @@ One-shot setup for a freshly installed Debian server. Runs the full baseline:
 
 1. Upgrade to Debian 13 (Trixie) — one release hop at a time, with a reboot in between
 2. Prefer IPv4 (`/etc/gai.conf`)
-3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq ufw`)
+3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables`)
 4. Enable chrony for NTP time sync
-5. SSH hardening — custom port, `PermitRootLogin prohibit-password`, add your public key
-6. Configure UFW (SSH port + custom ports)
-7. Configure fail2ban to protect sshd
+5. SSH hardening — custom port, key-only auth (`PermitRootLogin prohibit-password`, `PasswordAuthentication no`), your public key; neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
+6. Configure nftables (SSH port + custom ports; scaffolding included for future port forwarding)
+7. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
 8. Run `clikader o` for the remaining onboarding (DNS, TCP, APT, IPv6, hostname)
 
 Prompts for the SSH port, your public key, and any extra ports to open — or pass them
@@ -72,7 +72,7 @@ after the reboot resumes from where it stopped.
 **Parameters** (omit any to be prompted for it interactively):
 - `--ssh-port <port>` — SSH port to configure (1-65535)
 - `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`)
-- `--additional-ports <ports>` — extra UFW ports, comma/space separated (e.g. `36158,443`)
+- `--additional-ports <ports>` — extra ports to open in nftables, comma/space separated (e.g. `36158,443`)
 
 **Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
 will refuse to run again. Use `--force` to re-run the whole flow or `--reset` to wipe
@@ -95,8 +95,10 @@ sudo clikader setup --reset    # wipe state and start fresh
 **Files modified by this script:**
 - `/etc/apt/sources.list` and `/etc/apt/sources.list.d/*` (codename rewrite during upgrade)
 - `/etc/gai.conf` (IPv4 preference)
-- `/etc/ssh/sshd_config` (Port, PermitRootLogin) + `.backup_<timestamp>`
+- `/etc/ssh/sshd_config` (Port, PermitRootLogin, PasswordAuthentication, PubkeyAuthentication, KbdInteractiveAuthentication) + `.backup_<timestamp>`
+- `/etc/ssh/sshd_config.d/*.conf` (provider overrides commented out, each with its own backup)
 - `/root/.ssh/authorized_keys` (your public key)
+- `/etc/nftables.conf` (clikader-owned `clikader_filter`/`clikader_nat` tables) + `.backup_<timestamp>`
 - `/etc/fail2ban/jail.local`
 - `/etc/clikader/setup.state` (saved answers + progress)
 

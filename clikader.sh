@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.7.4"
+CLIKADER_VERSION="1.8.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -61,7 +61,7 @@ show_usage() {
 echo "Commands:"
 echo "  --help, -h, help            Show this help message"
 echo "  update, upgrade             Update CLiKader"
-echo "  setup, vpssetup             Full fresh-server setup (upgrade, ssh, ufw, fail2ban, onboard)"
+echo "  setup, vpssetup             Full fresh-server setup (upgrade, ssh, nftables, fail2ban, onboard)"
 echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off + hostname"
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
