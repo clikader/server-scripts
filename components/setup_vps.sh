@@ -677,10 +677,10 @@ table inet clikader_filter {
         ct state { established, related } accept
         ip protocol icmp accept
         meta l4proto ipv6-icmp accept
-        # Numeric ports (67=bootps, 68=bootpc): some nft releases fail with
-        # "No symbol type information" on symbolic service names here, so the
-        # generated config must not depend on /etc/services resolution.
-        udp sport 67 dport 68 accept comment "DHCP client replies"
+        # nft grammar: every header field needs its own protocol prefix —
+        # 'udp sport 67 dport 68' fails 'nft -c' with "No symbol type
+        # information" at the bare second 'dport' (ports 67=bootps, 68=bootpc).
+        udp sport 67 udp dport 68 accept comment "DHCP client replies"
 
         tcp dport { ${tcp_list} } accept comment "ssh + extra tcp ports"
 ${udp_rule}
