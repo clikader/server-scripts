@@ -584,8 +584,11 @@ step_ssh_hardening() {
         error "Effective PubkeyAuthentication is '${eff_pk}', expected 'yes'."
         fail=1
     fi
-    if [[ "$eff_prl" != "prohibit-password" ]]; then
-        error "Effective PermitRootLogin is '${eff_prl}', expected 'prohibit-password'."
+    # sshd -T dumps PermitRootLogin spelling differs by OpenSSH version:
+    # some print 'prohibit-password', older ones print 'without-password'.
+    # Both are the same value — key-only root login, passwords rejected.
+    if [[ "$eff_prl" != "prohibit-password" && "$eff_prl" != "without-password" ]]; then
+        error "Effective PermitRootLogin is '${eff_prl:-unset}', expected 'prohibit-password' (or 'without-password', its synonym)."
         fail=1
     fi
 
