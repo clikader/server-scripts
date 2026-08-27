@@ -9,7 +9,7 @@ set -euo pipefail
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.8.1"
+SETUP_DNS_REVISION="1.8.2"
 
 # Color codes for output
 RED='\033[0;31m'
