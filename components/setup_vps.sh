@@ -4,7 +4,8 @@
 #
 # Brings a freshly installed Debian 11/12/13 box to the clikader baseline:
 # upgrade to Debian 13, prefer IPv4, install base packages, chrony, SSH
-# hardening, nftables, fail2ban, then run `clikader o` for the remaining onboarding.
+# hardening (key-only or password login), nftables, fail2ban, then run `clikader o`
+# for the remaining onboarding.
 #
 # Survives the reboot a major-version upgrade requires: answers and progress
 # are persisted to /etc/clikader/setup.state, so re-running `clikader setup`
@@ -42,12 +43,6 @@ info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root"
-    exit 1
-fi
-
 # --- Paths and constants ---
 STATE_DIR="/etc/clikader"
 STATE_FILE="${STATE_DIR}/setup.state"
@@ -57,7 +52,9 @@ TOTAL_STEPS=8
 
 # Runtime state (defaults; overwritten by load_state when resuming)
 ssh_port=""
+ssh_auth_method=""   # "key" or "password" (how root logs in over SSH)
 ssh_public_key=""
+ssh_password=""
 extra_ports=""
 last_step=0
 clikader_setup_completed=0
@@ -68,6 +65,7 @@ reset=0
 # CLI-provided inputs (from argv). When set, the interactive prompts are skipped.
 cli_ssh_port=""
 cli_ssh_key=""
+cli_password=""
 cli_extra_ports=""
 
 # --- Argument parsing ---
@@ -83,6 +81,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { error "--ssh-key requires a value"; exit 1; }
             cli_ssh_key="$2"; shift 2 ;;
         --ssh-key=*)        cli_ssh_key="${1#*=}"; shift ;;
+        --password)
+            [[ $# -ge 2 ]] || { error "--password requires a value"; exit 1; }
+            cli_password="$2"; shift 2 ;;
+        --password=*)       cli_password="${1#*=}"; shift ;;
         --additional-ports|--extra-ports)
             [[ $# -ge 2 ]] || { error "--additional-ports requires a value"; exit 1; }
             cli_extra_ports="$2"; shift 2 ;;
@@ -99,14 +101,16 @@ Full fresh-server setup for Debian 11/12/13:
 Setup parameters (omit any to be prompted for it interactively):
   --ssh-port <port>            SSH port to configure (1-65535)
   --ssh-key <key>              Public key line for root (e.g. "ssh-ed25519 AAAA... me@h")
+  --password <password>        Root SSH password; enables password login instead of a key
+                               (mutually exclusive with --ssh-key)
   --additional-ports <ports>   Extra ports to open in nftables, comma/space separated (e.g. "36158,443")
 
 Run modes:
   --force   Re-run the entire flow even if already completed.
   --reset   Wipe saved state and start over from scratch.
 
-When --ssh-port and --ssh-key are both provided, the run is fully
-non-interactive. State is kept in ${STATE_FILE}; after a release-upgrade
+When --ssh-port plus either --ssh-key or --password are provided, the run is
+fully non-interactive. State is kept in ${STATE_FILE}; after a release-upgrade
 reboot, just re-run \`clikader setup\` and it resumes from where it stopped.
 EOF
             exit 0
@@ -118,6 +122,12 @@ EOF
             ;;
     esac
 done
+
+# Check if running as root (after --help/-h so usage is visible to any user).
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root"
+    exit 1
+fi
 
 # --- OS detection ---
 detect_os() {
@@ -156,12 +166,15 @@ escape_single_quotes() {
 
 save_state() {
     mkdir -p "$STATE_DIR"
-    local escaped_key
+    local escaped_key escaped_password
     escaped_key="$(escape_single_quotes "$ssh_public_key")"
+    escaped_password="$(escape_single_quotes "$ssh_password")"
     cat > "$STATE_FILE" <<EOF
 # Managed by clikader setup. Do not edit by hand; use 'clikader setup --reset'.
 ssh_port='${ssh_port}'
+ssh_auth_method='${ssh_auth_method}'
 ssh_public_key='${escaped_key}'
+ssh_password='${escaped_password}'
 extra_ports='${extra_ports}'
 last_step=${last_step}
 clikader_setup_completed=${clikader_setup_completed}
@@ -178,7 +191,9 @@ load_state() {
     . "$STATE_FILE"
     # last_step / completed flags become shell vars here; copy into our globals.
     : "${ssh_port:=}"
+    : "${ssh_auth_method:=}"
     : "${ssh_public_key:=}"
+    : "${ssh_password:=}"
     : "${extra_ports:=}"
     : "${last_step:=0}"
     : "${clikader_setup_completed:=0}"
@@ -235,6 +250,11 @@ apply_cli_inputs() {
         fi
         ssh_port="$cli_ssh_port"
     fi
+    # Auth method: --ssh-key and --password are mutually exclusive.
+    if [[ -n "$cli_ssh_key" && -n "$cli_password" ]]; then
+        error "--ssh-key and --password are mutually exclusive; provide only one."
+        exit 1
+    fi
     if [[ -n "$cli_ssh_key" ]]; then
         # Trim surrounding whitespace before validating.
         cli_ssh_key="${cli_ssh_key#"${cli_ssh_key%%[![:space:]]*}"}"
@@ -244,7 +264,17 @@ apply_cli_inputs() {
             echo "It should start with one of: ssh-rsa, ssh-ed25519, ecdsa-sha2-..., etc."
             exit 1
         fi
+        ssh_auth_method="key"
         ssh_public_key="$cli_ssh_key"
+        ssh_password=""
+    fi
+    if [[ -n "$cli_password" ]]; then
+        if [[ "${#cli_password}" -lt 8 ]]; then
+            warning "--password is shorter than 8 characters; use a strong password."
+        fi
+        ssh_auth_method="password"
+        ssh_password="$cli_password"
+        ssh_public_key=""
     fi
     if [[ -n "$cli_extra_ports" ]]; then
         extra_ports="$(normalize_port_list "$cli_extra_ports")" || exit 1
@@ -280,21 +310,65 @@ collect_inputs() {
 
     echo ""
 
-    # Public key
-    if [[ -n "$ssh_public_key" ]]; then
-        log "Public key already set: ${ssh_public_key%% *}"
+    # Authentication method: SSH key (default) or password login.
+    if [[ -n "$ssh_auth_method" ]]; then
+        log "SSH auth method already set: ${ssh_auth_method}"
     else
         while true; do
-            echo -n "Public SSH key for root (paste full 'ssh-... user@host' line): "
-            read -r ssh_public_key < /dev/tty
-            ssh_public_key="${ssh_public_key#"${ssh_public_key%%[![:space:]]*}"}"  # ltrim
-            ssh_public_key="${ssh_public_key%"${ssh_public_key##*[![:space:]]}"}"  # rtrim
-            if valid_ssh_pubkey "$ssh_public_key"; then
-                break
-            fi
-            error "That does not look like a valid OpenSSH public key line."
-            echo "It should start with one of: ssh-rsa, ssh-ed25519, ecdsa-sha2-..., etc."
+            echo -n "SSH login method [key/password] (default: key): "
+            read -r method_choice < /dev/tty
+            # Lowercase for a case-insensitive match (portable; bash 3.2 lacks ${var,,}).
+            method_choice="$(printf '%s' "$method_choice" | tr '[:upper:]' '[:lower:]')"
+            case "$method_choice" in
+                ""|key|k)   ssh_auth_method="key"; break ;;
+                password|pass|pw|p) ssh_auth_method="password"; break ;;
+                *)
+                    error "Please choose 'key' or 'password'."
+                    ;;
+            esac
         done
+    fi
+
+    echo ""
+
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        # Root password — silently prompted, then confirmed.
+        if [[ -n "$ssh_password" ]]; then
+            log "Root password already set (hidden)."
+        else
+            while true; do
+                echo -n "Root password for SSH login: "
+                read -rs ssh_password < /dev/tty
+                echo ""
+                echo -n "Confirm root password: "
+                read -rs confirm_password < /dev/tty
+                echo ""
+                if [[ -n "$ssh_password" && "$ssh_password" == "$confirm_password" ]]; then
+                    if [[ "${#ssh_password}" -lt 8 ]]; then
+                        warning "Password is shorter than 8 characters."
+                    fi
+                    break
+                fi
+                error "Passwords are empty or do not match; try again."
+            done
+        fi
+    else
+        # Public key
+        if [[ -n "$ssh_public_key" ]]; then
+            log "Public key already set: ${ssh_public_key%% *}"
+        else
+            while true; do
+                echo -n "Public SSH key for root (paste full 'ssh-... user@host' line): "
+                read -r ssh_public_key < /dev/tty
+                ssh_public_key="${ssh_public_key#"${ssh_public_key%%[![:space:]]*}"}"  # ltrim
+                ssh_public_key="${ssh_public_key%"${ssh_public_key##*[![:space:]]}"}"  # rtrim
+                if valid_ssh_pubkey "$ssh_public_key"; then
+                    break
+                fi
+                error "That does not look like a valid OpenSSH public key line."
+                echo "It should start with one of: ssh-rsa, ssh-ed25519, ecdsa-sha2-..., etc."
+            done
+        fi
     fi
 
     echo ""
@@ -510,6 +584,22 @@ step_ssh_hardening() {
     # --- Main config: replace previous managed block, then re-add at the top ---
     # (top placement wins under sshd's first-value-wins rule, ahead of the
     # Include line and anything a provider may add later)
+    # Directives depend on the chosen auth method: key-only (default) keeps
+    # PasswordAuthentication/KbdInteractiveAuthentication off and root
+    # key-only; --password turns password login on for root and never
+    # disables it.
+    local prl pw_auth kbd
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        prl="yes"
+        pw_auth="yes"
+        kbd="yes"
+        log "Password login enabled for root (PermitRootLogin yes, PasswordAuthentication yes)"
+    else
+        prl="prohibit-password"
+        pw_auth="no"
+        kbd="no"
+        log "Key-only login: PasswordAuthentication off, root key-only"
+    fi
     sed -i '/^# --- BEGIN clikader sshd settings ---$/,/^# --- END clikader sshd settings ---$/d' "$sshd_config"
     sed -i -E "/^[[:space:]]*(${managed_keywords})[[:space:]]/d" "$sshd_config"
     {
@@ -517,10 +607,10 @@ step_ssh_hardening() {
         echo "# Managed by clikader setup; supersedes the provider defaults below"
         echo "# and in sshd_config.d/*.conf (first obtained value wins in sshd)."
         echo "Port ${ssh_port}"
-        echo "PermitRootLogin prohibit-password"
-        echo "PasswordAuthentication no"
+        echo "PermitRootLogin ${prl}"
+        echo "PasswordAuthentication ${pw_auth}"
         echo "PubkeyAuthentication yes"
-        echo "KbdInteractiveAuthentication no"
+        echo "KbdInteractiveAuthentication ${kbd}"
         echo "# --- END clikader sshd settings ---"
     } | cat - "$sshd_config" > "${sshd_config}.new"
     chmod --reference="$sshd_config" "${sshd_config}.new"
@@ -535,17 +625,28 @@ step_ssh_hardening() {
         return 1
     fi
 
-    # authorized_keys BEFORE any restart: password auth is about to be turned
-    # off, so the key must already be in place or root gets locked out.
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    if [[ -n "$ssh_public_key" ]] && ! grep -qF "$ssh_public_key" /root/.ssh/authorized_keys; then
-        echo "$ssh_public_key" >> /root/.ssh/authorized_keys
-        log "Added public key to /root/.ssh/authorized_keys"
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        # Set the root password BEFORE enabling password auth and restarting
+        # sshd, so login works the moment the listener comes up.
+        if ! echo "root:${ssh_password}" | chpasswd; then
+            error "Failed to set root password (chpasswd)."
+            return 1
+        fi
+        log "Set root password for password login"
     else
-        log "Public key already present in /root/.ssh/authorized_keys"
+        # authorized_keys BEFORE any restart: password auth is about to be
+        # turned off, so the key must already be in place or root gets locked
+        # out.
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        touch /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        if [[ -n "$ssh_public_key" ]] && ! grep -qF "$ssh_public_key" /root/.ssh/authorized_keys; then
+            echo "$ssh_public_key" >> /root/.ssh/authorized_keys
+            log "Added public key to /root/.ssh/authorized_keys"
+        else
+            log "Public key already present in /root/.ssh/authorized_keys"
+        fi
     fi
 
     # Socket activation: while ssh.socket holds the listener, Port in
@@ -559,12 +660,23 @@ step_ssh_hardening() {
     systemctl restart sshd
 
     # --- Verify: effective config AND real listener, not just exit codes. ---
-    local effective eff_ports eff_pw eff_pk eff_prl fail=0
+    local effective eff_ports eff_pw eff_pk eff_prl eff_kbd fail=0
+    local expected_pw expected_prl expected_kbd
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        expected_pw="yes"
+        expected_prl="yes"
+        expected_kbd="yes"
+    else
+        expected_pw="no"
+        expected_prl="prohibit-password"
+        expected_kbd="no"
+    fi
     effective="$(sshd -T 2>/dev/null)"
     eff_ports="$(awk '$1 == "port" {print $2}' <<<"$effective" | tr '\n' ' ' | sed 's/ $//')"
     eff_pw="$(awk '$1 == "passwordauthentication" {print $2}' <<<"$effective")"
     eff_pk="$(awk '$1 == "pubkeyauthentication" {print $2}' <<<"$effective")"
     eff_prl="$(awk '$1 == "permitrootlogin" {print $2}' <<<"$effective")"
+    eff_kbd="$(awk '$1 == "kbdinteractiveauthentication" {print $2}' <<<"$effective")"
 
     if [[ -z "$effective" ]]; then
         error "Cannot read effective sshd config (sshd -T failed); verify manually."
@@ -576,19 +688,30 @@ step_ssh_hardening() {
         error "  grep -r 'Port' ${sshd_conf_dir}/ ; systemctl status ssh.socket"
         fail=1
     fi
-    if [[ "$eff_pw" != "no" ]]; then
-        error "Effective PasswordAuthentication is '${eff_pw}', expected 'no'."
+    if [[ "$eff_pw" != "$expected_pw" ]]; then
+        error "Effective PasswordAuthentication is '${eff_pw}', expected '${expected_pw}'."
         fail=1
     fi
     if [[ "$eff_pk" != "yes" ]]; then
         error "Effective PubkeyAuthentication is '${eff_pk}', expected 'yes'."
         fail=1
     fi
+    if [[ "$eff_kbd" != "$expected_kbd" ]]; then
+        error "Effective KbdInteractiveAuthentication is '${eff_kbd:-unset}', expected '${expected_kbd}'."
+        fail=1
+    fi
     # sshd -T dumps PermitRootLogin spelling differs by OpenSSH version:
     # some print 'prohibit-password', older ones print 'without-password'.
     # Both are the same value — key-only root login, passwords rejected.
-    if [[ "$eff_prl" != "prohibit-password" && "$eff_prl" != "without-password" ]]; then
-        error "Effective PermitRootLogin is '${eff_prl:-unset}', expected 'prohibit-password' (or 'without-password', its synonym)."
+    # In password mode the expected value is plain 'yes' (root may use a
+    # password), so no spelling-synonym dance is needed there.
+    if [[ "$expected_prl" == "prohibit-password" ]]; then
+        if [[ "$eff_prl" != "prohibit-password" && "$eff_prl" != "without-password" ]]; then
+            error "Effective PermitRootLogin is '${eff_prl:-unset}', expected 'prohibit-password' (or 'without-password', its synonym)."
+            fail=1
+        fi
+    elif [[ "$eff_prl" != "$expected_prl" ]]; then
+        error "Effective PermitRootLogin is '${eff_prl:-unset}', expected '${expected_prl}'."
         fail=1
     fi
 
@@ -612,7 +735,11 @@ step_ssh_hardening() {
         error "but fix the above before disconnecting (backups: *.backup_${ts})."
         return 1
     fi
-    log "sshd verified: port ${ssh_port}, key-only root (password auth disabled)"
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        log "sshd verified: port ${ssh_port}, root password login enabled"
+    else
+        log "sshd verified: port ${ssh_port}, key-only root (password auth disabled)"
+    fi
 
     last_step=5
     save_state
@@ -891,13 +1018,25 @@ main() {
     # Resolve setup parameters. Precedence: CLI flags > saved state > prompt.
     # CLI flags win so an explicit `--ssh-port`/`--ssh-key` always applies.
     local had_cli=0
-    if [[ -n "$cli_ssh_port" || -n "$cli_ssh_key" || -n "$cli_extra_ports" ]]; then
+    if [[ -n "$cli_ssh_port" || -n "$cli_ssh_key" || -n "$cli_password" || -n "$cli_extra_ports" ]]; then
         apply_cli_inputs
         had_cli=1
     fi
 
-    # After applying CLI inputs, prompt for anything still missing.
-    if [[ -z "$ssh_port" || -z "$ssh_public_key" ]]; then
+    # After applying CLI inputs, prompt for anything still missing. For the
+    # auth method we also need the matching credential: a key for key mode,
+    # a password for password mode.
+    local needs_prompt=0
+    [[ -z "$ssh_port" ]] && needs_prompt=1
+    [[ -z "$ssh_auth_method" ]] && needs_prompt=1
+    if [[ "$ssh_auth_method" == "password" && -z "$ssh_password" ]]; then
+        needs_prompt=1
+    fi
+    if [[ "$ssh_auth_method" == "key" && -z "$ssh_public_key" ]]; then
+        needs_prompt=1
+    fi
+
+    if (( needs_prompt )); then
         if (( had_cli )); then
             info "Some parameters not provided via flags; prompting for the rest."
         elif (( last_step > 0 )); then
@@ -905,7 +1044,7 @@ main() {
         fi
         collect_inputs
     else
-        info "Using parameters: ssh_port=${ssh_port}, extra_ports='${extra_ports:-none}'."
+        info "Using parameters: ssh_port=${ssh_port}, auth=${ssh_auth_method}, extra_ports='${extra_ports:-none}'."
         # Persist CLI-provided inputs so a later reboot/resume never re-prompts.
         (( had_cli )) && save_state
     fi
@@ -928,7 +1067,11 @@ main() {
     echo ""
     info "Summary:"
     echo "  • OS:           Debian ${debian_major} (${debian_codename})"
-    echo "  • SSH port:     ${ssh_port} (key-only root, password auth disabled)"
+    if [[ "$ssh_auth_method" == "password" ]]; then
+        echo "  • SSH port:     ${ssh_port} (root password login enabled)"
+    else
+        echo "  • SSH port:     ${ssh_port} (key-only root, password auth disabled)"
+    fi
     echo "  • Extra ports:  ${extra_ports:-none}"
     echo "  • fail2ban:     protecting sshd on port ${ssh_port} (nftables bans)"
     echo "  • Firewall:     nftables (input policy drop)"

@@ -59,19 +59,20 @@ One-shot setup for a freshly installed Debian server. Runs the full baseline:
 2. Prefer IPv4 (`/etc/gai.conf`)
 3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables`)
 4. Enable chrony for NTP time sync
-5. SSH hardening — custom port, key-only auth (`PermitRootLogin prohibit-password`, `PasswordAuthentication no`), your public key; neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
+5. SSH hardening — custom port, and either key-only auth (default: `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, your public key) or password login (`--password`: `PermitRootLogin yes`, `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, root password set); neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
 6. Configure nftables (SSH port + custom ports; scaffolding included for future port forwarding)
 7. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
 8. Run `clikader o` for the remaining onboarding (DNS, TCP, APT, IPv6, hostname)
 
-Prompts for the SSH port, your public key, and any extra ports to open — or pass them
-as flags for a fully non-interactive run. Survives the release-upgrade reboot: answers
-and progress are saved to `/etc/clikader/setup.state`, so re-running `clikader setup`
-after the reboot resumes from where it stopped.
+Prompts for the SSH port, the login method (SSH key or password), and any extra ports
+to open — or pass them as flags for a fully non-interactive run. Survives the
+release-upgrade reboot: answers and progress are saved to `/etc/clikader/setup.state`,
+so re-running `clikader setup` after the reboot resumes from where it stopped.
 
 **Parameters** (omit any to be prompted for it interactively):
 - `--ssh-port <port>` — SSH port to configure (1-65535)
-- `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`)
+- `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`) — key-only login
+- `--password <password>` — root SSH password; enables password login instead of a key (mutually exclusive with `--ssh-key`)
 - `--additional-ports <ports>` — extra ports to open in nftables, comma/space separated (e.g. `36158,443`)
 
 **Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
@@ -82,8 +83,11 @@ state and start over.
 # Interactive (prompts for everything)
 sudo clikader setup
 
-# Fully non-interactive
+# Fully non-interactive — key login
 sudo clikader setup --ssh-port 14419 --ssh-key "ssh-ed25519 AAAA... me@host" --additional-ports 36158,443
+
+# Fully non-interactive — password login (sets the root password, enables password auth)
+sudo clikader setup --ssh-port 14419 --password "S3curePassw0rd!" --additional-ports 36158,443
 
 # After the upgrade reboot (auto-resumes from where it stopped)
 sudo clikader setup
@@ -97,7 +101,8 @@ sudo clikader setup --reset    # wipe state and start fresh
 - `/etc/gai.conf` (IPv4 preference)
 - `/etc/ssh/sshd_config` (Port, PermitRootLogin, PasswordAuthentication, PubkeyAuthentication, KbdInteractiveAuthentication) + `.backup_<timestamp>`
 - `/etc/ssh/sshd_config.d/*.conf` (provider overrides commented out, each with its own backup)
-- `/root/.ssh/authorized_keys` (your public key)
+- `/root/.ssh/authorized_keys` (your public key in key mode; untouched in password mode)
+- root account password (set via `chpasswd` in password mode)
 - `/etc/nftables.conf` (clikader-owned `clikader_filter`/`clikader_nat` tables) + `.backup_<timestamp>`
 - `/etc/fail2ban/jail.local`
 - `/etc/clikader/setup.state` (saved answers + progress)

@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.8.3"
+CLIKADER_VERSION="1.8.4"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -50,6 +50,18 @@ require_root() {
         echo "Please run with sudo, for example: sudo clikader $*"
         exit 1
     fi
+}
+
+# Returns 0 if any argument is a help flag (-h/--help), so usage can be shown
+# without requiring root (e.g. 'clikader vpssetup --help' as a normal user).
+has_help_flag() {
+    local a
+    for a in "$@"; do
+        if [[ "$a" == "-h" || "$a" == "--help" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 show_usage() {
@@ -363,7 +375,10 @@ dispatch_command() {
             update_clikader
             ;;
         "setup" | "vpssetup")
-            require_root "$command"
+            # Help must be reachable without root so any user can see usage.
+            if ! has_help_flag "$@"; then
+                require_root "$command"
+            fi
             run_script "setup_vps.sh" "VPS Setup" "$@"
             ;;
         "dns")
