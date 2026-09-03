@@ -44,8 +44,16 @@ info() {
 }
 
 # --- Paths and constants ---
-STATE_DIR="/etc/clikader"
+STATE_DIR="${STATE_DIR:-/etc/clikader}"
 STATE_FILE="${STATE_DIR}/setup.state"
+# System file paths (env-overridable so tests can target temp files; defaults unchanged)
+GAI_CONF="${GAI_CONF:-/etc/gai.conf}"
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SSHD_CONF_DIR="${SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
+SSH_DIR="${SSH_DIR:-/root/.ssh}"
+AUTHORIZED_KEYS="${AUTHORIZED_KEYS:-${SSH_DIR}/authorized_keys}"
+NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
+FAIL2BAN_JAIL="${FAIL2BAN_JAIL:-/etc/fail2ban/jail.local}"
 TARGET_DEBIAN_VERSION=13
 TARGET_CODENAME="trixie"
 TOTAL_STEPS=8
@@ -498,11 +506,11 @@ step_upgrade_debian() {
 # --- Step 2: Prefer IPv4 ---
 step_prefer_ipv4() {
     step_banner 2 "Prefer IPv4"
-    if grep -q '^precedence ::ffff:0:0/96  100' /etc/gai.conf 2>/dev/null; then
-        log "IPv4 preference already set in /etc/gai.conf"
+    if grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF" 2>/dev/null; then
+        log "IPv4 preference already set in $GAI_CONF"
     else
-        echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
-        log "Added IPv4 preference to /etc/gai.conf"
+        echo 'precedence ::ffff:0:0/96  100' >> "$GAI_CONF"
+        log "Added IPv4 preference to $GAI_CONF"
     fi
     last_step=2
     save_state
@@ -546,8 +554,8 @@ step_enable_chrony() {
 step_ssh_hardening() {
     step_banner 5 "SSH hardening + authorized key"
 
-    local sshd_config="/etc/ssh/sshd_config"
-    local sshd_conf_dir="/etc/ssh/sshd_config.d"
+    local sshd_config="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+    local sshd_conf_dir="${SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
     local ts f
     ts="$(date +%Y%m%d_%H%M%S)"
 
@@ -637,15 +645,15 @@ step_ssh_hardening() {
         # authorized_keys BEFORE any restart: password auth is about to be
         # turned off, so the key must already be in place or root gets locked
         # out.
-        mkdir -p /root/.ssh
-        chmod 700 /root/.ssh
-        touch /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        if [[ -n "$ssh_public_key" ]] && ! grep -qF "$ssh_public_key" /root/.ssh/authorized_keys; then
-            echo "$ssh_public_key" >> /root/.ssh/authorized_keys
-            log "Added public key to /root/.ssh/authorized_keys"
+        mkdir -p "$SSH_DIR"
+        chmod 700 "$SSH_DIR"
+        touch "$AUTHORIZED_KEYS"
+        chmod 600 "$AUTHORIZED_KEYS"
+        if [[ -n "$ssh_public_key" ]] && ! grep -qF "$ssh_public_key" "$AUTHORIZED_KEYS"; then
+            echo "$ssh_public_key" >> "$AUTHORIZED_KEYS"
+            log "Added public key to $AUTHORIZED_KEYS"
         else
-            log "Public key already present in /root/.ssh/authorized_keys"
+            log "Public key already present in $AUTHORIZED_KEYS"
         fi
     fi
 
@@ -762,7 +770,7 @@ step_configure_nftables() {
         log "ufw disabled and removed"
     fi
 
-    local nft_conf="/etc/nftables.conf"
+    local nft_conf="${NFT_CONF:-/etc/nftables.conf}"
     local ts
     ts="$(date +%Y%m%d_%H%M%S)"
     # Keep the distro-shipped file once; never back up our own generated one.
@@ -882,7 +890,7 @@ EOF
 # A test ban at the end proves the journal->jail->nftables path really works.
 step_setup_fail2ban() {
     step_banner 7 "Configure fail2ban for SSH"
-    cat > /etc/fail2ban/jail.local <<EOF
+    cat > "$FAIL2BAN_JAIL" <<EOF
 [DEFAULT]
 # Never ban localhost, even under a flood of failed attempts.
 ignoreip = 127.0.0.1/8 ::1
@@ -902,12 +910,12 @@ backend = systemd
 # ORs the two journal matches so either journal name is picked up.
 journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service
 EOF
-    log "Wrote /etc/fail2ban/jail.local (sshd port ${ssh_port}, backend systemd, nftables bans)"
+    log "Wrote $FAIL2BAN_JAIL (sshd port ${ssh_port}, backend systemd, nftables bans)"
 
     # Validate config before touching the running service.
     if ! fail2ban-client -t >/dev/null 2>&1; then
         error "fail2ban config test failed; NOT restarting the service."
-        error "Inspect /etc/fail2ban/jail.local before continuing."
+        error "Inspect $FAIL2BAN_JAIL before continuing."
         return 1
     fi
     log "fail2ban config test passed"
@@ -1087,4 +1095,7 @@ main() {
     echo ""
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

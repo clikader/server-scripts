@@ -13,6 +13,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# APT paths (env-overridable so tests can target temp files; defaults unchanged)
+APT_SOURCES_LIST="${APT_SOURCES_LIST:-/etc/apt/sources.list}"
+APT_SOURCES_LIST_D="${APT_SOURCES_LIST_D:-/etc/apt/sources.list.d}"
+
 # Logging functions
 log() {
     echo -e "${GREEN}-->${NC} $1"
@@ -52,20 +56,20 @@ log "Detected: $ID $VERSION_ID ($os_codename)"
 # Backup existing sources
 backup_sources() {
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_dir="/etc/apt/sources.list.backup_${timestamp}"
+    local backup_dir="$APT_SOURCES_LIST.backup_${timestamp}"
     
     log "Creating backup of existing APT sources..."
     
     mkdir -p "$backup_dir"
     
-    if [[ -f /etc/apt/sources.list ]]; then
-        cp /etc/apt/sources.list "$backup_dir/sources.list"
-        log "✅ Backed up /etc/apt/sources.list to $backup_dir/"
+    if [[ -f $APT_SOURCES_LIST ]]; then
+        cp $APT_SOURCES_LIST "$backup_dir/sources.list"
+        log "✅ Backed up $APT_SOURCES_LIST to $backup_dir/"
     fi
     
-    if [[ -d /etc/apt/sources.list.d ]] && [[ -n "$(ls -A /etc/apt/sources.list.d/ 2>/dev/null)" ]]; then
-        cp -r /etc/apt/sources.list.d/* "$backup_dir/" 2>/dev/null || true
-        log "✅ Backed up /etc/apt/sources.list.d/ to $backup_dir/"
+    if [[ -d ${APT_SOURCES_LIST_D} ]] && [[ -n "$(ls -A ${APT_SOURCES_LIST_D}/ 2>/dev/null)" ]]; then
+        cp -r ${APT_SOURCES_LIST_D}/* "$backup_dir/" 2>/dev/null || true
+        log "✅ Backed up ${APT_SOURCES_LIST_D}/ to $backup_dir/"
     fi
     
     echo ""
@@ -87,7 +91,7 @@ generate_debian_sources_deb822() {
         *) error "Unsupported Debian version for DEB822: $version"; return 1 ;;
     esac
 
-    cat > /etc/apt/sources.list.d/debian.sources << EOF
+    cat > ${APT_SOURCES_LIST_D}/debian.sources << EOF
 # Debian ${version} - Official Sources (DEB822 format)
 # Managed by reset_apt_source.sh
 
@@ -111,7 +115,7 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
     # The old sources.list is deprecated on Trixie; neutralize it so apt doesn't
     # warn about duplicate sources. A pointer comment is the Debian/Ubuntu norm.
-    cat > /etc/apt/sources.list << 'EOF'
+    cat > $APT_SOURCES_LIST << 'EOF'
 # Debian sources have moved to /etc/apt/sources.list.d/debian.sources (DEB822).
 # Managed by reset_apt_source.sh.
 EOF
@@ -125,7 +129,7 @@ generate_debian_sources() {
 
     case "$version" in
         13)
-            cat > /etc/apt/sources.list << 'EOF'
+            cat > $APT_SOURCES_LIST << 'EOF'
 # Debian 13 (Trixie) - Official Sources
 
 # Main repository
@@ -143,7 +147,7 @@ EOF
             log "✅ Generated Debian 13 (Trixie) sources"
             ;;
         12)
-            cat > /etc/apt/sources.list << 'EOF'
+            cat > $APT_SOURCES_LIST << 'EOF'
 # Debian 12 (Bookworm) - Official Sources
 
 # Main repository
@@ -161,7 +165,7 @@ EOF
             log "✅ Generated Debian 12 (Bookworm) sources"
             ;;
         11)
-            cat > /etc/apt/sources.list << 'EOF'
+            cat > $APT_SOURCES_LIST << 'EOF'
 # Debian 11 (Bullseye) - Official Sources
 
 # Main repository
@@ -192,7 +196,7 @@ generate_ubuntu_sources_deb822() {
     
     case "$version" in
         24.10)
-            cat > /etc/apt/sources.list.d/ubuntu.sources << 'EOF'
+            cat > ${APT_SOURCES_LIST_D}/ubuntu.sources << 'EOF'
 # Ubuntu 24.10 (Oracular Oriole) - Official Sources
 # DEB822 format
 
@@ -209,11 +213,11 @@ Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
             # Clear the old sources.list
-            echo "# This system uses /etc/apt/sources.list.d/ubuntu.sources" > /etc/apt/sources.list
+            echo "# This system uses ${APT_SOURCES_LIST_D}/ubuntu.sources" > $APT_SOURCES_LIST
             log "✅ Generated Ubuntu 24.10 (Oracular Oriole) sources (DEB822 format)"
             ;;
         24.04)
-            cat > /etc/apt/sources.list.d/ubuntu.sources << 'EOF'
+            cat > ${APT_SOURCES_LIST_D}/ubuntu.sources << 'EOF'
 # Ubuntu 24.04 LTS (Noble Numbat) - Official Sources
 # DEB822 format
 
@@ -230,7 +234,7 @@ Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
             # Clear the old sources.list
-            echo "# This system uses /etc/apt/sources.list.d/ubuntu.sources" > /etc/apt/sources.list
+            echo "# This system uses ${APT_SOURCES_LIST_D}/ubuntu.sources" > $APT_SOURCES_LIST
             log "✅ Generated Ubuntu 24.04 LTS (Noble Numbat) sources (DEB822 format)"
             ;;
         *)
@@ -246,7 +250,7 @@ generate_ubuntu_sources() {
     
     case "$version" in
         24.10)
-            cat > /etc/apt/sources.list << EOF
+            cat > $APT_SOURCES_LIST << EOF
 # Ubuntu 24.10 (Oracular Oriole) - Official Sources
 
 # Main repositories
@@ -268,7 +272,7 @@ EOF
             log "✅ Generated Ubuntu 24.10 (Oracular Oriole) sources"
             ;;
         24.04)
-            cat > /etc/apt/sources.list << EOF
+            cat > $APT_SOURCES_LIST << EOF
 # Ubuntu 24.04 LTS (Noble Numbat) - Official Sources
 
 # Main repositories
@@ -290,7 +294,7 @@ EOF
             log "✅ Generated Ubuntu 24.04 LTS (Noble Numbat) sources"
             ;;
         22.04)
-            cat > /etc/apt/sources.list << EOF
+            cat > $APT_SOURCES_LIST << EOF
 # Ubuntu 22.04 LTS (Jammy Jellyfish) - Official Sources
 
 # Main repositories
@@ -312,7 +316,7 @@ EOF
             log "✅ Generated Ubuntu 22.04 LTS (Jammy Jellyfish) sources"
             ;;
         20.04)
-            cat > /etc/apt/sources.list << EOF
+            cat > $APT_SOURCES_LIST << EOF
 # Ubuntu 20.04 LTS (Focal Fossa) - Official Sources
 
 # Main repositories
@@ -342,46 +346,46 @@ EOF
 
 # Clean sources.list.d directory and all APT source configurations
 clean_sources_list_d() {
-    log "Cleaning /etc/apt/sources.list.d/ directory and related files..."
+    log "Cleaning ${APT_SOURCES_LIST_D}/ directory and related files..."
     
-    if [[ -d /etc/apt/sources.list.d ]]; then
+    if [[ -d ${APT_SOURCES_LIST_D} ]]; then
         local list_count=0
         local sources_count=0
         local save_count=0
         local other_count=0
         
         # Count and remove .list files (traditional format)
-        list_count=$(find /etc/apt/sources.list.d/ -type f -name "*.list" 2>/dev/null | wc -l)
+        list_count=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.list" 2>/dev/null | wc -l)
         if [[ $list_count -gt 0 ]]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.list" -delete 2>/dev/null || true
+            find ${APT_SOURCES_LIST_D}/ -type f -name "*.list" -delete 2>/dev/null || true
             log "✅ Removed $list_count .list file(s)"
         fi
         
         # Count and remove .sources files (DEB822 format, used in Ubuntu 24.04+)
-        sources_count=$(find /etc/apt/sources.list.d/ -type f -name "*.sources" 2>/dev/null | wc -l)
+        sources_count=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.sources" 2>/dev/null | wc -l)
         if [[ $sources_count -gt 0 ]]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.sources" -delete 2>/dev/null || true
+            find ${APT_SOURCES_LIST_D}/ -type f -name "*.sources" -delete 2>/dev/null || true
             log "✅ Removed $sources_count .sources file(s) (DEB822 format)"
         fi
         
         # Count and remove .list.save backup files
-        save_count=$(find /etc/apt/sources.list.d/ -type f -name "*.list.save" 2>/dev/null | wc -l)
+        save_count=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.list.save" 2>/dev/null | wc -l)
         if [[ $save_count -gt 0 ]]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.list.save" -delete 2>/dev/null || true
+            find ${APT_SOURCES_LIST_D}/ -type f -name "*.list.save" -delete 2>/dev/null || true
             log "✅ Removed $save_count .list.save backup file(s)"
         fi
         
         # Count and remove .distUpgrade files
-        other_count=$(find /etc/apt/sources.list.d/ -type f -name "*.distUpgrade" 2>/dev/null | wc -l)
+        other_count=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.distUpgrade" 2>/dev/null | wc -l)
         if [[ $other_count -gt 0 ]]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.distUpgrade" -delete 2>/dev/null || true
+            find ${APT_SOURCES_LIST_D}/ -type f -name "*.distUpgrade" -delete 2>/dev/null || true
             log "✅ Removed $other_count .distUpgrade file(s)"
         fi
         
         # Remove .gpg files (repository keys in sources.list.d)
-        local gpg_count=$(find /etc/apt/sources.list.d/ -type f -name "*.gpg" 2>/dev/null | wc -l)
+        local gpg_count=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.gpg" 2>/dev/null | wc -l)
         if [[ $gpg_count -gt 0 ]]; then
-            find /etc/apt/sources.list.d/ -type f -name "*.gpg" -delete 2>/dev/null || true
+            find ${APT_SOURCES_LIST_D}/ -type f -name "*.gpg" -delete 2>/dev/null || true
             log "✅ Removed $gpg_count .gpg key file(s)"
         fi
         
@@ -395,9 +399,9 @@ clean_sources_list_d() {
     fi
     
     # Also clean up sources.list.save if it exists
-    if [[ -f /etc/apt/sources.list.save ]]; then
-        rm -f /etc/apt/sources.list.save
-        log "✅ Removed /etc/apt/sources.list.save"
+    if [[ -f ${APT_SOURCES_LIST}.save ]]; then
+        rm -f ${APT_SOURCES_LIST}.save
+        log "✅ Removed ${APT_SOURCES_LIST}.save"
     fi
 }
 
@@ -424,14 +428,14 @@ verify_sources() {
     local sources_found=false
     
     # Check traditional sources.list
-    if [[ -f /etc/apt/sources.list ]] && [[ -s /etc/apt/sources.list ]]; then
-        local content=$(grep -v '^#' /etc/apt/sources.list | grep -v '^$' || true)
+    if [[ -f $APT_SOURCES_LIST ]] && [[ -s $APT_SOURCES_LIST ]]; then
+        local content=$(grep -v '^#' $APT_SOURCES_LIST | grep -v '^$' || true)
         if [[ -n "$content" ]]; then
-            log "✅ /etc/apt/sources.list exists and contains entries"
+            log "✅ $APT_SOURCES_LIST exists and contains entries"
             sources_found=true
             
             echo ""
-            log "Current /etc/apt/sources.list content:"
+            log "Current $APT_SOURCES_LIST content:"
             echo ""
             echo "$content"
             echo ""
@@ -439,8 +443,8 @@ verify_sources() {
     fi
     
     # Check for DEB822 format sources in sources.list.d
-    if [[ -d /etc/apt/sources.list.d ]]; then
-        local sources_files=$(find /etc/apt/sources.list.d/ -type f -name "*.sources" 2>/dev/null)
+    if [[ -d ${APT_SOURCES_LIST_D} ]]; then
+        local sources_files=$(find ${APT_SOURCES_LIST_D}/ -type f -name "*.sources" 2>/dev/null)
         if [[ -n "$sources_files" ]]; then
             log "✅ Found .sources files (DEB822 format):"
             for file in $sources_files; do
@@ -450,7 +454,7 @@ verify_sources() {
             
             echo ""
             log "Content of the main .sources file (if exists):"
-            for sf in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources; do
+            for sf in ${APT_SOURCES_LIST_D}/ubuntu.sources ${APT_SOURCES_LIST_D}/debian.sources; do
                 if [[ -f "$sf" ]]; then
                     echo ""
                     log "$(basename "$sf"):"
@@ -532,4 +536,7 @@ main() {
     echo ""
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

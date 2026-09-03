@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.8.4"
+CLIKADER_VERSION="1.9.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -77,6 +77,7 @@ echo "  setup, vpssetup             Full fresh-server setup (upgrade, ssh, nftab
 echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off + hostname"
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
+echo "  nft, nftables               Manage inbound ports in the nftables allowlist"
 echo "  apt-reset, aptreset         Run APT source reset tool"
 echo "  hostname                    Run hostname fix tool"
 echo "  ipv6, 6                     Run IPv6 configuration tool"
@@ -98,6 +99,7 @@ echo "  sudo clikader onboard"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
     echo "  sudo clikader tcp --revert"
+    echo "  sudo clikader nft add 8080, 8443 tcp"
     echo "  sudo clikader apt-reset"
     echo "  sudo clikader aptreset"
     echo "  sudo clikader hostname"
@@ -389,6 +391,13 @@ dispatch_command() {
             require_root "$command"
             run_script "optimize_tcp.sh" "TCP/Network Optimization" "$@"
             ;;
+        "nft" | "nftables")
+            # Help must be reachable without root so any user can see usage.
+            if ! has_help_flag "$@"; then
+                require_root "$command"
+            fi
+            run_script "nft_manager.sh" "NFTables Port Manager" "$@"
+            ;;
         "apt-reset" | "aptreset")
             require_root "$command"
             run_script "reset_apt_source.sh" "Reset APT Sources" "$@"
@@ -422,4 +431,7 @@ main() {
     dispatch_command "$@"
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

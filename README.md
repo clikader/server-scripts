@@ -42,6 +42,8 @@ Master entrypoint with direct sub-commands for all server management tasks.
 - `clikader setup` / `clikader vpssetup`
 - `clikader onboard` / `clikader o`
 - `clikader dns`
+- `clikader tcp`
+- `clikader nft` / `clikader nftables`
 - `clikader apt-reset` / `clikader aptreset`
 - `clikader hostname`
 - `clikader ipv6` / `clikader 6`
@@ -209,6 +211,36 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 - NetworkManager
 - Manual configuration
 
+---
+
+### 6. NFTables Port Manager (`nft` / `nftables`)
+Manage the inbound TCP/UDP allowlist in the clikader-managed `/etc/nftables.conf`
+without hand-editing the ruleset. Only the two clikader allow rules are touched
+(`tcp dport { ... } accept comment "ssh + extra tcp ports"` and its UDP
+counterpart); forward/nat chains and any user additions are left intact. Every
+change is validated with `nft -c` before reloading, and a timestamped backup of
+`/etc/nftables.conf` is kept.
+
+**Sub-commands:**
+- `clikader nft` — interactive numbered menu (add / delete / reset)
+- `clikader nft add <ports> [type]` — allow inbound `<ports>` (comma/space separated, spaces around commas are trimmed); `[type]` is `tcp`, `udp` or `both` (default: both)
+- `clikader nft delete <ports>` — remove `<ports>` from the allowlist (both tcp and udp); the SSH port is protected and skipped (if mixed with other ports, the others are still deleted and a warning is shown)
+- `clikader nft reset [-y]` — clear the allowlist except the SSH port (grabbed from the effective sshd config); `-y` skips the confirmation prompt
+
+**Safety:** the SSH port is always kept in the TCP allow set and is protected
+from `delete`/`reset`, so this tool can never lock you out.
+
+```bash
+sudo clikader nft                          # interactive menu
+sudo clikader nft add 8080                 # allow TCP+UDP inbound on 8080
+sudo clikader nft add 8080, 8443 tcp       # allow TCP inbound on 8080 and 8443
+sudo clikader nft delete 8080,8443         # remove 8080 and 8443
+sudo clikader nft reset                    # remove all non-SSH allowed ports
+sudo clikader nft reset -y                 # same, without confirmation
+```
+
+**Files modified by this script:**
+- `/etc/nftables.conf` (the two clikader allow rules only) + `.backup_<timestamp>`
 
 ---
 

@@ -14,8 +14,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-# Configuration file path
-SYSCTL_CONFIG="/etc/sysctl.d/99-disable-ipv6.conf"
+# Configuration file path (env-overridable so tests can target a temp file)
+SYSCTL_CONFIG="${SYSCTL_CONFIG:-/etc/sysctl.d/99-disable-ipv6.conf}"
+SYSCTL_LEGACY="${SYSCTL_LEGACY:-/etc/sysctl.conf}"
+IFACES_FILE="${IFACES_FILE:-/etc/network/interfaces}"
 
 # Logging functions
 log() {
@@ -126,11 +128,11 @@ enable_ipv6() {
     log "✅ IPv6 enabled on all interfaces"
     
     # Also remove any conflicting legacy configurations
-    if [[ -f /etc/sysctl.conf ]]; then
-        if grep -q "disable_ipv6" /etc/sysctl.conf; then
-            log "Removing IPv6 disable entries from /etc/sysctl.conf..."
-            sed -i '/disable_ipv6/d' /etc/sysctl.conf
-            log "✅ Cleaned /etc/sysctl.conf"
+    if [[ -f "$SYSCTL_LEGACY" ]]; then
+        if grep -q "disable_ipv6" "$SYSCTL_LEGACY"; then
+            log "Removing IPv6 disable entries from $SYSCTL_LEGACY..."
+            sed -i '/disable_ipv6/d' "$SYSCTL_LEGACY"
+            log "✅ Cleaned $SYSCTL_LEGACY"
         fi
     fi
     
@@ -355,7 +357,7 @@ configure_ipv6_address() {
     
     if [[ -d /etc/netplan ]] && ls /etc/netplan/*.yaml >/dev/null 2>&1; then
         config_method="netplan"
-    elif [[ -f /etc/network/interfaces ]]; then
+    elif [[ -f "$IFACES_FILE" ]]; then
         config_method="interfaces"
     elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
         config_method="networkmanager"
@@ -383,7 +385,7 @@ configure_ipv6_address() {
             echo "Then run: sudo netplan apply"
             ;;
         interfaces)
-            local iface_config="/etc/network/interfaces"
+            local iface_config="$IFACES_FILE"
             log "Adding configuration to $iface_config..."
             
             # Check if interface section exists
@@ -599,4 +601,7 @@ main() {
     esac
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

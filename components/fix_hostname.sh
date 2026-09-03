@@ -14,6 +14,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
+# File paths (env-overridable so tests can target temp files; defaults unchanged)
+HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
+HOSTNAME_FILE="${HOSTNAME_FILE:-/etc/hostname}"
+
 # Logging functions
 log() {
     echo -e "${GREEN}-->${NC} $1"
@@ -93,35 +97,35 @@ fix_hostname_resolution() {
     
     log "Current hostname: ${BOLD}${current_hostname}${NC}"
     
-    # Backup /etc/hosts
+    # Backup HOSTS_FILE
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    cp /etc/hosts "/etc/hosts.backup_${timestamp}"
-    log "✅ Backed up /etc/hosts to /etc/hosts.backup_${timestamp}"
+    cp "$HOSTS_FILE" "${HOSTS_FILE}.backup_${timestamp}"
+    log "✅ Backed up $HOSTS_FILE to ${HOSTS_FILE}.backup_${timestamp}"
     
-    # Check if hostname is already in /etc/hosts
-    if grep -qE "^127\.0\.(0\.1|1\.1)[[:space:]]+.*${current_hostname}" /etc/hosts; then
-        log "Hostname entry already exists in /etc/hosts, updating..."
+    # Check if hostname is already in HOSTS_FILE
+    if grep -qE "^127\.0\.(0\.1|1\.1)[[:space:]]+.*${current_hostname}" "$HOSTS_FILE"; then
+        log "Hostname entry already exists in $HOSTS_FILE, updating..."
         # Remove existing entries
-        sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" /etc/hosts
-        sed -i "/[[:space:]]${current_hostname}\$/d" /etc/hosts
+        sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" "$HOSTS_FILE"
+        sed -i "/[[:space:]]${current_hostname}\$/d" "$HOSTS_FILE"
     fi
     
-    # Add hostname to /etc/hosts
+    # Add hostname to HOSTS_FILE
     # Check if 127.0.1.1 line exists
-    if grep -q "^127\.0\.1\.1" /etc/hosts; then
+    if grep -q "^127\.0\.1\.1" "$HOSTS_FILE"; then
         # Update existing 127.0.1.1 line
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${current_hostname}/" /etc/hosts
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${current_hostname}/" "$HOSTS_FILE"
         log "✅ Updated 127.0.1.1 entry with hostname: ${current_hostname}"
     else
         # Add new 127.0.1.1 line after 127.0.0.1
-        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${current_hostname}" /etc/hosts
+        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${current_hostname}" "$HOSTS_FILE"
         log "✅ Added new entry: 127.0.1.1 ${current_hostname}"
     fi
     
     echo ""
-    log "Current /etc/hosts content:"
+    log "Current $HOSTS_FILE content:"
     echo ""
-    cat /etc/hosts
+    cat "$HOSTS_FILE"
     echo ""
     
     # Verify resolution
@@ -208,28 +212,28 @@ change_hostname() {
         log "✅ Set hostname using hostnamectl"
     else
         # Fallback for systems without systemd
-        echo "$new_hostname" > /etc/hostname
+        echo "$new_hostname" > "$HOSTNAME_FILE"
         hostname "$new_hostname"
-        log "✅ Updated /etc/hostname and current hostname"
+        log "✅ Updated $HOSTNAME_FILE and current hostname"
     fi
     
-    # Update /etc/hosts
+    # Update HOSTS_FILE
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    cp /etc/hosts "/etc/hosts.backup_${timestamp}"
-    log "✅ Backed up /etc/hosts"
+    cp "$HOSTS_FILE" "${HOSTS_FILE}.backup_${timestamp}"
+    log "✅ Backed up $HOSTS_FILE"
     
     # Remove old hostname entries
-    sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" /etc/hosts
-    sed -i "/[[:space:]]${current_hostname}\$/d" /etc/hosts
+    sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" "$HOSTS_FILE"
+    sed -i "/[[:space:]]${current_hostname}\$/d" "$HOSTS_FILE"
     
-    # Add new hostname to /etc/hosts
-    if grep -q "^127\.0\.1\.1" /etc/hosts; then
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${new_hostname}/" /etc/hosts
+    # Add new hostname to HOSTS_FILE
+    if grep -q "^127\.0\.1\.1" "$HOSTS_FILE"; then
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${new_hostname}/" "$HOSTS_FILE"
     else
-        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${new_hostname}" /etc/hosts
+        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${new_hostname}" "$HOSTS_FILE"
     fi
     
-    log "✅ Updated /etc/hosts with new hostname"
+    log "✅ Updated $HOSTS_FILE with new hostname"
     
     echo ""
     log "Verifying hostname change..."
@@ -325,4 +329,7 @@ main() {
     esac
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

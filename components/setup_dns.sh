@@ -9,7 +9,7 @@ set -euo pipefail
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.8.4"
+SETUP_DNS_REVISION="1.9.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -24,6 +24,14 @@ ipv6_support=false
 has_dot_support=false
 use_secure_dns=false
 non_interactive=false   # set by --yes: accept all defaults with no prompts
+
+# System file paths (env-overridable so tests can target temp files; defaults unchanged)
+RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
+DHCLIENT_CONF="${DHCLIENT_CONF:-/etc/dhcp/dhclient.conf}"
+IFUPD_RESOLVED="${IFUPD_RESOLVED:-/etc/network/if-up.d/resolved}"
+CLOUD_CFG_DIR="${CLOUD_CFG_DIR:-/etc/cloud/cloud.cfg.d}"
+RESOLVED_CONF="${RESOLVED_CONF:-/etc/systemd/resolved.conf}"
+STUB_RESOLV_CONF="${STUB_RESOLV_CONF:-/run/systemd/resolve/stub-resolv.conf}"
 
 # Provider data arrays (associative, keyed by 1-based menu index). Populated by
 # load_provider_table from DNS_PROVIDERS; the Custom entry (CUSTOM_DNS_INDEX) is
@@ -296,11 +304,11 @@ ask_secure_dns() {
 }
 
 unlock_resolv_conf() {
-    if [[ -f /etc/resolv.conf ]]; then
-        if lsattr /etc/resolv.conf 2>/dev/null | grep -q '^....i'; then
-            log "Detected locked /etc/resolv.conf, unlocking..."
-            chattr -i /etc/resolv.conf 2>/dev/null || true
-            log "✅ /etc/resolv.conf unlocked"
+    if [[ -f $RESOLV_CONF ]]; then
+        if lsattr $RESOLV_CONF 2>/dev/null | grep -q '^....i'; then
+            log "Detected locked $RESOLV_CONF, unlocking..."
+            chattr -i $RESOLV_CONF 2>/dev/null || true
+            log "✅ $RESOLV_CONF unlocked"
         fi
     fi
 }
@@ -638,9 +646,9 @@ health_check() {
     
     # Check 2: dhclient.conf configuration
     echo -n "2. Checking dhclient.conf configuration... "
-    if [[ -f /etc/dhcp/dhclient.conf ]] && \
-       grep -q "^supersede domain-name-servers" /etc/dhcp/dhclient.conf && \
-       grep -q "^prepend domain-name-servers" /etc/dhcp/dhclient.conf; then
+    if [[ -f $DHCLIENT_CONF ]] && \
+       grep -q "^supersede domain-name-servers" $DHCLIENT_CONF && \
+       grep -q "^prepend domain-name-servers" $DHCLIENT_CONF; then
         echo -e "${GREEN}✓ Properly configured${NC}"
     else
         echo -e "${YELLOW}'ignore' parameters not found${NC}"
@@ -649,7 +657,7 @@ health_check() {
     
     # Check 3: if-up.d conflict script
     echo -n "3. Checking if-up.d conflict script... "
-    if [[ -x /etc/network/if-up.d/resolved ]]; then
+    if [[ -x $IFUPD_RESOLVED ]]; then
         echo -e "${YELLOW}Script exists and is executable${NC}"
         all_passed=false
     else
@@ -678,35 +686,35 @@ purify_dns() {
     
     # Configure dhclient to ignore DHCP DNS
     log "Configuring DHCP client (dhclient)..."
-    if [[ -f /etc/dhcp/dhclient.conf ]]; then
+    if [[ -f $DHCLIENT_CONF ]]; then
         # Remove any previously-added override block (idempotent re-runs). We
         # strip everything between our markers, including the markers and the
         # legacy unmarked supersede/prepend lines from older script versions.
-        sed -i '/^# BEGIN setup_dns.sh DNS override$/,/^# END setup_dns.sh DNS override$/d' /etc/dhcp/dhclient.conf
-        sed -i '/^# DNS override configuration - added by setup_dns.sh$/,/^prepend domain-name-servers 127\.0\.0\.53;$/d' /etc/dhcp/dhclient.conf
-        sed -i '/^supersede domain-name-servers/d' /etc/dhcp/dhclient.conf
-        sed -i '/^prepend domain-name-servers/d' /etc/dhcp/dhclient.conf
+        sed -i '/^# BEGIN setup_dns.sh DNS override$/,/^# END setup_dns.sh DNS override$/d' $DHCLIENT_CONF
+        sed -i '/^# DNS override configuration - added by setup_dns.sh$/,/^prepend domain-name-servers 127\.0\.0\.53;$/d' $DHCLIENT_CONF
+        sed -i '/^supersede domain-name-servers/d' $DHCLIENT_CONF
+        sed -i '/^prepend domain-name-servers/d' $DHCLIENT_CONF
 
         # Add our configuration (marked so future runs can remove it cleanly)
-        cat >> /etc/dhcp/dhclient.conf << 'EOF'
+        cat >> $DHCLIENT_CONF << 'EOF'
 
 # BEGIN setup_dns.sh DNS override
 supersede domain-name-servers 127.0.0.53;
 prepend domain-name-servers 127.0.0.53;
 # END setup_dns.sh DNS override
 EOF
-        log "✅ Updated 'ignore' directives in /etc/dhcp/dhclient.conf"
+        log "✅ Updated 'ignore' directives in $DHCLIENT_CONF"
     fi
     
     # Disable the if-up.d resolved script
     log "Disabling conflicting if-up.d script..."
-    if [[ -f /etc/network/if-up.d/resolved ]]; then
-        chmod -x /etc/network/if-up.d/resolved 2>/dev/null || true
-        log "✅ Removed execute permission from /etc/network/if-up.d/resolved"
+    if [[ -f $IFUPD_RESOLVED ]]; then
+        chmod -x $IFUPD_RESOLVED 2>/dev/null || true
+        log "✅ Removed execute permission from $IFUPD_RESOLVED"
     fi
 
     # Disable cloud-init DNS management. cloud-init (present on virtually every
-    # cloud VPS image: AWS/GCP/Azure/Oracle/DigitalOcean) rewrites /etc/resolv.conf
+    # cloud VPS image: AWS/GCP/Azure/Oracle/DigitalOcean) rewrites $RESOLV_CONF
     # on boot per manage_resolv_conf, which silently rolls back this script's DNS
     # setup after a reboot or provider maintenance. This is the #1 cause of "DNS
     # works until reboot" reports. We scope the change narrowly: only stop the
@@ -714,8 +722,8 @@ EOF
     # to configure the primary interface, so disabling network config entirely
     # could leave the box offline after reboot).
     log "Disabling cloud-init DNS management (prevents reboot rollback)..."
-    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
-        cat > /etc/cloud/cloud.cfg.d/99-disable-dns-mgmt.cfg << 'EOF'
+    if [[ -d $CLOUD_CFG_DIR ]]; then
+        cat > $CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg << 'EOF'
 # Managed by setup_dns.sh -- prevents cloud-init from overwriting DNS on boot.
 # This is what keeps the clikader DNS config from being rolled back after reboot.
 manage_resolv_conf: false
@@ -748,7 +756,7 @@ EOF
     if dpkg -s resolvconf &> /dev/null 2>&1; then
         log "Detected 'resolvconf' package, uninstalling..."
         apt-get remove -y resolvconf || true
-        rm -f /etc/resolv.conf
+        rm -f $RESOLV_CONF
         log "✅ 'resolvconf' successfully uninstalled"
     fi
     
@@ -761,10 +769,10 @@ EOF
     
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
     generate_resolved_config
-    echo -e "${SECURE_RESOLVED_CONFIG}" > /etc/systemd/resolved.conf
+    echo -e "${SECURE_RESOLVED_CONFIG}" > $RESOLVED_CONF
     unlock_resolv_conf
-    rm -f /etc/resolv.conf 2>/dev/null || true
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    rm -f $RESOLV_CONF 2>/dev/null || true
+    ln -sf $STUB_RESOLV_CONF $RESOLV_CONF
     systemctl restart systemd-resolved || {
         error "Failed to restart systemd-resolved"
         return 1
@@ -803,8 +811,8 @@ verify_dns() {
     fi
     
     echo ""
-    log "Current /etc/resolv.conf:"
-    cat /etc/resolv.conf
+    log "Current $RESOLV_CONF:"
+    cat $RESOLV_CONF
     echo ""
 }
 
@@ -869,4 +877,7 @@ main() {
     echo ""
 }
 
-main "$@"
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

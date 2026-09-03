@@ -69,19 +69,19 @@ section()  { echo -e "\n${CYAN}${BOLD}=== $1 ===${NC}"; }
 # --------------------------------------------------------------------------
 # Paths / constants
 # --------------------------------------------------------------------------
-SYSCONF="/etc/sysctl.conf"
-DROPIN_DIR="/etc/sysctl.d"
+SYSCONF="${SYSCONF:-/etc/sysctl.conf}"
+DROPIN_DIR="${DROPIN_DIR:-/etc/sysctl.d}"
 DROPIN="${DROPIN_DIR}/zz-clikader-tcp.conf"   # "zz-" => sorts last among drop-ins
 MARKER="disabled by clikader-tcp"             # tag for keys we neutralize in sysctl.conf
-BACKUP_DIR="/etc/clikader-tcp-backup"
-BBR_MODULE_FILE="/etc/modules-load.d/clikader-tcp-bbr.conf"
+BACKUP_DIR="${BACKUP_DIR:-/etc/clikader-tcp-backup}"
+BBR_MODULE_FILE="${BBR_MODULE_FILE:-/etc/modules-load.d/clikader-tcp-bbr.conf}"
 
 # File-descriptor limits (NOT sysctl-managed): a proxy must hold many open
 # sockets. fs.file-max is a global kernel cap (sysctl, below), but the per-process
 # soft/hard nofile lives in PAM limits, and a systemd *service* (like sing-box)
 # ignores PAM — so we also drop a systemd override so the daemon actually inherits it.
-LIMITS_FILE="/etc/security/limits.conf"
-SYSTEMD_OVERRIDE_DIR="/etc/systemd/system.conf.d"
+LIMITS_FILE="${LIMITS_FILE:-/etc/security/limits.conf}"
+SYSTEMD_OVERRIDE_DIR="${SYSTEMD_OVERRIDE_DIR:-/etc/systemd/system.conf.d}"
 SYSTEMD_OVERRIDE="${SYSTEMD_OVERRIDE_DIR}/clikader-tcp-limits.conf"
 
 # Desired floor values for capacity/buffer keys that must never regress DOWNWARD.
@@ -651,9 +651,12 @@ do_status() {
 }
 
 # --------------------------------------------------------------------------
-case "$MODE" in
-    apply)   do_apply ;;
-    revert)  do_revert ;;
-    dryrun)  do_dryrun ;;
-    status)  do_status ;;
-esac
+# Run only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "$MODE" in
+        apply)   do_apply ;;
+        revert)  do_revert ;;
+        dryrun)  do_dryrun ;;
+        status)  do_status ;;
+    esac
+fi
