@@ -39,12 +39,23 @@
 #  to the true pre-script state (not just "delete the file and hope").
 # ===========================================================================
 #
-# Usage:  clikader tcp [--dry-run|--status|--revert|--help]
-#   (no flag)   Apply tuning (idempotent; safe to re-run)
-#   --dry-run   Show current -> desired per key, make no changes
-#   --status    Show what is currently active and whether the drop-in is in charge
-#   --revert    Restore pre-script state (drop-in + sysctl.conf + live snapshot)
-#   --help      Show this help
+# Buffer sizing is BDP-derived (bandwidth-delay product), not copied constants:
+# BDP = link_bandwidth * assumed_RTT(150ms); buf_max = 2*BDP + 2MiB, clamped to
+# [4MiB, RAM/32] with a 256MiB ceiling, so small VPS don't OOM and high-BDP
+# boxes still get the headroom they need. tcp_mem is derived from total RAM.
+#
+# Usage:  clikader tcp [--dry-run|--status|--revert|--help] [options]
+#   (no flag)         Apply tuning (idempotent; safe to re-run)
+#   --dry-run         Show current -> desired per key, make no changes
+#   --status          Show what is currently active and whether the drop-in is in charge
+#   --revert          Restore pre-script state (drop-in + sysctl.conf + live snapshot)
+#   --initcwnd        Also set initcwnd/initrwnd 32 on the default route and persist
+#                     it (skipped on links <=100Mbps; revert restores the route)
+#   --swap SIZE       Also create a swapfile (e.g. 2G, clamped 1-20G) and set
+#                     vm.swappiness=10; for small-RAM boxes where grown TCP
+#                     buffers risk OOM-killing the proxy
+#   --bandwidth MBPS  Override link-speed detection for BDP buffer sizing
+#   --help            Show this help
 
 set -euo pipefail
 
@@ -85,15 +96,30 @@ SYSTEMD_OVERRIDE_DIR="${SYSTEMD_OVERRIDE_DIR:-/etc/systemd/system.conf.d}"
 SYSTEMD_OVERRIDE="${SYSTEMD_OVERRIDE_DIR}/clikader-tcp-limits.conf"
 
 # Desired floor values for capacity/buffer keys that must never regress DOWNWARD.
-FLOOR_RMEM_MAX=33554432
-FLOOR_WMEM_MAX=33554432
 FLOOR_CONNTRACK_MAX=65536
 FLOOR_UDP_RMEM_MIN=8192
 FLOOR_UDP_WMEM_MIN=8192
-TUPLE_UPPER=33554432   # third element of tcp_rmem/tcp_wmem upper bound
+TUPLE_UPPER=33554432   # tcp_rmem/tcp_wmem upper-bound threshold; build_desired
+                       # recomputes it from the BDP-derived buf_max
+
+# BDP-derived buffer sizing (bandwidth-delay product). BDP = bandwidth * RTT;
+# buf_max = 2*BDP + 2MiB, clamped to [BUF_MAX_FLOOR, min(RAM/32, CEILING)] so
+# tiny VPS don't OOM and long-fat links get real headroom.
+ASSUMED_RTT_MS="${ASSUMED_RTT_MS:-150}"   # typical international relay path
+BUF_MAX_FLOOR=4194304        # 4 MiB
+BUF_MAX_CEILING=268435456    # 256 MiB
+BUF_DEF=1048576              # per-socket default rmem/wmem (proxy role)
 FILE_MAX_TARGET=1048576      # fs.file-max floor
 NR_OPEN_TARGET=1048576       # fs.nr_open (per-process ceiling) floor
 NOFILE_LIMIT=1048576         # nofile written to limits.conf + systemd override
+
+# Concurrency guard + opt-in feature paths.
+LOCK_FILE="${LOCK_FILE:-/var/lock/clikader-tcp.lock}"
+INITCWND_HOOK_DIR="${INITCWND_HOOK_DIR:-/etc/networkd-dispatcher/routable.d}"
+INITCWND_SERVICE="${INITCWND_SERVICE:-/etc/systemd/system/clikader-tcp-initcwnd.service}"
+INITCWND_VALUE=32
+SWAPFILE_PATH="${SWAPFILE_PATH:-/swapfile}"
+FSTAB="${FSTAB:-/etc/fstab}"
 
 # --------------------------------------------------------------------------
 # Pre-flight
@@ -109,17 +135,31 @@ done
 
 # --- Argument parsing ---
 MODE="apply"
-for arg in "$@"; do
-    case "$arg" in
+OPT_INITCWND=0
+OPT_SWAP=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --revert|--uninstall|-r) MODE="revert" ;;
         --dry-run|-n)            MODE="dryrun" ;;
         --status|-s)             MODE="status" ;;
+        --initcwnd)              OPT_INITCWND=1 ;;
+        --swap=*)
+            OPT_SWAP="${1#*=}" ;;
+        --swap)
+            # `--swap 2G` takes the value; bare `--swap` defaults to 2G.
+            if [[ $# -ge 2 && "$2" != -* ]]; then OPT_SWAP="$2"; shift; else OPT_SWAP="2G"; fi ;;
+        --bandwidth=*)
+            BANDWIDTH_MBPS="${1#*=}" ;;
+        --bandwidth)
+            if [[ $# -ge 2 && "$2" != -* ]]; then BANDWIDTH_MBPS="$2"; shift
+            else error "--bandwidth requires a value (Mbps)"; exit 2; fi ;;
         --help|-h)
-            sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,58p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
-        *) error "Unknown argument: $arg"; exit 2 ;;
+        *) error "Unknown argument: $1"; exit 2 ;;
     esac
+    shift
 done
 
 # --------------------------------------------------------------------------
@@ -161,6 +201,72 @@ floor_tuple() {
     fi
 }
 
+# --- Machine profiling: derive values from specs instead of fixed constants ---
+
+# Total RAM in kB (env MEM_TOTAL_KB overrides for tests).
+mem_total_kb() {
+    if [[ -n "${MEM_TOTAL_KB:-}" ]]; then echo "$MEM_TOTAL_KB"; return; fi
+    awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true
+}
+
+# Link bandwidth in Mbps (env/flag BANDWIDTH_MBPS overrides). Virtual NICs
+# often report -1 or nothing in /sys/class/net/*/speed; fall back to 1000.
+detect_bandwidth_mbps() {
+    if [[ -n "${BANDWIDTH_MBPS:-}" ]]; then echo "$BANDWIDTH_MBPS"; return; fi
+    local iface speed
+    iface="$(ip route show default 2>/dev/null | head -1 | \
+        awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    if [[ -n "$iface" ]]; then
+        speed="$(cat "/sys/class/net/$iface/speed" 2>/dev/null || true)"
+        speed="${speed//[!0-9]/}"
+        if [[ -n "$speed" && "$speed" -gt 0 ]]; then echo "$speed"; return; fi
+    fi
+    echo 1000
+}
+
+# BDP-derived max socket buffer: 2*BDP + 2MiB, clamped to
+# [4MiB, min(RAM/32, 256MiB)].
+# Args: bandwidth_mbps ram_kb -> echoes bytes
+calc_buf_max() {
+    local bw="$1" ram_kb="$2"
+    local bdp=$(( bw * 1000000 / 8 * ASSUMED_RTT_MS / 1000 ))
+    local v=$(( 2*bdp + 2097152 ))
+    local cap=$(( ram_kb*1024/32 ))
+    (( cap > BUF_MAX_CEILING )) && cap=$BUF_MAX_CEILING
+    (( v > cap )) && v=$cap
+    (( v < BUF_MAX_FLOOR )) && v=$BUF_MAX_FLOOR
+    echo "$v"
+}
+
+# RAM-derived tcp_mem triple (low pressure max), in pages. Setting max near RAM
+# is the classic small-VPS OOM cause, so cap at RAM/4.
+# Args: ram_kb -> echoes "low pressure max"
+calc_tcp_mem() {
+    local ram_kb="$1" pagesize total low pressure max
+    pagesize="$(getconf PAGE_SIZE 2>/dev/null || true)"
+    pagesize="${pagesize//[!0-9]/}"
+    [[ -n "$pagesize" && "$pagesize" -gt 0 ]] || pagesize=4096
+    total=$(( ram_kb*1024/pagesize ))
+    low=$(( total/16 ));     (( low < 4096 )) && low=4096
+    pressure=$(( total/8 )); (( pressure < 8192 )) && pressure=8192
+    max=$(( total/4 ));      (( max < 16384 )) && max=16384
+    echo "$low $pressure $max"
+}
+
+# Concurrency guard: two concurrent runs would race on the drop-in, snapshots
+# and routes. Non-interactive CLI, so just fail with a clear message.
+take_lock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
+    # NB: no `2>/dev/null` on this exec — it would become a permanent redirect
+    # and swallow the script's stderr (all warnings/errors) for the whole run.
+    exec 9>"$LOCK_FILE" || return 0
+    if ! flock -n 9; then
+        error "Another clikader tcp instance is running (lock: $LOCK_FILE)"
+        exit 1
+    fi
+}
+
 # Is nf_conntrack loaded/present? (decides whether conntrack keys are applied)
 conntrack_present() {
     [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]] || \
@@ -195,6 +301,15 @@ build_desired() {
 
     section_note() { :; } # placeholder (sections are visual only)
 
+    # --- Machine-derived sizing (BDP for buffers, RAM for tcp_mem) ---
+    local ram_kb bw buf_max
+    ram_kb="$(mem_total_kb)"; ram_kb="${ram_kb//[!0-9]/}"
+    [[ -n "$ram_kb" && "$ram_kb" -gt 0 ]] || ram_kb=1048576   # assume 1GB
+    bw="$(detect_bandwidth_mbps)"; bw="${bw//[!0-9]/}"
+    [[ -n "$bw" && "$bw" -gt 0 ]] || bw=1000
+    buf_max="$(calc_buf_max "$bw" "$ram_kb")"
+    TUPLE_UPPER="$buf_max"   # floor_tuple compares live upper bounds against this
+
     # --- Ramp-up & reuse: fast resume of idle relay streams + TFO reconnect ---
     add net.ipv4.tcp_slow_start_after_idle 0 \
         "Don't reset cwnd after idle -> long-lived relay streams resume at speed"
@@ -223,16 +338,17 @@ build_desired() {
         "Safe reuse of outbound TIME_WAIT sockets (NOT tcp_tw_recycle)"
     add net.ipv4.tcp_max_tw_buckets 32768 \
         "Headroom for TIME_WAIT churn from short-lived conns"
-    add net.ipv4.tcp_max_syn_backlog 4096 \
-        "SYN backlog for bursty inbound handshakes"
+    add net.ipv4.tcp_max_syn_backlog \
+        "$(floor_numeric net.ipv4.tcp_max_syn_backlog 8192)" \
+        "SYN backlog for bursty inbound handshakes (floor only)"
     add net.ipv4.tcp_max_orphans 32768 \
         "Orphaned-socket cap before kernel drops"
     add "net.ipv4.ip_local_port_range" "10240 65535" \
         "Ephemeral port range for outbound conn churn"
-    add net.ipv4.tcp_fin_timeout 30 \
+    add net.ipv4.tcp_fin_timeout 15 \
         "Reclaim FIN-WAIT-2 sockets faster"
-    add net.core.somaxconn 4096 \
-        "Accept queue depth for listeners"
+    add net.core.somaxconn "$(floor_numeric net.core.somaxconn 8192)" \
+        "Accept queue depth for listeners (floor only)"
     # WORKLOAD-DEPENDENT: tcp_retries2 caps how long the kernel retransmits an
     # unacknowledged segment before giving up (~default 15 -> ~924s/15min).
     # Lower (e.g. 8) -> fail over to a healthier path/peer faster on lossy links;
@@ -242,24 +358,35 @@ build_desired() {
         "Retransmit cap; lower for faster failover, higher for patience"
 
     # --- Buffers & windowing (floors only: never lower an existing higher value) ---
-    # WORKLOAD-DEPENDENT: these upper bounds assume a box with >=1GB RAM doing
-    # heavy relay. Lower them on memory-constrained VPS; raise the *_max pair
-    # for very-high-BDP long-haul links.
-    add net.core.rmem_max "$(floor_numeric net.core.rmem_max "$FLOOR_RMEM_MAX")" \
-        "Max recv socket buffer (floor only)"
-    add net.core.wmem_max "$(floor_numeric net.core.wmem_max "$FLOOR_WMEM_MAX")" \
-        "Max send socket buffer (floor only)"
-    add net.ipv4.tcp_rmem "$(floor_tuple net.ipv4.tcp_rmem '4096 87380 33554432')" \
+    # WORKLOAD-DEPENDENT: buf_max is BDP-derived (2*BDP + 2MiB, clamped to
+    # [4MiB, RAM/32, 256MiB ceiling]). Override the bandwidth input with
+    # --bandwidth on virtual NICs whose link speed can't be detected.
+    add net.core.rmem_max "$(floor_numeric net.core.rmem_max "$buf_max")" \
+        "Max recv socket buffer (BDP-derived, floor only)"
+    add net.core.wmem_max "$(floor_numeric net.core.wmem_max "$buf_max")" \
+        "Max send socket buffer (BDP-derived, floor only)"
+    add net.core.rmem_default "$(floor_numeric net.core.rmem_default "$BUF_DEF")" \
+        "Default recv buffer per socket (proxy role, floor only)"
+    add net.core.wmem_default "$(floor_numeric net.core.wmem_default "$BUF_DEF")" \
+        "Default send buffer per socket (proxy role, floor only)"
+    add net.ipv4.tcp_rmem "$(floor_tuple net.ipv4.tcp_rmem "4096 $BUF_DEF $buf_max")" \
         "TCP recv autotuning tuple (min default max)"
-    add net.ipv4.tcp_wmem "$(floor_tuple net.ipv4.tcp_wmem '4096 16384 33554432')" \
+    add net.ipv4.tcp_wmem "$(floor_tuple net.ipv4.tcp_wmem "4096 $BUF_DEF $buf_max")" \
         "TCP send autotuning tuple (min default max)"
+    # tcp_mem is RAM-derived (pages: RAM/16, RAM/8, RAM/4). Capping the max at
+    # RAM/4 avoids the classic small-VPS OOM where TCP buffers eat all memory.
+    add net.ipv4.tcp_mem "$(calc_tcp_mem "$ram_kb")" \
+        "Global TCP memory limits in pages (RAM-derived: /16 /8 /4)"
     add net.ipv4.tcp_window_scaling 1 "Allow large windows beyond 64KB"
+    add net.ipv4.tcp_adv_win_scale 1 "1/2 of recv buffer for app, 1/2 for window"
     add net.ipv4.tcp_sack 1          "Selective ACKs for faster loss recovery"
+    add net.ipv4.tcp_dsack 1         "Duplicate SACK: detect spurious retransmits"
     add net.ipv4.tcp_moderate_rcvbuf 1 "Kernel autotunes recv buffer per socket"
     # WORKLOAD-DEPENDENT: notsent_lowat caps bytes cached in the kernel send
     # queue before blocking the app. Lower (e.g. 131072) cuts bufferbloat and
     # improves latency on interactive/relay streams at the cost of some
-    # throughput; set to a large value (or 0x200000=2MB) for pure bulk.
+    # throughput (it can measurably hurt throughput on low-core machines);
+    # set to a large value (or 0x200000=2MB) for pure bulk.
     add net.ipv4.tcp_notsent_lowat 131072 \
         "Send-queue floor; lower = less bufferbloat / lower latency"
     # UDP floors matter for QUIC and SOCKS5-UDP relay; never lower existing.
@@ -279,8 +406,13 @@ build_desired() {
     add net.ipv4.tcp_keepalive_probes 5   "Probes before declaring peer dead"
 
     # --- RX headroom ---
-    add net.core.netdev_max_backlog 5000 \
-        "NIC->kernel queue depth before packets dropped under burst"
+    add net.core.netdev_max_backlog \
+        "$(floor_numeric net.core.netdev_max_backlog 16384)" \
+        "NIC->kernel queue depth before packets dropped under burst (floor only)"
+
+    # --- VM hygiene: keep a reserve so heavy buffer growth can't stall the box ---
+    add vm.min_free_kbytes "$(floor_numeric vm.min_free_kbytes 32768)" \
+        "Keep 32MB free reserve (floor only; avoids allocation stalls)"
 
     # --- Routing & relay correctness (sing-box TUN / transparent proxy needs this) ---
     # ip_forward is KERNEL ROUTING, not firewall — required so the box forwards
@@ -336,6 +468,12 @@ build_desired() {
         add net.netfilter.nf_conntrack_max \
             "$(floor_numeric net.netfilter.nf_conntrack_max "$FLOOR_CONNTRACK_MAX")" \
             "Conntrack table size (floor only; never lower existing)"
+    fi
+
+    # --- Swap policy (only when --swap created our swapfile) ---
+    if [[ -f "${BACKUP_DIR}/swapfile.owned" ]]; then
+        add vm.swappiness 10 \
+            "Prefer RAM over swap, but let buffers overflow instead of OOM-killing"
     fi
 }
 
@@ -487,11 +625,189 @@ apply_conntrack_hashsize() {
 }
 
 # --------------------------------------------------------------------------
+# Read-back verification (non-fatal): sysctl -p silently skips keys the kernel
+# rejects, so compare live state against the desired set and report mismatches.
+# --------------------------------------------------------------------------
+verify_applied() {
+    local i key des cur fails=0
+    for i in "${!DK_KEYS[@]}"; do
+        key="${DK_KEYS[$i]}"; des="${DK_VALS[$i]}"
+        cur="$(get_live "$key")"
+        # Unquoted echo collapses tabs/multiple spaces so sysctl's tuple
+        # formatting ("a\tb\tc") compares equal to our "a b c".
+        if [[ "$(echo $cur)" != "$(echo $des)" ]]; then
+            warning "Verify: ${key} is '${cur:-(unset)}', expected '${des}'"
+            fails=$((fails+1))
+        fi
+    done
+    if (( fails == 0 )); then
+        log "Verified: all ${#DK_KEYS[@]} keys match live state"
+    else
+        warning "${fails} key(s) did not take effect (see above)."
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Opt-in: initcwnd/initrwnd on the default route.
+# A larger initial congestion window (32 segments) removes several RTTs of
+# slow-start ramp-up per connection — a real win on high-BDP links. Skipped on
+# links <=100Mbps, where the 32-segment first burst would punch through small
+# policer token buckets. Route attributes are wiped when the route is recreated
+# (DHCP renew, link flap), so we persist via a networkd-dispatcher hook when
+# available, else a systemd oneshot unit. Ownership marker ensures revert only
+# touches what we created.
+# --------------------------------------------------------------------------
+apply_initcwnd() {
+    local route cleaned speed
+    route="$(ip route show default 2>/dev/null | head -1)"
+    if [[ -z "$route" ]]; then
+        warning "No default IPv4 route found; skipping initcwnd"
+        return 0
+    fi
+    speed="$(detect_bandwidth_mbps)"; speed="${speed//[!0-9]/}"
+    if [[ -n "$speed" && "$speed" -le 100 ]]; then
+        info "Link speed ${speed}Mbps <= 100Mbps; skipping initcwnd (would burst through small policers)"
+        return 0
+    fi
+    # Snapshot the pristine route once so revert restores the true original.
+    if [[ ! -f "${BACKUP_DIR}/default-route.snapshot" ]]; then
+        echo "$route" > "${BACKUP_DIR}/default-route.snapshot"
+    fi
+    # Strip any existing initcwnd/initrwnd tokens, then add ours; all other
+    # tokens (via/dev/metric/proto/src/onlink) are preserved verbatim.
+    cleaned="$(echo "$route" | sed -E 's/[[:space:]]+initcwnd [0-9]+//g; s/[[:space:]]+initrwnd [0-9]+//g')"
+    # Intentional word-splitting: $cleaned is an ip-route token list.
+    if ip route replace $cleaned initcwnd "$INITCWND_VALUE" initrwnd "$INITCWND_VALUE"; then
+        log "Set initcwnd/initrwnd ${INITCWND_VALUE} on the default route"
+        : > "${BACKUP_DIR}/initcwnd.owned"
+        persist_initcwnd "$cleaned"
+    else
+        warning "Failed to set initcwnd on the default route"
+    fi
+}
+
+persist_initcwnd() {
+    local route="$1"
+    if [[ -d "$INITCWND_HOOK_DIR" ]]; then
+        cat > "${INITCWND_HOOK_DIR}/50-clikader-initcwnd" <<EOF
+#!/bin/sh
+# Managed by clikader tcp -- re-applies initcwnd when the route is recreated.
+ip route replace $route initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE 2>/dev/null || true
+EOF
+        chmod 0755 "${INITCWND_HOOK_DIR}/50-clikader-initcwnd"
+        log "Wrote networkd-dispatcher hook ${INITCWND_HOOK_DIR}/50-clikader-initcwnd"
+    else
+        mkdir -p "$(dirname "$INITCWND_SERVICE")"
+        cat > "$INITCWND_SERVICE" <<EOF
+# Managed by clikader tcp -- re-applies initcwnd after network-online at boot.
+[Unit]
+Description=clikader tcp initcwnd
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip route replace $route initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        log "Wrote systemd unit ${INITCWND_SERVICE}"
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now "$(basename "$INITCWND_SERVICE")" 2>/dev/null || true
+    fi
+}
+
+revert_initcwnd() {
+    [[ -f "${BACKUP_DIR}/initcwnd.owned" ]] || return 0
+    local route=""
+    if [[ -f "${BACKUP_DIR}/default-route.snapshot" ]]; then
+        route="$(cat "${BACKUP_DIR}/default-route.snapshot")"
+    fi
+    # Intentional word-splitting: $route is an ip-route token list.
+    if [[ -n "$route" ]] && ip route replace $route 2>/dev/null; then
+        log "Restored original default route (initcwnd removed)"
+    fi
+    rm -f "${INITCWND_HOOK_DIR}/50-clikader-initcwnd"
+    if [[ -f "$INITCWND_SERVICE" ]]; then
+        systemctl disable --now "$(basename "$INITCWND_SERVICE")" 2>/dev/null || true
+        rm -f "$INITCWND_SERVICE"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f "${BACKUP_DIR}/initcwnd.owned" "${BACKUP_DIR}/default-route.snapshot"
+}
+
+# --------------------------------------------------------------------------
+# Opt-in: swap hardening. On <=1GB boxes without swap, grown TCP buffers can
+# trigger the OOM-killer against the proxy process mid-transfer. A modest
+# swapfile + swappiness=10 gives the kernel somewhere to put idle pages.
+# --------------------------------------------------------------------------
+apply_swap() {
+    local size="$1" gb
+    gb="${size%[Gg]}"; gb="${gb//[!0-9]/}"
+    if [[ -z "$gb" ]]; then
+        error "Invalid --swap size: '$size' (use e.g. 2G)"
+        exit 2
+    fi
+    (( gb < 1 )) && gb=1
+    (( gb > 20 )) && gb=20
+    if [[ -e "$SWAPFILE_PATH" && ! -f "${BACKUP_DIR}/swapfile.owned" ]]; then
+        error "$SWAPFILE_PATH exists and is not managed by clikader tcp; refusing to overwrite"
+        exit 1
+    fi
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE_PATH"; then
+        info "Swapfile $SWAPFILE_PATH already active"
+        : > "${BACKUP_DIR}/swapfile.owned"
+        return 0
+    fi
+    log "Creating ${gb}G swapfile at $SWAPFILE_PATH..."
+    if ! fallocate -l "${gb}G" "$SWAPFILE_PATH" 2>/dev/null; then
+        dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count=$((gb*1024)) status=none
+    fi
+    chmod 600 "$SWAPFILE_PATH"
+    mkswap "$SWAPFILE_PATH" >/dev/null
+    swapon "$SWAPFILE_PATH"
+    if [[ -f "$FSTAB" ]]; then
+        sed -i '/# BEGIN clikader-tcp swap/,/# END clikader-tcp swap/d' "$FSTAB"
+    fi
+    cat >> "$FSTAB" <<EOF
+
+# BEGIN clikader-tcp swap
+$SWAPFILE_PATH none swap sw 0 0
+# END clikader-tcp swap
+EOF
+    : > "${BACKUP_DIR}/swapfile.owned"
+    log "Swap ${gb}G active (vm.swappiness=10 included in this run's drop-in)"
+}
+
+revert_swap() {
+    [[ -f "${BACKUP_DIR}/swapfile.owned" ]] || return 0
+    if ! swapoff "$SWAPFILE_PATH" 2>/dev/null; then
+        warning "swapoff $SWAPFILE_PATH failed (was it active?)"
+    fi
+    if [[ -f "$FSTAB" ]]; then
+        sed -i '/# BEGIN clikader-tcp swap/,/# END clikader-tcp swap/d' "$FSTAB"
+        log "Removed clikader-tcp block from $FSTAB"
+    fi
+    rm -f "$SWAPFILE_PATH" "${BACKUP_DIR}/swapfile.owned"
+    log "Removed swapfile $SWAPFILE_PATH"
+}
+
+# --------------------------------------------------------------------------
 # Modes
 # --------------------------------------------------------------------------
 
 do_apply() {
     section "TCP/network optimization — apply"
+    take_lock
+
+    # Swap first: build_desired() includes vm.swappiness only when our swap
+    # marker exists, so the drop-in written below picks it up on the same run.
+    if [[ -n "$OPT_SWAP" ]]; then
+        apply_swap "$OPT_SWAP"
+    fi
+
     build_desired
 
     # BBR: warn clearly if the kernel can't do it; we still skip the CC key
@@ -516,9 +832,13 @@ do_apply() {
     neutralize_sysctl_conf
     write_dropin
     apply_live
+    verify_applied
     apply_limits_files
     if conntrack_present; then
         apply_conntrack_hashsize
+    fi
+    if [[ "$OPT_INITCWND" == 1 ]]; then
+        apply_initcwnd
     fi
 
     local n
@@ -533,7 +853,10 @@ do_apply() {
 
 do_revert() {
     section "TCP/network optimization — revert"
-    if [[ ! -f "$DROPIN" ]] && [[ ! -f "${BACKUP_DIR}/live-values.snapshot" ]]; then
+    take_lock
+    if [[ ! -f "$DROPIN" ]] && [[ ! -f "${BACKUP_DIR}/live-values.snapshot" ]] \
+        && [[ ! -f "${BACKUP_DIR}/initcwnd.owned" ]] \
+        && [[ ! -f "${BACKUP_DIR}/swapfile.owned" ]]; then
         warning "Nothing to revert (no drop-in and no snapshot found)."
         exit 0
     fi
@@ -590,6 +913,10 @@ do_revert() {
     # 6. Best-effort cleanup of the BBR module-load hint (leave the module
     #    loaded; rmmod could disrupt live flows).
     rm -f "$BBR_MODULE_FILE" 2>/dev/null || true
+
+    # 7. Revert opt-in features (each is a no-op unless its marker exists).
+    revert_initcwnd
+    revert_swap
 
     echo ""
     echo -e "${GREEN}Reverted to pre-script state.${NC}"

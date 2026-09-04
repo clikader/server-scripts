@@ -10,8 +10,16 @@ setup() {
     export BBR_MODULE_FILE="$BATS_TEST_TMPDIR/bbr.conf"
     export LIMITS_FILE="$BATS_TEST_TMPDIR/limits.conf"
     export SYSTEMD_OVERRIDE_DIR="$BATS_TEST_TMPDIR/systemd.conf.d"
+    export LOCK_FILE="$BATS_TEST_TMPDIR/tcp.lock"
+    export INITCWND_HOOK_DIR="$BATS_TEST_TMPDIR/networkd-dispatcher"
+    export INITCWND_SERVICE="$BATS_TEST_TMPDIR/systemd/clikader-tcp-initcwnd.service"
+    export SWAPFILE_PATH="$BATS_TEST_TMPDIR/swapfile"
+    export FSTAB="$BATS_TEST_TMPDIR/fstab"
+    export MEM_TOTAL_KB=1048576     # 1GB
+    export BANDWIDTH_MBPS=1000
     mkdir -p "$DROPIN_DIR" "$BACKUP_DIR" "$SYSTEMD_OVERRIDE_DIR"
     printf '* soft nofile 1024\n' > "$LIMITS_FILE"
+    printf '# fstab\n' > "$FSTAB"
     : > "$SYSCONF"
 
     cat > "$MOCK_BIN/sysctl" <<'MOCK'
@@ -34,11 +42,37 @@ fi
 exit 0
 MOCK
     chmod +x "$MOCK_BIN/sysctl"
+    # fallocate must actually create the target file (chmod/mkswap follow it).
+    cat > "$MOCK_BIN/fallocate" <<'MOCK'
+#!/usr/bin/env bash
+me="$(basename "$0")"
+printf '%s' "$me" >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+: > "${@: -1}"
+MOCK
+    chmod +x "$MOCK_BIN/fallocate"
     make_mock systemctl
     make_mock lsmod --out ""
     make_mock modprobe --status 1
     make_mock sleep
+    make_mock ip --out "default via 10.0.0.1 dev eth0 proto dhcp metric 100"
+    make_mock mkswap
+    make_mock swapon
+    make_mock swapoff
     load_component components/optimize_tcp.sh
+}
+
+# Value of a key in the DK_* desired-state arrays (fails if key absent).
+dk_val() {
+    local i
+    for i in "${!DK_KEYS[@]}"; do
+        if [[ "${DK_KEYS[$i]}" == "$1" ]]; then
+            echo "${DK_VALS[$i]}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 set_sysctl() {
@@ -196,4 +230,178 @@ set_sysctl() {
     run do_status
     [ "$status" -eq 0 ]
     assert_output_contains "Drop-in present"
+}
+
+@test "calc_buf_max: BDP-derived with RAM cap, ceiling and floor" {
+    # 1Gbps + 1GB RAM -> 2*BDP+2MiB = 39.6MB, capped at RAM/32 = 32MiB
+    run calc_buf_max 1000 1048576
+    [ "$output" = "33554432" ]
+    # 1Gbps + 512MB RAM -> capped at 16MiB
+    run calc_buf_max 1000 524288
+    [ "$output" = "16777216" ]
+    # 100Gbps + 64GB RAM -> 256MiB ceiling
+    run calc_buf_max 100000 67108864
+    [ "$output" = "268435456" ]
+    # 10Mbps -> 4MiB floor
+    run calc_buf_max 10 1048576
+    [ "$output" = "4194304" ]
+}
+
+@test "calc_tcp_mem: RAM-derived page triple with floors" {
+    # 1GB / 4KiB = 262144 pages -> /16 /8 /4
+    run calc_tcp_mem 1048576
+    [ "$output" = "16384 32768 65536" ]
+    # 128MB -> 32768 pages -> all floors kick in
+    run calc_tcp_mem 131072
+    [ "$output" = "4096 8192 16384" ]
+}
+
+@test "mem_total_kb / detect_bandwidth_mbps: env overrides win" {
+    run mem_total_kb
+    [ "$output" = "1048576" ]
+    run detect_bandwidth_mbps
+    [ "$output" = "1000" ]
+}
+
+@test "detect_bandwidth_mbps: falls back to 1000 when undetectable" {
+    unset BANDWIDTH_MBPS
+    make_mock ip --out ""   # no default route visible
+    run detect_bandwidth_mbps
+    [ "$output" = "1000" ]
+}
+
+@test "build_desired: includes BDP/RAM-derived and new keys" {
+    build_desired
+    run dk_val net.core.rmem_max
+    [ "$output" = "33554432" ]
+    run dk_val net.ipv4.tcp_mem
+    [ "$output" = "16384 32768 65536" ]
+    run dk_val net.ipv4.tcp_rmem
+    [ "$output" = "4096 1048576 33554432" ]
+    run dk_val net.core.rmem_default
+    [ "$output" = "1048576" ]
+    run dk_val net.ipv4.tcp_dsack
+    [ "$output" = "1" ]
+    run dk_val net.ipv4.tcp_adv_win_scale
+    [ "$output" = "1" ]
+    run dk_val vm.min_free_kbytes
+    [ "$output" = "32768" ]
+}
+
+@test "build_desired: bumped queue keys keep higher live values" {
+    set_sysctl net.core.somaxconn 65535
+    set_sysctl net.core.netdev_max_backlog 99999
+    set_sysctl net.ipv4.tcp_max_syn_backlog 16384
+    build_desired
+    run dk_val net.core.somaxconn
+    [ "$output" = "65535" ]
+    run dk_val net.core.netdev_max_backlog
+    [ "$output" = "99999" ]
+    run dk_val net.ipv4.tcp_max_syn_backlog
+    [ "$output" = "16384" ]
+}
+
+@test "build_desired: vm.swappiness only when swap marker exists" {
+    build_desired
+    run dk_val vm.swappiness
+    [ "$status" -eq 1 ]
+    : > "$BACKUP_DIR/swapfile.owned"
+    build_desired
+    run dk_val vm.swappiness
+    [ "$output" = "10" ]
+}
+
+@test "verify_applied: warns when live values do not match desired" {
+    build_desired
+    run verify_applied
+    [ "$status" -eq 0 ]
+    assert_output_contains "Verify:"
+}
+
+@test "take_lock: fails when another instance holds the lock" {
+    command -v flock >/dev/null 2>&1 || skip "flock not available"
+    exec 9>"$LOCK_FILE"
+    flock -n 9
+    run take_lock
+    [ "$status" -eq 1 ]
+    assert_output_contains "Another clikader tcp instance"
+    exec 9>&-
+}
+
+@test "apply_initcwnd: rewrites default route and persists via systemd unit" {
+    run apply_initcwnd
+    [ "$status" -eq 0 ]
+    [ -f "$BACKUP_DIR/default-route.snapshot" ]
+    [ -f "$BACKUP_DIR/initcwnd.owned" ]
+    [ -f "$INITCWND_SERVICE" ]
+    mock_last_args ip | grep -q "route replace"
+    mock_last_args ip | grep -q "initcwnd 32"
+    grep -q "proto dhcp metric 100" "$INITCWND_SERVICE"
+}
+
+@test "apply_initcwnd: uses networkd-dispatcher hook when available" {
+    mkdir -p "$INITCWND_HOOK_DIR"
+    run apply_initcwnd
+    [ "$status" -eq 0 ]
+    [ -f "$INITCWND_HOOK_DIR/50-clikader-initcwnd" ]
+    [ ! -f "$INITCWND_SERVICE" ]
+}
+
+@test "apply_initcwnd: skips links <=100Mbps" {
+    BANDWIDTH_MBPS=100 run apply_initcwnd
+    [ "$status" -eq 0 ]
+    assert_output_contains "skipping initcwnd"
+    [ ! -f "$BACKUP_DIR/initcwnd.owned" ]
+}
+
+@test "revert_initcwnd: restores route and removes artifacts" {
+    run apply_initcwnd
+    [ -f "$INITCWND_SERVICE" ]
+    run revert_initcwnd
+    [ "$status" -eq 0 ]
+    [ ! -f "$INITCWND_SERVICE" ]
+    [ ! -f "$BACKUP_DIR/initcwnd.owned" ]
+    [ ! -f "$BACKUP_DIR/default-route.snapshot" ]
+    assert_output_contains "Restored original default route"
+}
+
+@test "apply_swap: refuses to overwrite a non-owned swapfile" {
+    : > "$SWAPFILE_PATH"
+    run apply_swap 2G
+    [ "$status" -eq 1 ]
+    assert_output_contains "refusing to overwrite"
+}
+
+@test "apply_swap: rejects an invalid size" {
+    run apply_swap bogus
+    [ "$status" -eq 2 ]
+}
+
+@test "apply_swap: creates swapfile, fstab block and marker" {
+    run apply_swap 2G
+    [ "$status" -eq 0 ]
+    [ -f "$BACKUP_DIR/swapfile.owned" ]
+    assert_file_contains "$FSTAB" "BEGIN clikader-tcp swap"
+    assert_file_contains "$FSTAB" "$SWAPFILE_PATH none swap sw 0 0"
+    assert_mock_called mkswap
+    assert_mock_called swapon
+}
+
+@test "revert_swap: swapoff, fstab cleanup, file removal" {
+    run apply_swap 2G
+    [ -f "$SWAPFILE_PATH" ]
+    run revert_swap
+    [ "$status" -eq 0 ]
+    [ ! -f "$SWAPFILE_PATH" ]
+    [ ! -f "$BACKUP_DIR/swapfile.owned" ]
+    ! grep -q "clikader-tcp swap" "$FSTAB"
+    assert_mock_called swapoff
+}
+
+@test "do_apply: drop-in includes vm.swappiness when swap was requested" {
+    set_sysctl net.ipv4.tcp_available_congestion_control "cubic bbr"
+    run apply_swap 2G
+    run do_apply
+    [ "$status" -eq 0 ]
+    grep -q "vm.swappiness" "$DROPIN"
 }
