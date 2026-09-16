@@ -2,6 +2,10 @@
 
 # DNS Setup Script - Configures DNS using systemd-resolved
 # Defaults to plain direct-IP DNS; secure DNS (DNSSEC + DNS-over-TLS) is optional.
+# Optional recursive mode (--recursive): a local unbound resolver queries the
+# authoritative nameservers directly, removing every public resolver cache
+# (and its stale negative answers) from the path — the real fix for ACME
+# DNS-01 propagation hangs. See resolve_cache_setting for the background.
 # Officially supported: Debian 12/13, Ubuntu 22.04/24.04/26
 # Other OS versions may work but are user-tested, not officially supported.
 
@@ -9,7 +13,7 @@ set -euo pipefail
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.10.0"
+SETUP_DNS_REVISION="1.11.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -23,6 +27,7 @@ selected_names=()
 ipv6_support=false
 has_dot_support=false
 use_secure_dns=false
+use_recursive=false     # set by --recursive: local unbound resolver instead of forwarding
 non_interactive=false   # set by --yes: accept all defaults with no prompts
 
 # System file paths (env-overridable so tests can target temp files; defaults unchanged)
@@ -31,6 +36,10 @@ DHCLIENT_CONF="${DHCLIENT_CONF:-/etc/dhcp/dhclient.conf}"
 IFUPD_RESOLVED="${IFUPD_RESOLVED:-/etc/network/if-up.d/resolved}"
 CLOUD_CFG_DIR="${CLOUD_CFG_DIR:-/etc/cloud/cloud.cfg.d}"
 RESOLVED_CONF="${RESOLVED_CONF:-/etc/systemd/resolved.conf}"
+RESOLVED_CONF_D="${RESOLVED_CONF_D:-/etc/systemd/resolved.conf.d}"
+UNBOUND_CONF="${UNBOUND_CONF:-/etc/unbound/unbound.conf}"
+UNBOUND_TRUST_ANCHOR="${UNBOUND_TRUST_ANCHOR:-/var/lib/unbound/root.key}"
+UNBOUND_ROOT_KEY_SRC="${UNBOUND_ROOT_KEY_SRC:-/usr/share/dns/root.key}"
 STUB_RESOLV_CONF="${STUB_RESOLV_CONF:-/run/systemd/resolve/stub-resolv.conf}"
 
 # Provider data arrays (associative, keyed by 1-based menu index). Populated by
@@ -48,7 +57,7 @@ declare -A dns_names
 PROBE_TIMEOUT=2          # seconds; per-server query timeout for the probe
 PROBE_QUERY="www.google.com"
 PROBE_QTYPE="A"
-LAST_RESORT_DNS="9.9.9.9 149.112.112.112"  # FallbackDNS: contacted only when every primary is down
+LAST_RESORT_DNS="208.67.222.222 208.67.220.220"  # OpenDNS (Cisco): operator-independent FallbackDNS, contacted only when every primary is down
 
 # How many providers "auto" mode keeps after probing the whole pool.
 AUTO_PICK_TOP=3
@@ -59,6 +68,12 @@ AUTO_PICK_TOP=3
 # reordering a provider only changes one place. The index in the array + 1 is
 # the menu number shown to the user (1-based, matching the original script).
 #
+# Curation policy (decided 2026-09): only globally famous, non-filtering,
+# anycast-everywhere resolvers. Servers run unattended ACME DNS-01 challenges
+# and background jobs, so resolvers that filter/redirect (AdGuard, OpenDNS)
+# or have thin regional coverage (DNS.SB, Control D, CleanBrowsing) are
+# deliberately excluded — "Custom DNS" covers anything not listed here.
+#
 # DoT hostname is embedded as "<ip>#<hostname>" per systemd-resolved syntax.
 # Direct-IP mode strips the "#hostname" suffix before applying (see select_dns_providers).
 #
@@ -67,11 +82,6 @@ DNS_PROVIDERS=(
     "Cloudflare|1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com|2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
     "Google|8.8.8.8#dns.google 8.8.4.4#dns.google|2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
     "Quad9|9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net|2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
-    "OpenDNS|208.67.222.222#dns.opendns.com 208.67.220.220#dns.opendns.com|2620:119:35::35#dns.opendns.com 2620:119:53::53#dns.opendns.com"
-    "AdGuard|94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com|2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
-    "CleanBrowsing|185.228.168.9#family-filter-dns.cleanbrowsing.org 185.228.169.9#family-filter-dns.cleanbrowsing.org|2a0d:2a00:1::#family-filter-dns.cleanbrowsing.org 2a0d:2a00:2::#family-filter-dns.cleanbrowsing.org"
-    "Control D|76.76.2.0#p0.freedns.controld.com 76.76.10.0#p0.freedns.controld.com|2606:1a40::0#p0.freedns.controld.com 2606:1a40:1::0#p0.freedns.controld.com"
-    "DNS.SB|185.222.222.222#dot.dns.sb 45.11.45.11#dot.dns.sb|2a09::#dot.dns.sb 2a11::#dot.dns.sb"
 )
 # Index of the "Custom DNS" menu entry (always last, after the catalogue).
 CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
@@ -81,6 +91,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -6|--ipv6)
             ipv6_support=true
+            shift
+            ;;
+        -r|--recursive)
+            use_recursive=true
             shift
             ;;
         -y|--yes)
@@ -190,7 +204,7 @@ probe_server() {
 #
 # Probes run in PARALLEL (one background subshell per provider) so wall time
 # stays ~PROBE_TIMEOUT regardless of how many providers are tested — important
-# now that "auto" mode probes the whole 8-provider pool.
+# because "auto" mode probes the whole pool.
 # Args: <space-separated choices>
 order_by_latency() {
     local choices=($@)
@@ -268,6 +282,46 @@ order_by_latency() {
     done < <(printf '%s' "$results" | sort -t'|' -k1,1n)
 
     return 0
+}
+
+# Ask which resolver architecture to use. Recursive mode (unbound) removes
+# every public resolver cache from the path — the structural fix for the
+# stale-negative-answer hangs that blocked ACME DNS-01 issuance on 2026-09-16.
+ask_resolver_mode() {
+    echo ""
+    echo "=========================================="
+    echo "  Resolver Mode"
+    echo "=========================================="
+    echo ""
+    echo "  forward   - systemd-resolved forwards to Cloudflare/Google/Quad9"
+    echo "              (default, current behavior)"
+    echo "  recursive - local unbound resolves via the authoritative nameservers"
+    echo "              directly: no public DNS cache in the path, DNSSEC"
+    echo "              validated, immune to stale-negative cert hangs"
+    echo "              (recommended for servers running ACME DNS-01)"
+    echo ""
+
+    if [[ "$non_interactive" == true ]]; then
+        if [[ "$use_recursive" == true ]]; then
+            log "Resolver: local recursive (unbound) [--recursive]"
+        else
+            log "Resolver: forward to public DNS (default; pass --recursive for unbound)"
+        fi
+        echo ""
+        return
+    fi
+
+    echo -n "Use the local recursive resolver (unbound)? (y/N): "
+    read -r recursive_answer < /dev/tty
+
+    if [[ "$recursive_answer" =~ ^[Yy]$ ]]; then
+        use_recursive=true
+        log "Resolver: local recursive (unbound)"
+    else
+        use_recursive=false
+        log "Resolver: forward to public DNS"
+    fi
+    echo ""
 }
 
 ask_secure_dns() {
@@ -417,7 +471,7 @@ get_custom_dns() {
     fi
 
     # Return the configuration via global variables.
-    # CUSTOM_DNS_INDEX is the catalogue length + 1 (9 with the current 8-provider pool).
+    # CUSTOM_DNS_INDEX is the catalogue length + 1 (4 with the current 3-provider pool).
     dns_ipv4[$CUSTOM_DNS_INDEX]="$dns_config_ipv4"
     dns_ipv6[$CUSTOM_DNS_INDEX]="$dns_config_ipv6"
     dns_names[$CUSTOM_DNS_INDEX]="Custom"
@@ -441,12 +495,13 @@ select_dns_providers() {
     echo "  auto) Automatically test ALL providers and pick the ${AUTO_PICK_TOP} fastest (recommended)"
 
     # Generate the numbered list from the catalogue so the menu and the data
-    # can never drift apart. Show the DoT hostname only in secure-DNS mode.
+    # can never drift apart. Show every IPv4 (both anycast IPs of a provider
+    # are always written to DNS=; the DoT hostname only in secure-DNS mode).
     local i name ipv4_display dot
     for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
         name="$(provider_name "$i")"
-        # First IPv4 without the DoT suffix, for display.
-        ipv4_display="$(provider_ipv4 "$i" | awk '{print $1}' | sed 's/#.*//')"
+        ipv4_display="$(provider_ipv4 "$i" | sed 's/#[^ ]*//g')"
+        ipv4_display="${ipv4_display// /, }"
         if [[ "$use_secure_dns" == true ]]; then
             dot="$(provider_ipv4 "$i" | awk '{print $1}' | sed 's/.*#//')"
             printf '  %2d) %s (%s) - DoT: %s\n' "$i" "$name" "$ipv4_display" "$dot"
@@ -567,30 +622,30 @@ select_dns_providers() {
 
     if [[ -z "$primary_dns" ]]; then
         if [[ "$use_secure_dns" == true ]]; then
-            warning "No valid selection made. Using default: Cloudflare, Google, AdGuard."
+            warning "No valid selection made. Using default: Cloudflare, Google, Quad9."
             primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
             primary_dns+=" 8.8.8.8#dns.google 8.8.4.4#dns.google"
-            primary_dns+=" 94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
+            primary_dns+=" 9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net"
 
             if [[ "$ipv6_support" == true ]]; then
                 primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
                 primary_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
-                primary_dns+=" 2a10:50c0::ad1:ff#dns.adguard.com 2a10:50c0::ad2:ff#dns.adguard.com"
+                primary_dns+=" 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
             fi
         else
-            warning "No valid selection made. Using default: Cloudflare, Google, AdGuard (direct IP)."
+            warning "No valid selection made. Using default: Cloudflare, Google, Quad9 (direct IP)."
             primary_dns="1.1.1.1 1.0.0.1"
             primary_dns+=" 8.8.8.8 8.8.4.4"
-            primary_dns+=" 94.140.14.14 94.140.15.15"
+            primary_dns+=" 9.9.9.9 149.112.112.112"
 
             if [[ "$ipv6_support" == true ]]; then
                 primary_dns+=" 2606:4700:4700::1111 2606:4700:4700::1001"
                 primary_dns+=" 2001:4860:4860::8888 2001:4860:4860::8844"
-                primary_dns+=" 2a10:50c0::ad1:ff 2a10:50c0::ad2:ff"
+                primary_dns+=" 2620:fe::fe 2620:fe::9"
             fi
         fi
 
-        selected_names=("Cloudflare" "Google" "AdGuard")
+        selected_names=("Cloudflare" "Google" "Quad9")
     fi
 
     primary_dns=$(echo "$primary_dns" | xargs)
@@ -601,6 +656,41 @@ select_dns_providers() {
         log "Custom DNS appended last (skipped latency probe)"
     fi
     echo ""
+}
+
+# systemd major version as an integer (e.g. 255), or 0 when undeterminable.
+systemd_major_version() {
+    local ver
+    ver="$(systemctl --version 2>/dev/null | awk 'NR==1{print $2; exit}')"
+    if [[ "$ver" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$ver"
+    else
+        printf '0'
+    fi
+}
+
+# Cache= setting for the generated resolved.conf.
+#
+# Never "yes" (the upstream default): systemd-resolved caches NXDOMAIN/NODATA
+# for the zone's SOA minimum — 1800s on Cloudflare-hosted zones — which is
+# exactly the 30-minute DNS-01 propagation timeout of 1Panel/lego (and any
+# other ACME client polling through the system resolver). One lookup of
+# _acme-challenge.<domain> made before the TXT record exists pins a stale
+# negative for the entire challenge window and certificate issuance hangs.
+# Observed twice in production 2026-09-16; disabling negative caching fixed
+# both within seconds.
+#
+# "no-negative" (keep positive caching, drop negative caching) needs
+# systemd >= 250; Ubuntu 22.04 ships 249, so fall back to plain "no" there
+# (an unknown value would only log a warning and silently re-enable "yes").
+resolve_cache_setting() {
+    local ver
+    ver="$(systemd_major_version)"
+    if (( ver >= 250 )); then
+        printf 'no-negative'
+    else
+        printf 'no'
+    fi
 }
 
 generate_resolved_config() {
@@ -614,13 +704,15 @@ generate_resolved_config() {
         fi
     fi
 
+    CACHE_SETTING="$(resolve_cache_setting)"
+
     SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=$primary_dns
 FallbackDNS=$LAST_RESORT_DNS
 Domains=~.
 DNSSEC=$dnssec_setting
 DNSOverTLS=$dot_setting
-Cache=yes
+Cache=$CACHE_SETTING
 CacheFromLocalhost=no
 DNSStubListener=yes
 DNSStubListenerExtra=127.0.0.53
@@ -673,6 +765,134 @@ health_check() {
         echo ""
         return 1
     fi
+}
+
+# Install and configure a local recursive resolver (unbound). Called by
+# purify_dns BEFORE systemd-resolved is switched to DNS=127.0.0.1, so a
+# failure here (port taken, bad config, package broken) aborts with the old
+# resolver config still active — the box never loses DNS.
+configure_recursive_resolver() {
+    echo "--- Configuring local recursive resolver (unbound) ---"
+
+    if ! command -v unbound &> /dev/null; then
+        log "Installing unbound..."
+        if ! apt-get update -qq; then
+            error "apt-get update failed while installing unbound"
+            return 1
+        fi
+        if ! apt-get install -y unbound; then
+            error "Failed to install unbound"
+            return 1
+        fi
+    fi
+
+    local do_ip6="no"
+    local ipv6_lines=""
+    if [[ "$ipv6_support" == true ]]; then
+        do_ip6="yes"
+        ipv6_lines=$'    interface: ::1\n    access-control: ::1/128 allow'
+    fi
+
+    # Ensure the DNSSEC trust anchor exists. The package normally creates
+    # /var/lib/unbound/root.key at install/start, but minimal images and
+    # offline installs can miss it (verified on a Debian 13 container), and
+    # unbound refuses to load a config pointing at a missing anchor. Seed it
+    # from the static anchor shipped by dns-root-data (an unbound dependency);
+    # if even that is unavailable, generate the config without validation
+    # rather than shipping one unbound rejects.
+    local trust_anchor="$UNBOUND_TRUST_ANCHOR"
+    if [[ ! -f "$trust_anchor" && -f "$UNBOUND_ROOT_KEY_SRC" ]]; then
+        # chown to the unbound user for RFC5011 rollover updates; plain cp
+        # fallback covers systems without the user (read-only validation).
+        install -o unbound -g unbound -m 0644 "$UNBOUND_ROOT_KEY_SRC" "$trust_anchor" 2> /dev/null \
+            || cp "$UNBOUND_ROOT_KEY_SRC" "$trust_anchor" \
+            || true
+    fi
+    local trust_anchor_line="    auto-trust-anchor-file: \"$trust_anchor\""
+    if [[ ! -f "$trust_anchor" ]]; then
+        warning "DNSSEC trust anchor not available; unbound will run without DNSSEC validation"
+        trust_anchor_line="    # DNSSEC validation disabled: no trust anchor available"
+    fi
+
+    log "Writing managed $UNBOUND_CONF..."
+    cat > "$UNBOUND_CONF" << EOF
+# Managed by setup_dns.sh (full overwrite on every run) — local recursive
+# resolver. Resolves via the authoritative nameservers directly, so no public
+# resolver cache (and its stale negative answers) sits in the path.
+#
+# cache-max-negative-ttl: 0 is load-bearing: a cached stale NODATA lives for
+# the zone's SOA minimum (1800s on Cloudflare zones) — exactly the 30-minute
+# DNS-01 propagation timeout of 1Panel/lego — and hangs certificate issuance
+# (observed twice in production, 2026-09-16).
+server:
+    interface: 127.0.0.1
+    port: 53
+${ipv6_lines}
+    do-ip4: yes
+    do-ip6: $do_ip6
+    do-udp: yes
+    do-tcp: yes
+
+    # Loopback clients only; unbound refuses everything else by default.
+    access-control: 127.0.0.0/8 allow
+
+    # Never serve a cached negative answer (see comment above).
+    cache-max-negative-ttl: 0
+
+    # DNSSEC validation against the trust anchor created at install time.
+${trust_anchor_line}
+    harden-dnssec-stripped: yes
+    val-permissive-mode: no
+
+    # Privacy / hardening
+    qname-minimisation: yes
+    hide-identity: yes
+    hide-version: yes
+    harden-glue: yes
+    harden-below-nxdomain: yes
+    aggressive-nsec: yes
+    edns-buffer-size: 1232
+
+    # Caches sized for a single VPS
+    msg-cache-size: 32m
+    rrset-cache-size: 64m
+
+remote-control:
+    control-enable: no
+EOF
+
+    # Validate before restarting anything; skip with a warning only when the
+    # tool is absent (e.g. stripped images) so real config errors still abort.
+    if command -v unbound-checkconf &> /dev/null; then
+        if ! unbound-checkconf "$UNBOUND_CONF" &> /dev/null; then
+            error "unbound-checkconf rejected $UNBOUND_CONF — keeping the old resolver config"
+            unbound-checkconf "$UNBOUND_CONF" || true
+            return 1
+        fi
+        log "✅ unbound-checkconf passed"
+    else
+        warning "unbound-checkconf not found; skipping config validation"
+    fi
+
+    # unbound-resolvconf.service (shipped by the Debian/Ubuntu package) tries
+    # to register unbound with resolvconf and meddle with resolv.conf. Both
+    # are unwanted here: resolv.conf is a managed stub symlink.
+    systemctl disable --now unbound-resolvconf.service &> /dev/null || true
+
+    systemctl unmask unbound &> /dev/null || true
+    systemctl enable unbound &> /dev/null || true
+    if ! systemctl restart unbound; then
+        error "Failed to restart unbound — keeping the old resolver config"
+        return 1
+    fi
+    sleep 2
+    if ! systemctl is-active --quiet unbound; then
+        error "unbound is not running after restart — keeping the old resolver config"
+        return 1
+    fi
+    log "✅ unbound active on 127.0.0.1:53 (recursive, DNSSEC-validating)"
+    echo ""
+    return 0
 }
 
 # Main purification function
@@ -763,13 +983,36 @@ EOF
     log "Enabling and starting systemd-resolved service..."
     # systemctl returns non-zero in several non-fatal cases (already enabled,
     # masked edge cases, etc.). Never let that kill the script under set -e.
-    systemctl unmask systemd-resolved 2>/dev/null || true
-    systemctl enable systemd-resolved 2>/dev/null || true
-    systemctl start systemd-resolved 2>/dev/null || true
-    
+    systemctl unmask systemd-resolved 2> /dev/null || true
+    systemctl enable systemd-resolved 2> /dev/null || true
+    systemctl start systemd-resolved 2> /dev/null || true
+
+    # Recursive mode: bring unbound up BEFORE resolved is pointed at it, so
+    # any failure here aborts with the previous resolver still in place.
+    if [[ "$use_recursive" == true ]]; then
+        if ! configure_recursive_resolver; then
+            return 1
+        fi
+    fi
+
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
     generate_resolved_config
     echo -e "${SECURE_RESOLVED_CONFIG}" > $RESOLVED_CONF
+
+    # Also pin the Cache= setting in a drop-in so a later hand-edit of the main
+    # resolved.conf (e.g. someone changing DNS= and rewriting the file) cannot
+    # silently re-enable negative caching — the exact regression that pinned a
+    # 30-minute stale NODATA on 2026-09-16 and hung two cert issuances.
+    if mkdir -p "$RESOLVED_CONF_D" 2> /dev/null; then
+        cat > "${RESOLVED_CONF_D}/10-setup-dns-cache.conf" << EOF
+# Managed by setup_dns.sh. Prevents negative-answer caching, which pins stale
+# NXDOMAIN/NODATA answers for the zone's SOA minimum (1800s on Cloudflare
+# zones) and hangs ACME DNS-01 challenges that poll via the system resolver.
+[Resolve]
+Cache=$CACHE_SETTING
+EOF
+    fi
+
     unlock_resolv_conf
     rm -f $RESOLV_CONF 2>/dev/null || true
     ln -sf $STUB_RESOLV_CONF $RESOLV_CONF
@@ -786,12 +1029,21 @@ EOF
 # Verification function
 verify_dns() {
     echo "--- Verifying DNS configuration ---"
-    
+
     if systemctl is-active --quiet systemd-resolved; then
         log "✅ systemd-resolved is active"
     else
         error "systemd-resolved is not running"
         return 1
+    fi
+
+    if [[ "$use_recursive" == true ]]; then
+        if systemctl is-active --quiet unbound; then
+            log "✅ unbound (local recursive resolver) is active"
+        else
+            error "unbound is not running"
+            return 1
+        fi
     fi
     
     if resolvectl status >/dev/null 2>&1; then
@@ -838,8 +1090,25 @@ main() {
         log "Starting DNS reconfiguration..."
     fi
     
-    ask_secure_dns
-    select_dns_providers
+    ask_resolver_mode
+
+    if [[ "$use_recursive" == true ]]; then
+        # No upstream providers to pick, and unbound does its own DNSSEC
+        # validation, so DoT-to-upstream secure mode does not apply.
+        use_secure_dns=false
+        has_dot_support=false
+        primary_dns="127.0.0.1"
+        if [[ "$ipv6_support" == true ]]; then
+            primary_dns="127.0.0.1 ::1"
+        fi
+        selected_names=("unbound (local recursive)")
+        log "Recursive mode: systemd-resolved will forward to unbound on 127.0.0.1:53"
+        echo ""
+    else
+        ask_secure_dns
+        select_dns_providers
+    fi
+
     purify_dns
     verify_dns
     
@@ -849,16 +1118,25 @@ main() {
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Your system is now using:"
-    for name in "${selected_names[@]}"; do
-        if [[ "$use_secure_dns" == true ]]; then
-            echo "  • $name DNS (DNS-over-TLS)"
-        else
-            echo "  • $name DNS (direct IP)"
-        fi
-    done
+    if [[ "$use_recursive" == true ]]; then
+        echo "  • Local recursive resolver (unbound) on 127.0.0.1:53, reached via the systemd-resolved stub"
+        echo "  • No public DNS cache in the path — immune to stale-negative cert-renewal hangs"
+    else
+        for name in "${selected_names[@]}"; do
+            if [[ "$use_secure_dns" == true ]]; then
+                echo "  • $name DNS (DNS-over-TLS)"
+            else
+                echo "  • $name DNS (direct IP)"
+            fi
+        done
+    fi
     echo ""
     echo "Security features enabled:"
-    if [[ "$use_secure_dns" == true ]]; then
+    if [[ "$use_recursive" == true ]]; then
+        echo "  • DNSSEC: Validated by unbound (full authoritative chain)"
+        echo "  • DNS-over-TLS: N/A (loopback hop to unbound)"
+        echo "  • Negative caching: Disabled on both layers (resolved + unbound)"
+    elif [[ "$use_secure_dns" == true ]]; then
         echo "  • DNSSEC: Yes"
         if [[ "$has_dot_support" == true ]]; then
             echo "  • DNS-over-TLS: Opportunistic"

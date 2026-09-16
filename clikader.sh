@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.10.0"
+CLIKADER_VERSION="1.11.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -95,6 +95,8 @@ echo "  sudo clikader update"
 echo "  sudo clikader setup"
 echo "  sudo clikader vpssetup --force"
 echo "  sudo clikader onboard"
+echo "  sudo clikader onboard --recursive   (DNS via local unbound recursive resolver)"
+echo "  sudo clikader dns --recursive       (switch an existing box to unbound)"
     echo "  sudo clikader dns"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
@@ -323,12 +325,28 @@ onboard_step() {
 }
 
 onboard_clikader() {
+    # Recognized options:
+    #   --recursive / -r   run the DNS step with a local unbound recursive
+    #                      resolver instead of forwarding to public DNS
+    local dns_extra_args=""
+    local arg
+    for arg in "$@"; do
+        case $arg in
+            -r|--recursive) dns_extra_args="--recursive" ;;
+            *) warning "Ignoring unknown onboard option: $arg" ;;
+        esac
+    done
+
     echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║       CLiKader Onboarding (5 steps)     ${NC}"
     echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
     echo ""
     info "Runs all setup steps non-interactively with production defaults:"
-    info "  1. DNS   (direct-IP, default providers, latency-ordered)"
+    if [[ -n "$dns_extra_args" ]]; then
+        info "  1. DNS   (local recursive unbound, no public DNS cache in path)"
+    else
+        info "  1. DNS   (direct-IP, default providers, latency-ordered)"
+    fi
     info "  2. TCP   (network-stack optimization)"
     info "  3. APT   (reset to official sources)"
     info "  4. IPv6  (disabled)"
@@ -338,7 +356,7 @@ onboard_clikader() {
     ONBOARD_RESULTS=()
 
     # 1. DNS — --yes uses direct-IP mode + default providers + proceeds past rerun
-    onboard_step 1 "setup_dns.sh"        "Setup DNS"            "--yes"
+    onboard_step 1 "setup_dns.sh"        "Setup DNS"            --yes $dns_extra_args
 
     # 2. TCP — non-interactive, apply tuning
     onboard_step 2 "optimize_tcp.sh"     "TCP/Network Optimization"
@@ -413,7 +431,7 @@ dispatch_command() {
             ;;
         "onboard" | "o")
             require_root "$command"
-            onboard_clikader
+            onboard_clikader "$@"
             ;;
         "uninstall" | "remove")
             require_root "$command"

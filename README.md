@@ -136,24 +136,29 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 ### 3. Setup DNS
 Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 22.04/24.04/26 (other OS versions may work but are user-tested).
 
-**DNS Providers:** Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing, Control D, DNS.SB, Custom
+**Two resolver modes:**
+
+- **Forward (default)** — systemd-resolved forwards to the selected public resolvers. **Providers:** Cloudflare, Google, Quad9, Custom — globally famous, non-filtering, anycast-everywhere resolvers only (filtering resolvers like AdGuard/OpenDNS and thin-coverage ones like DNS.SB/Control D/CleanBrowsing are deliberately excluded; use Custom DNS for those)
+- **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. If unbound ever dies, `FallbackDNS` (OpenDNS) keeps DNS alive. Onboarding support: `clikader onboard --recursive`; switch an existing box with `clikader dns --yes --recursive`
 
 **Features:**
 - Defaults to plain direct-IP DNS
-- Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation
+- Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation (forward mode)
 - IPv6 support (optional)
-- **Auto mode (default):** probes all 8 providers in parallel and picks the 3 fastest — ideal when regional latency varies
+- **Auto mode (default):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies
 - Manually select specific providers if preferred
-- All selected DNS providers are queried in order as primary servers
-- Auto-orders selected providers by measured latency (fastest first) and drops unresponsive ones
-- Static last-resort `FallbackDNS` for when all primaries are down
+- Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
+- Static last-resort `FallbackDNS` (OpenDNS — operator-independent) for when all primaries are down
+- **Negative caching disabled** (`Cache=no-negative`, or `Cache=no` on systemd < 250): a cached stale NODATA answer pins ACME DNS-01 challenges (1Panel/lego, certbot, acme.sh) for the zone's SOA minimum — 30 minutes on Cloudflare zones — and hangs certificate issuance. The setting is also pinned in a drop-in so hand-edits of `resolved.conf` can't revert it
 - Automatic conflict resolution
 
 **Files modified by this script:**
 - `/etc/systemd/resolved.conf`
+- `/etc/systemd/resolved.conf.d/10-setup-dns-cache.conf` (pins the `Cache=` setting)
 - `/etc/resolv.conf` (re-created as symlink to systemd-resolved stub)
 - `/etc/dhcp/dhclient.conf`
 - `/etc/network/if-up.d/resolved` (removes execute permission when present)
+- `/etc/unbound/unbound.conf` (recursive mode only; full managed overwrite)
 
 ---
 

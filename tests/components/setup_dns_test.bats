@@ -9,6 +9,10 @@ setup() {
     export IFUPD_RESOLVED="$BATS_TEST_TMPDIR/if-up.resolved"
     export CLOUD_CFG_DIR="$BATS_TEST_TMPDIR/cloud.cfg.d"
     export RESOLVED_CONF="$BATS_TEST_TMPDIR/resolved.conf"
+    export RESOLVED_CONF_D="$BATS_TEST_TMPDIR/resolved.conf.d"
+    export UNBOUND_CONF="$BATS_TEST_TMPDIR/unbound.conf"
+    export UNBOUND_TRUST_ANCHOR="$BATS_TEST_TMPDIR/root.key"
+    export UNBOUND_ROOT_KEY_SRC="$BATS_TEST_TMPDIR/static-root.key"
     export STUB_RESOLV_CONF="$BATS_TEST_TMPDIR/stub-resolv.conf"
     mkdir -p "$CLOUD_CFG_DIR" "$(dirname "$IFUPD_RESOLVED")"
     printf 'nameserver 1.1.1.1\n' > "$RESOLV_CONF"
@@ -88,6 +92,54 @@ MOCK
     [[ "$SECURE_RESOLVED_CONFIG" == *"DNSOverTLS=opportunistic"* ]]
 }
 
+@test "resolve_cache_setting: systemd >= 250 -> no-negative, older/unknown -> no" {
+    # Default mock systemctl prints nothing for --version: undeterminable -> "no".
+    run resolve_cache_setting
+    [ "$status" -eq 0 ]
+    [ "$output" = "no" ]
+
+    make_mock systemctl --out "systemd 249 (249.11-0ubuntu3)"
+    run resolve_cache_setting
+    [ "$output" = "no" ]
+
+    make_mock systemctl --out "systemd 250 (250.3-1)"
+    run resolve_cache_setting
+    [ "$output" = "no-negative" ]
+
+    make_mock systemctl --out "systemd 255 (255.4-1ubuntu8)"
+    run resolve_cache_setting
+    [ "$output" = "no-negative" ]
+}
+
+@test "generate_resolved_config: never emits Cache=yes" {
+    primary_dns="1.1.1.1 8.8.8.8"
+    use_secure_dns=false
+    has_dot_support=false
+
+    # Undeterminable version (default silent mock) -> full caching off.
+    generate_resolved_config
+    [[ "$SECURE_RESOLVED_CONFIG" == *"Cache=no"* ]]
+    [[ "$SECURE_RESOLVED_CONFIG" != *"Cache=yes"* ]]
+
+    # Modern systemd -> negative caching only disabled.
+    make_mock systemctl --out "systemd 255 (255.4-1ubuntu8)"
+    generate_resolved_config
+    [[ "$SECURE_RESOLVED_CONFIG" == *"Cache=no-negative"* ]]
+    [[ "$SECURE_RESOLVED_CONFIG" != *"Cache=yes"* ]]
+}
+
+@test "catalogue: only the three global non-filtering providers remain" {
+    [ "${#DNS_PROVIDERS[@]}" -eq 3 ]
+    [ "$(provider_name 1)" = "Cloudflare" ]
+    [ "$(provider_name 2)" = "Google" ]
+    [ "$(provider_name 3)" = "Quad9" ]
+    [ "$CUSTOM_DNS_INDEX" -eq 4 ]
+    # Filtering / thin-coverage providers must not come back via the fallback
+    # default either.
+    local joined="${DNS_PROVIDERS[*]}"
+    [[ "$joined" != *"AdGuard"* && "$joined" != *"DNS.SB"* && "$joined" != *"OpenDNS"* ]]
+}
+
 @test "ask_secure_dns: --yes disables secure DNS" {
     non_interactive=true
     run ask_secure_dns
@@ -131,12 +183,13 @@ MOCK
     assert_output_contains "All checks passed"
 }
 
-@test "purify_dns: writes resolved.conf, dhclient override, cloud-init drop-in" {
+@test "purify_dns: writes resolved.conf, dhclient override, cloud-init drop-in, cache drop-in" {
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
 printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
 printf '\n' >> "$MOCK_CFG_DIR/calls"
+if [[ "$1" == "--version" ]]; then printf 'systemd 255 (255.4-1)\n'; fi
 exit 0
 MOCK
     chmod +x "$MOCK_BIN/systemctl"
@@ -151,6 +204,8 @@ MOCK
     assert_file_contains "$DHCLIENT_CONF" "BEGIN setup_dns.sh DNS override"
     assert_file_contains "$CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg" "manage_resolv_conf: false"
     assert_file_contains "$RESOLVED_CONF" "DNS=1.1.1.1"
+    assert_file_contains "$RESOLVED_CONF" "Cache=no-negative"
+    assert_file_contains "$RESOLVED_CONF_D/10-setup-dns-cache.conf" "Cache=no-negative"
     [ ! -x "$IFUPD_RESOLVED" ]
 }
 
@@ -184,6 +239,17 @@ MOCK
     ipv6_support=false
     select_dns_providers
     [ -n "$primary_dns" ]
+}
+
+@test "provider menu shows both anycast IPs per provider" {
+    non_interactive=true
+    use_secure_dns=false
+    ipv6_support=false
+    run select_dns_providers
+    [ "$status" -eq 0 ]
+    assert_output_contains "Cloudflare (1.1.1.1, 1.0.0.1)"
+    assert_output_contains "Google (8.8.8.8, 8.8.4.4)"
+    assert_output_contains "Quad9 (9.9.9.9, 149.112.112.112)"
 }
 
 @test "get_custom_dns via pty: ipv4 only" {
@@ -231,6 +297,183 @@ MOCK
     run_pty "$inner" "y"
     [ "$PTY_RC" -eq 0 ]
     [[ "$PTY_OUT" == *"ENABLED"* ]]
+}
+
+@test "ask_resolver_mode via pty: y selects recursive" {
+    non_interactive=false
+    local inner
+    inner="$(make_inner components/setup_dns.sh 'ask_resolver_mode')"
+    run_pty "$inner" "y"
+    [ "$PTY_RC" -eq 0 ]
+    [[ "$PTY_OUT" == *"local recursive (unbound)"* ]]
+}
+
+@test "ask_resolver_mode via pty: empty/other keeps forward" {
+    non_interactive=false
+    local inner
+    inner="$(make_inner components/setup_dns.sh 'ask_resolver_mode')"
+    run_pty "$inner" ""
+    [ "$PTY_RC" -eq 0 ]
+    [[ "$PTY_OUT" == *"forward to public DNS"* ]]
+}
+
+@test "ask_resolver_mode: --yes keeps flag decision without prompting" {
+    non_interactive=true
+    use_recursive=false
+    run ask_resolver_mode
+    [ "$status" -eq 0 ]
+    assert_output_contains "forward to public DNS"
+    use_recursive=true
+    run ask_resolver_mode
+    [ "$status" -eq 0 ]
+    assert_output_contains "local recursive (unbound) [--recursive]"
+}
+
+@test "purify_dns: recursive installs unbound, writes config, resolves via 127.0.0.1" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=false
+    primary_dns="127.0.0.1"
+    run purify_dns
+    [ "$status" -eq 0 ]
+    assert_output_contains "unbound-checkconf passed"
+    assert_file_contains "$UNBOUND_CONF" "cache-max-negative-ttl: 0"
+    assert_file_contains "$UNBOUND_CONF" "interface: 127.0.0.1"
+    assert_file_contains "$UNBOUND_CONF" "do-ip6: no"
+    assert_file_contains "$RESOLVED_CONF" "DNS=127.0.0.1"
+    assert_mock_called unbound-checkconf 1
+}
+
+@test "purify_dns: recursive with ipv6 adds ::1 interface and do-ip6" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=true
+    primary_dns="127.0.0.1 ::1"
+    run purify_dns
+    [ "$status" -eq 0 ]
+    assert_file_contains "$UNBOUND_CONF" "do-ip6: yes"
+    assert_file_contains "$UNBOUND_CONF" "interface: ::1"
+    assert_file_contains "$RESOLVED_CONF" "DNS=127.0.0.1 ::1"
+}
+
+@test "purify_dns: recursive installs unbound when missing" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=false
+    run purify_dns
+    [ "$status" -eq 0 ]
+    assert_output_contains "Installing unbound"
+    assert_file_contains "$UNBOUND_CONF" "cache-max-negative-ttl: 0"
+}
+
+@test "purify_dns: recursive seeds DNSSEC anchor and includes it in config" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    printf '. IN DNSKEY 257 3 8 test-anchor\n' > "$UNBOUND_ROOT_KEY_SRC"
+    rm -f "$UNBOUND_TRUST_ANCHOR"
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=false
+    primary_dns="127.0.0.1"
+    run purify_dns
+    [ "$status" -eq 0 ]
+    [ -f "$UNBOUND_TRUST_ANCHOR" ]
+    assert_file_contains "$UNBOUND_CONF" "auto-trust-anchor-file: \"$UNBOUND_TRUST_ANCHOR\""
+}
+
+@test "purify_dns: recursive without any anchor disables validation, not resolution" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    rm -f "$UNBOUND_TRUST_ANCHOR" "$UNBOUND_ROOT_KEY_SRC"
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=false
+    primary_dns="127.0.0.1"
+    run purify_dns
+    [ "$status" -eq 0 ]
+    assert_output_contains "trust anchor not available"
+    assert_file_contains "$UNBOUND_CONF" "DNSSEC validation disabled"
+}
+
+@test "purify_dns: invalid unbound config aborts before resolved.conf is touched" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 1
+    use_recursive=true
+    use_secure_dns=false
+    has_dot_support=false
+    ipv6_support=false
+    run purify_dns
+    [ "$status" -eq 1 ]
+    assert_output_contains "unbound-checkconf rejected"
+    # The old resolver config must still be in place.
+    [ ! -f "$RESOLVED_CONF" ]
+}
+
+@test "main: --yes recursive end-to-end" {
+    non_interactive=true
+    use_recursive=true
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    run main
+    [ "$status" -eq 0 ]
+    assert_output_contains "DNS setup completed successfully"
+    assert_output_contains "unbound (local recursive resolver) is active"
+    assert_file_contains "$UNBOUND_CONF" "cache-max-negative-ttl: 0"
+    assert_file_contains "$RESOLVED_CONF" "DNS=127.0.0.1"
 }
 
 @test "purify_dns: installs systemd-resolved when resolvectl missing" {
