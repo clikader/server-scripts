@@ -14,7 +14,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.13.0"
+SETUP_DNS_REVISION="1.13.1"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -701,6 +701,9 @@ generate_resolved_config() {
 
     CACHE_SETTING="$(resolve_cache_setting)"
 
+    # DNSStubListenerExtra is deliberately NOT set: DNSStubListener=yes already
+    # binds the 127.0.0.53 stub, and an Extra assignment for the same address
+    # just logs "Failed to store ... File exists" on every restart (2026-09-18).
     SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=$primary_dns
 FallbackDNS=$LAST_RESORT_DNS
@@ -710,7 +713,6 @@ DNSOverTLS=$dot_setting
 Cache=$CACHE_SETTING
 CacheFromLocalhost=no
 DNSStubListener=yes
-DNSStubListenerExtra=127.0.0.53
 ReadEtcHosts=yes
 ResolveUnicastSingleLabel=no"
 }
@@ -1113,6 +1115,7 @@ EOF
 # This is what keeps the clikader DNS config from being rolled back after reboot.
 manage_resolv_conf: false
 EOF
+        chmod 644 "$CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg" || exit 1
         log "✅ Disabled cloud-init resolver management"
     else
         log "cloud-init not present (non-cloud image); skipping"
@@ -1148,11 +1151,19 @@ EOF
     generate_resolved_config
     printf '%s\n' "$SECURE_RESOLVED_CONFIG" > "$TX_DIR/resolved.conf" || exit 1
     install_config "$TX_DIR/resolved.conf" "$RESOLVED_CONF" || exit 1
+    # tx_begin's umask 077 would create this directory 0700 and the drop-ins
+    # below 0600 — unreadable by systemd-resolved, which runs as the
+    # unprivileged systemd-resolve user. resolved then rejects the WHOLE
+    # configuration and starts with no DNS servers at all (production outage
+    # 2026-09-18: "Failed to open zz-clikader-dns.conf: Permission denied").
+    # Service-read configuration must be world-readable.
     mkdir -p "$RESOLVED_CONF_D" || exit 1
+    chmod 755 "$RESOLVED_CONF_D"
     {
         printf '[Resolve]\nDNS=\nFallbackDNS=\nDomains=\n'
         printf '%s\n' "$SECURE_RESOLVED_CONFIG"
     } > "$RESOLVED_CONF_D/zz-clikader-dns.conf" || exit 1
+    chmod 644 "$RESOLVED_CONF_D/zz-clikader-dns.conf" || exit 1
 
     # Also pin the Cache= setting in a drop-in so a later hand-edit of the main
     # resolved.conf (e.g. someone changing DNS= and rewriting the file) cannot
@@ -1166,7 +1177,7 @@ EOF
 [Resolve]
 Cache=$CACHE_SETTING
 EOF
-        [[ $? -eq 0 ]] || exit 1
+        chmod 644 "${RESOLVED_CONF_D}/10-setup-dns-cache.conf" || exit 1
     fi
 
     unlock_resolv_conf

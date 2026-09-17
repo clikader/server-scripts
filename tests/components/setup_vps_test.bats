@@ -185,6 +185,7 @@ MOCK
     [ "$status" -eq 0 ]
     assert_file_contains "$NFT_CONF" "Managed by clikader setup"
     assert_file_contains "$NFT_CONF" "2222"
+    [ "$(stat -c %a "$NFT_CONF")" = 644 ]
 }
 
 @test "step_configure_nftables: applies with nft -f, never restarts the nftables service" {
@@ -345,6 +346,7 @@ MOCK
     run step_setup_fail2ban
     [ "$status" -eq 0 ]
     assert_file_contains "$FAIL2BAN_JAIL" "port = 2222"
+    [ "$(stat -c %a "$FAIL2BAN_JAIL")" = 644 ]
 }
 
 @test "step_run_onboard: calls clikader o when present" {

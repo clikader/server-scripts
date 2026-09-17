@@ -113,6 +113,14 @@ source components/setup_dns.sh
 primary_dns=127.0.0.1
 purify_dns
 resolvectl query google.com | grep -q 192.0.2.80
+# The transaction umask must not leak into service-read config: resolved runs
+# as the unprivileged systemd-resolve user and rejects its WHOLE config when it
+# cannot read a drop-in (production outage 2026-09-18). The container's
+# resolved may tolerate this; the mode assertion does not.
+[[ "$(stat -c %a /etc/systemd/resolved.conf.d)" == 755 ]]
+[[ "$(stat -c %a /etc/systemd/resolved.conf.d/zz-clikader-dns.conf)" == 644 ]]
+setpriv --reuid="$(id -u systemd-resolve)" --regid="$(id -g systemd-resolve)" --clear-groups \
+    cat /etc/systemd/resolved.conf.d/zz-clikader-dns.conf >/dev/null
 cp /etc/systemd/resolved.conf "$work/working-resolved.conf"
 primary_dns=127.0.0.2
 if purify_dns; then echo 'Broken DNS cutover unexpectedly succeeded'; exit 1; fi

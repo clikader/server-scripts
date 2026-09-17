@@ -1061,6 +1061,7 @@ table inet clikader_nat {
     }
 }
 EOF
+    chmod 644 "$nft_conf"
     log "Wrote ${nft_conf} (ssh ${ssh_port}/tcp, extra ports: ${extra_ports:-none})"
 
     # Validate before applying so a syntax error can't cut this session off.
@@ -1141,6 +1142,7 @@ backend = systemd
 # ORs the two journal matches so either journal name is picked up.
 journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session
 EOF
+    chmod 644 "$FAIL2BAN_JAIL"
     log "Wrote $FAIL2BAN_JAIL (sshd port ${ssh_port}, backend systemd, nftables bans)"
 
     # Validate config before touching the running service.

@@ -246,6 +246,39 @@ MOCK
     [ ! -x "$IFUPD_RESOLVED" ]
 }
 
+@test "purify_dns: service-read config is world-readable (resolved runs unprivileged)" {
+    # tx_begin's umask 077 used to create these 0600/0700; systemd-resolved
+    # (user systemd-resolve) then rejected the whole config and started with
+    # NO DNS servers (production outage 2026-09-18). Modes are load-bearing.
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+if [[ "$1" == "--version" ]]; then printf 'systemd 255 (255.4-1)\n'; fi
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock resolvectl --status 0
+    primary_dns="1.1.1.1"
+    use_secure_dns=false
+    has_dot_support=false
+    rm -rf "$RESOLVED_CONF_D"   # exercise the fresh-directory path
+    run purify_dns
+    [ "$status" -eq 0 ]
+    [ "$(stat -c %a "$RESOLVED_CONF_D")" = 755 ]
+    [ "$(stat -c %a "$RESOLVED_CONF_D/zz-clikader-dns.conf")" = 644 ]
+    [ "$(stat -c %a "$RESOLVED_CONF_D/10-setup-dns-cache.conf")" = 644 ]
+    [ "$(stat -c %a "$CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg")" = 644 ]
+    # The unprivileged resolver user can actually read them (best-effort:
+    # minimal test images may lack the user or setpriv; the mode assertions
+    # above are the hard gate, the integration suite does this for real).
+    if id systemd-resolve >/dev/null 2>&1 && command -v setpriv >/dev/null; then
+        setpriv --reuid="$(id -u systemd-resolve)" --regid="$(id -g systemd-resolve)" --clear-groups \
+            cat "$RESOLVED_CONF_D/zz-clikader-dns.conf" >/dev/null
+    fi
+}
+
 @test "verify_dns: active resolved + resolvectl + nslookup" {
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash
