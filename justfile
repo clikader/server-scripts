@@ -14,3 +14,7 @@ coverage: _build
 # Drop into the test container shell (for debugging tests)
 shell: _build
     docker run --rm -it -v .:/workspace/server-scripts -w /workspace/server-scripts {{image}} bash
+
+# Exercise actual systemd, OpenSSH, nftables, fail2ban and Netplan in Linux
+integration:
+    bash tests/integration/run.sh

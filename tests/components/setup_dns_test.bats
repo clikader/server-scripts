@@ -18,6 +18,7 @@ setup() {
     printf 'nameserver 1.1.1.1\n' > "$RESOLV_CONF"
     printf '# dhclient\n' > "$DHCLIENT_CONF"
     printf 'nameserver 127.0.0.53\n' > "$STUB_RESOLV_CONF"
+    printf '. IN DNSKEY 257 3 8 test-anchor\n' > "$UNBOUND_TRUST_ANCHOR"
 
     make_mock systemctl
     make_mock resolvectl --out "DNS Servers: 1.1.1.1"
@@ -89,7 +90,7 @@ MOCK
     has_dot_support=true
     generate_resolved_config
     [[ "$SECURE_RESOLVED_CONFIG" == *"DNSSEC=yes"* ]]
-    [[ "$SECURE_RESOLVED_CONFIG" == *"DNSOverTLS=opportunistic"* ]]
+    [[ "$SECURE_RESOLVED_CONFIG" == *"DNSOverTLS=yes"* ]]
 }
 
 @test "resolve_cache_setting: systemd >= 250 -> no-negative, older/unknown -> no" {
@@ -249,7 +250,7 @@ MOCK
     [ "$status" -eq 0 ]
     assert_output_contains "Cloudflare (1.1.1.1, 1.0.0.1)"
     assert_output_contains "Google (8.8.8.8, 8.8.4.4)"
-    assert_output_contains "Quad9 (9.9.9.9, 149.112.112.112)"
+    assert_output_contains "Quad9 (9.9.9.10, 149.112.112.10)"
 }
 
 @test "get_custom_dns via pty: ipv4 only" {
@@ -273,7 +274,7 @@ MOCK
     [[ "$PTY_OUT" == *"IPv4 DNS servers are required"* ]]
 }
 
-@test "order_by_latency: all probes fail keeps original order" {
+@test "order_by_latency: all probes fail without replacing the resolver" {
     load_provider_table
     cat > "$MOCK_BIN/dig" <<'MOCK'
 #!/usr/bin/env bash
@@ -286,7 +287,7 @@ exit 1
 MOCK
     chmod +x "$MOCK_BIN/nslookup"
     run order_by_latency 1 2 3
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     assert_output_contains "All probes failed"
 }
 
@@ -384,6 +385,7 @@ exit 0
 MOCK
     chmod +x "$MOCK_BIN/systemctl"
     make_mock apt-get --status 0
+    make_mock unbound-checkconf --status 0
     use_recursive=true
     use_secure_dns=false
     has_dot_support=false
@@ -416,7 +418,7 @@ MOCK
     assert_file_contains "$UNBOUND_CONF" "auto-trust-anchor-file: \"$UNBOUND_TRUST_ANCHOR\""
 }
 
-@test "purify_dns: recursive without any anchor disables validation, not resolution" {
+@test "purify_dns: recursive without a trust anchor refuses instead of disabling validation" {
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 exit 0
@@ -432,9 +434,9 @@ MOCK
     ipv6_support=false
     primary_dns="127.0.0.1"
     run purify_dns
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     assert_output_contains "trust anchor not available"
-    assert_file_contains "$UNBOUND_CONF" "DNSSEC validation disabled"
+    [ ! -f "$UNBOUND_CONF" ]
 }
 
 @test "purify_dns: invalid unbound config aborts before resolved.conf is touched" {
@@ -663,7 +665,7 @@ MOCK
     use_secure_dns=false
     has_dot_support=false
     run purify_dns
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     assert_output_contains "Installing systemd-resolved"
 }
 
@@ -684,4 +686,44 @@ MOCK
     run main
     [ "$status" -eq 0 ]
     assert_output_contains "DNS setup completed successfully"
+}
+
+@test "DNS verification fails when the system resolver lookup fails" {
+    make_mock nslookup --status 1
+    run verify_dns
+    [ "$status" -eq 1 ]
+    assert_output_contains 'DNS resolution test failed'
+}
+
+@test "failed forward cutover restores the old resolver and configuration" {
+    printf 'old resolved settings\n' > "$RESOLVED_CONF"
+    original="$(cat "$RESOLV_CONF")"
+    primary_dns=192.0.2.53
+    make_mock nslookup --status 1
+    run purify_dns
+    [ "$status" -eq 1 ]
+    [ "$(cat "$RESOLV_CONF")" = "$original" ]
+    [ ! -L "$RESOLV_CONF" ]
+    assert_file_contains "$RESOLVED_CONF" 'old resolved settings'
+    [ ! -e "$RESOLVED_CONF_D/zz-clikader-dns.conf" ]
+}
+
+@test "failed recursive resolver restart restores an already-recursive server config" {
+    make_mock unbound
+    make_mock unbound-checkconf
+    printf 'previous recursive config\n' > "$UNBOUND_CONF"
+    use_recursive=true
+    recursion_is_possible() { return 0; }
+    unbound_resolves() { return 1; }
+    run purify_dns
+    [ "$status" -eq 1 ]
+    assert_file_contains "$UNBOUND_CONF" 'previous recursive config'
+    assert_file_contains "$RESOLV_CONF" 'nameserver 1.1.1.1'
+}
+
+@test "unbound health check rejects dig error text" {
+    rm "$MOCK_BIN/dig"
+    make_mock dig --out ';; communications error: timed out' --status 9
+    run unbound_resolves
+    [ "$status" -eq 1 ]
 }

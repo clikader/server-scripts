@@ -9,6 +9,7 @@ setup() {
     # Point SCRIPT_DIR at a temp tree so run_script never touches real components.
     SCRIPT_DIR="$BATS_TEST_TMPDIR/tree"
     mkdir -p "$SCRIPT_DIR/components"
+    printf '#!/bin/bash\nprintf "installer %%s\\n" "$*"\n' > "$SCRIPT_DIR/install.sh"
     printf '#!/usr/bin/env bash\necho dummy-ok\nexit 0\n' > "$SCRIPT_DIR/components/setup_dns.sh"
     printf '#!/usr/bin/env bash\necho dummy-ok\nexit 0\n' > "$SCRIPT_DIR/components/optimize_tcp.sh"
     printf '#!/usr/bin/env bash\necho dummy-ok\nexit 0\n' > "$SCRIPT_DIR/components/reset_apt_source.sh"
@@ -78,7 +79,7 @@ setup() {
     assert_output_contains "exit code: 7"
 }
 
-@test "run_script: missing local downloads via curl" {
+@test "run_script: incomplete bundle fails without downloading executable code" {
     rm -f "$SCRIPT_DIR/components/setup_dns.sh"
     cat > "$MOCK_BIN/curl" <<'MOCK'
 #!/usr/bin/env bash
@@ -92,8 +93,9 @@ exit 0
 MOCK
     chmod +x "$MOCK_BIN/curl"
     run run_script "setup_dns.sh" "Setup DNS"
-    [ "$status" -eq 0 ]
-    assert_output_contains "Downloaded successfully"
+    [ "$status" -eq 1 ]
+    assert_output_contains "bundle is incomplete"
+    [ ! -s "$MOCK_CFG_DIR/calls" ]
 }
 
 @test "run_script: curl failure returns 1" {
@@ -101,7 +103,7 @@ MOCK
     make_mock curl --status 1
     run run_script "setup_dns.sh" "Setup DNS"
     [ "$status" -eq 1 ]
-    assert_output_contains "Failed to download"
+    assert_output_contains "bundle is incomplete"
 }
 
 @test "dispatch_command: dns / tcp / hostname / ipv6 / apt-reset use run_script" {
@@ -152,34 +154,22 @@ MOCK
     [ "$status" -eq 0 ]
 }
 
-@test "update_clikader: not installed -> 1" {
-    run update_clikader
-    [ "$status" -eq 1 ]
-    assert_output_contains "not installed system-wide"
-}
-
-@test "update_clikader: up to date" {
-    printf '#!/usr/bin/env bash\n' > "$MOCK_BIN/clikader"
-    chmod +x "$MOCK_BIN/clikader"
-    cat > "$MOCK_BIN/curl" <<MOCK
-#!/usr/bin/env bash
-out="\${@: -1}"
-printf 'CLIKADER_VERSION="%s"\n' "$CLIKADER_VERSION" > "\$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
+@test "update_clikader: invokes the bundled installer" {
     run update_clikader
     [ "$status" -eq 0 ]
-    assert_output_contains "up to date"
+    assert_output_contains 'installer --update'
 }
 
-@test "update_clikader: curl failure" {
-    printf '#!/usr/bin/env bash\n' > "$MOCK_BIN/clikader"
-    chmod +x "$MOCK_BIN/clikader"
-    make_mock curl --status 1
+@test "update_clikader: forwards unattended and rollback flags" {
+    run update_clikader --yes --rollback
+    [ "$status" -eq 0 ]
+    assert_output_contains 'installer --update --yes --rollback'
+}
+
+@test "update_clikader: installer failure propagates" {
+    printf '#!/bin/bash\nexit 1\n' > "$SCRIPT_DIR/install.sh"
     run update_clikader
     [ "$status" -eq 1 ]
-    assert_output_contains "Failed to check for updates"
 }
 
 @test "uninstall_clikader: not installed -> 1" {
@@ -213,4 +203,29 @@ MOCK
     run main version
     [ "$status" -eq 0 ]
     [ "$output" = "$CLIKADER_VERSION" ]
+}
+
+@test "real Bash onboarding continues after failure and returns an aggregate failure" {
+    inner="$(make_inner clikader.sh 'run_script() { echo "called $1"; [[ "$1" != setup_dns.sh ]]; }; onboard_clikader --disable-ipv6')"
+    run bash "$inner"
+    [ "$status" -eq 1 ]
+    assert_output_contains 'called fix_hostname.sh'
+    assert_output_contains 'Onboarding Summary'
+    assert_output_contains 'FAILED'
+}
+
+@test "general profile preserves DNS repositories and relay tuning" {
+    run onboard_clikader --profile=general --keep-ipv6
+    [ "$status" -eq 0 ]
+    [[ "$output" != *'Selected:'*'Setup DNS'* ]]
+    assert_output_contains 'general profile'
+    assert_output_contains 'IPv6 kept enabled'
+}
+
+@test "every command exposes read-only help without root" {
+    local command
+    for command in dns tcp nft apt-reset hostname ipv6 setup onboard update uninstall doctor maintenance; do
+        run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/clikader.sh" "$command" --help
+        [ "$status" -eq 0 ]
+    done
 }

@@ -1,607 +1,301 @@
 #!/usr/bin/env bash
-
-# IPv6 Configuration Script - Enable or disable IPv6 on Debian/Ubuntu systems
-# Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04/24.10
-
+# IPv6 policy and persistent address configuration for Debian-family servers.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
-
-# Configuration file path (env-overridable so tests can target a temp file)
-SYSCTL_CONFIG="${SYSCTL_CONFIG:-/etc/sysctl.d/99-disable-ipv6.conf}"
+SYSCTL_CONFIG="${SYSCTL_CONFIG:-/etc/sysctl.d/zz-clikader-ipv6.conf}"
 SYSCTL_LEGACY="${SYSCTL_LEGACY:-/etc/sysctl.conf}"
 IFACES_FILE="${IFACES_FILE:-/etc/network/interfaces}"
-
-# Logging functions
-log() {
-    echo -e "${GREEN}-->${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root"
-    exit 1
-fi
-
-# Detect OS version
-if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    os_name="$ID"
-    os_version="$VERSION_ID"
-else
-    error "Cannot detect OS version"
-    exit 1
-fi
-
-log "Detected: $ID $VERSION_ID"
-
-# --- Argument parsing (enables non-interactive use, e.g. from `clikader onboard`) ---
-# Flags: --enable / --disable / --status pick a mode and skip the menu;
-# --yes answers the disable confirm automatically.
+NETPLAN_DIR="${NETPLAN_DIR:-/etc/netplan}"
+NETWORKD_DIR="${NETWORKD_DIR:-/etc/systemd/network}"
 IPV6_MODE=""
 IPV6_ASSUME_YES=false
+ADDRESS=""; INTERFACE=""; GATEWAY=""; NETPLAN_ID=""
+log() { echo "--> $*"; }
+info() { echo "$*"; }
+warning() { echo "WARNING: $*" >&2; }
+error() { echo "ERROR: $*" >&2; }
+usage() {
+    cat <<'EOF'
+Usage: clikader ipv6 [--enable|--disable|--status] [--yes]
+       clikader ipv6 --address ADDRESS/PREFIX --interface IFACE [--gateway IPv6]
+                     [--netplan-id ID]
+Without options, show the interactive IPv6 Configuration Tool.
+Addresses and optional default routes are persisted through Netplan,
+systemd-networkd, NetworkManager or ifupdown, preserving existing addresses.
+EOF
+}
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --enable)  IPV6_MODE="enable";  shift ;;
-        --disable) IPV6_MODE="disable"; shift ;;
-        --status)  IPV6_MODE="status";  shift ;;
-        -y|--yes)  IPV6_ASSUME_YES=true; shift ;;
-        -h|--help) IPV6_MODE="help"; shift ;;
-        *) shift ;;
+        --enable) IPV6_MODE=enable; shift ;;
+        --disable) IPV6_MODE=disable; shift ;;
+        --status) IPV6_MODE=status; shift ;;
+        --yes|-y) IPV6_ASSUME_YES=true; shift ;;
+        --address|--interface|--gateway|--netplan-id)
+            [[ $# -ge 2 ]] || { error "$1 requires a value"; exit 2; }
+            case "$1" in
+                --address) ADDRESS="$2"; IPV6_MODE=address ;;
+                --interface) INTERFACE="$2" ;;
+                --gateway) GATEWAY="$2" ;;
+                --netplan-id) NETPLAN_ID="$2" ;;
+            esac
+            shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) error "Unknown option: $1"; exit 2 ;;
     esac
 done
+[[ $EUID -eq 0 || "$IPV6_MODE" == status ]] || { error 'This script must be run as root'; exit 1; }
 
-# Check current IPv6 status
+valid_ipv6_address() {
+    local address="$1" piece count=0 compressed=0 rest
+    [[ "$address" == *:* && "$address" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    if [[ "$address" == *::* ]]; then
+        compressed=1
+        rest="${address#*::}"
+        [[ "$rest" != *::* && "$address" != *:::* ]] || return 1
+    else
+        [[ "$address" != :* && "$address" != *: ]] || return 1
+    fi
+    local pieces=()
+    IFS=: read -r -a pieces <<< "$address"
+    for piece in "${pieces[@]}"; do
+        [[ -n "$piece" ]] || continue
+        [[ ${#piece} -le 4 ]] || return 1
+        count=$((count + 1))
+    done
+    if (( compressed )); then (( count < 8 )); else (( count == 8 )); fi
+}
+
 check_ipv6_status() {
-    local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
-    
-    echo ""
-    log "Current IPv6 Status:"
-    
-    if [[ "$ipv6_disabled" == "1" ]]; then
-        echo -e "  Status: ${RED}DISABLED${NC}"
-        
-        if [[ -f "$SYSCTL_CONFIG" ]]; then
-            info "Configuration file exists: $SYSCTL_CONFIG"
-        fi
-        
-        return 1
-    else
-        echo -e "  Status: ${GREEN}ENABLED${NC}"
-        
-        # Show IPv6 addresses if enabled
-        local ipv6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[\da-f:]+' | head -n 3)
-        if [[ -n "$ipv6_addrs" ]]; then
-            echo ""
-            info "IPv6 addresses detected:"
-            echo "$ipv6_addrs" | while read -r addr; do
-                echo "    $addr"
-            done
-        fi
-        
-        return 0
-    fi
+    local disabled
+    disabled="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" || { error 'IPv6 sysctls unavailable'; return 1; }
+    if [[ "$disabled" == 1 ]]; then log 'IPv6 DISABLED'; return 1; fi
+    log 'IPv6 ENABLED'
+    ip -6 addr show scope global
 }
 
-# Enable IPv6
-enable_ipv6() {
-    echo ""
-    echo "=========================================="
-    echo "  Enable IPv6"
-    echo "=========================================="
-    echo ""
-    
-    # Remove sysctl configuration file if it exists
-    if [[ -f "$SYSCTL_CONFIG" ]]; then
-        log "Removing IPv6 disable configuration..."
-        rm -f "$SYSCTL_CONFIG"
-        log "✅ Removed $SYSCTL_CONFIG"
-    else
-        info "IPv6 disable configuration not found (already removed or never created)"
-    fi
-    
-    # Enable IPv6 immediately
-    log "Enabling IPv6 on all interfaces..."
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
-    
-    log "✅ IPv6 enabled on all interfaces"
-    
-    # Also remove any conflicting legacy configurations
+set_ipv6_policy() (
+    local value="$1" key old
+    clikader_lock ipv6 || exit 1
+    tx_begin ipv6 restore_ipv6 || exit 1
+    tx_save "$SYSCTL_CONFIG" "$SYSCTL_LEGACY" || exit 1
+    restore_ipv6() {
+        while read -r key old; do sysctl -w "$key=$old" >/dev/null || return 1; done < "$TX_DIR/live"
+    }
+    # Preserve each interface value, not only the all/default pseudo-interfaces.
+    sysctl -a 2>/dev/null | awk '/^net.ipv6.conf\.[^.]+\.disable_ipv6 =/ {print $1,$3}' > "$TX_DIR/live"
+    for key in all default lo; do
+        printf 'net.ipv6.conf.%s.disable_ipv6 = %s\n' "$key" "$value"
+    done > "$SYSCTL_CONFIG" || exit 1
+    chmod 644 "$SYSCTL_CONFIG"
     if [[ -f "$SYSCTL_LEGACY" ]]; then
-        if grep -q "disable_ipv6" "$SYSCTL_LEGACY"; then
-            log "Removing IPv6 disable entries from $SYSCTL_LEGACY..."
-            sed -i '/disable_ipv6/d' "$SYSCTL_LEGACY"
-            log "✅ Cleaned $SYSCTL_LEGACY"
-        fi
+        sed -i -E 's/^([[:space:]]*net\.ipv6\.conf\.[^.]+\.disable_ipv6[[:space:]]*=)/# [clikader ipv6] \1/' "$SYSCTL_LEGACY" || exit 1
     fi
-    
-    # Reload networking to get IPv6 addresses (non-blocking)
-    log "Reloading network configuration..."
-    if systemctl is-active --quiet networking 2>/dev/null; then
-        systemctl restart networking >/dev/null 2>&1 || true
-    fi
-    
-    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        systemctl restart NetworkManager >/dev/null 2>&1 || true
-    fi
-    
-    # Wait a moment for IPv6 addresses to be assigned
-    sleep 2
-    
-    echo ""
-    log "Verifying IPv6 status..."
-    
-    local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
-    
-    if [[ "$ipv6_disabled" == "0" ]]; then
-        log "✅ IPv6 is now enabled"
-        
-        echo ""
-        log "Testing IPv6 connectivity..."
-        
-        # Try to get IPv6 addresses
-        local ipv6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[\da-f:]+' | head -n 3)
-        
-        if [[ -n "$ipv6_addrs" ]]; then
-            log "✅ IPv6 addresses detected:"
-            echo "$ipv6_addrs" | while read -r addr; do
-                echo "    $addr"
-            done
-        else
-            warning "No global IPv6 addresses detected yet"
-            info "This is normal if your network doesn't provide IPv6"
-            info "Or addresses may take a few moments to be assigned via SLAAC/DHCPv6"
-        fi
-        
-        # Test IPv6 DNS resolution
-        if ping6 -c 1 -W 2 google.com >/dev/null 2>&1; then
-            log "✅ IPv6 internet connectivity working"
-        else
-            info "IPv6 internet connectivity test failed (may not have IPv6 upstream)"
-        fi
-        
-        echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}IPv6 enabled successfully!${NC}"
-        echo -e "${GREEN}========================================${NC}"
-        echo ""
-        info "Configuration is persistent across reboots"
-        
-    else
-        error "Failed to enable IPv6"
-        return 1
-    fi
-}
-
-# Configure IPv6 address manually
-configure_ipv6_address() {
-    echo ""
-    echo "=========================================="
-    echo "  Configure IPv6 Address"
-    echo "=========================================="
-    echo ""
-    
-    # List available network interfaces
-    log "Available network interfaces:"
-    echo ""
-    
-    # Get list of interfaces (excluding loopback)
-    local interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | grep -v '@')
-    local iface_array=()
-    
-    if [[ -z "$interfaces" ]]; then
-        error "No network interfaces found"
-        return 1
-    fi
-    
-    # Display interfaces with current IPv6 addresses
-    local index=1
-    while IFS= read -r iface; do
-        iface_array+=("$iface")
-        local ipv6_addrs=$(ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -oP '(?<=inet6\s)[\da-f:]+/\d+' || echo "none")
-        echo "  $index) $iface"
-        if [[ "$ipv6_addrs" != "none" ]]; then
-            echo "     Current IPv6: $ipv6_addrs"
-        else
-            echo "     Current IPv6: No global IPv6 address"
-        fi
-        ((index++))
-    done <<< "$interfaces"
-    
-    echo ""
-    echo -n "Select interface number (1-${#iface_array[@]}): "
-    read -r iface_choice < /dev/tty
-    
-    # Validate interface choice
-    if ! [[ "$iface_choice" =~ ^[0-9]+$ ]] || [[ "$iface_choice" -lt 1 ]] || [[ "$iface_choice" -gt "${#iface_array[@]}" ]]; then
-        error "Invalid interface selection"
-        return 1
-    fi
-    
-    local selected_iface="${iface_array[$((iface_choice-1))]}"
-    
-    echo ""
-    log "Selected interface: ${BOLD}${selected_iface}${NC}"
-    
-    # Check if interface already has IPv6 addresses
-    local existing_ipv6=$(ip -6 addr show dev "$selected_iface" scope global 2>/dev/null | grep -oP '(?<=inet6\s)[\da-f:]+/\d+')
-    
-    if [[ -n "$existing_ipv6" ]]; then
-        echo ""
-        warning "This interface already has IPv6 address(es) configured:"
-        echo ""
-        echo "$existing_ipv6" | while read -r addr; do
-            echo "  • $addr"
-        done
-        echo ""
-        info "You can add additional addresses from your allocated prefix"
-        echo ""
-        echo -n "Do you want to continue and ADD another IPv6 address? (y/N): "
-        read -r continue_confirm < /dev/tty
-        
-        if [[ ! "$continue_confirm" =~ ^[Yy]$ ]]; then
-            warning "Configuration cancelled"
-            return 0
-        fi
-    fi
-    
-    echo ""
-    
-    # Get IPv6 address from user
-    echo "Enter the IPv6 address to ADD (with or without CIDR prefix):"
-    echo ""
-    echo "  Examples:"
-    echo "    - 2001:db8::1/64"
-    echo "    - 2001:db8::1 (will default to /64)"
-    echo ""
-    echo "  Common VPS scenarios:"
-    echo "    - Provider gives you a single address: 2001:db8:a1b2::1/64"
-    echo "    - Provider gives you a prefix: 2001:db8:a1b2::/48 or /56"
-    echo "      → You can add any address from that prefix"
-    echo ""
-    echo -n "IPv6 address to add: "
-    read -r ipv6_input < /dev/tty
-    
-    if [[ -z "$ipv6_input" ]]; then
-        error "IPv6 address cannot be empty"
-        return 1
-    fi
-    
-    # Parse IPv6 address and prefix
-    local ipv6_addr=""
-    local ipv6_prefix="64"
-    
-    if [[ "$ipv6_input" =~ / ]]; then
-        # Contains CIDR notation
-        ipv6_addr="${ipv6_input%/*}"
-        ipv6_prefix="${ipv6_input##*/}"
-    else
-        # No CIDR notation, use default /64
-        ipv6_addr="$ipv6_input"
-    fi
-    
-    # Basic IPv6 validation (simplified)
-    if ! [[ "$ipv6_addr" =~ ^[0-9a-fA-F:]+$ ]]; then
-        error "Invalid IPv6 address format"
-        return 1
-    fi
-    
-    # Validate prefix length
-    if ! [[ "$ipv6_prefix" =~ ^[0-9]+$ ]] || [[ "$ipv6_prefix" -lt 1 ]] || [[ "$ipv6_prefix" -gt 128 ]]; then
-        error "Invalid IPv6 prefix length (must be 1-128)"
-        return 1
-    fi
-    
-    local full_ipv6="${ipv6_addr}/${ipv6_prefix}"
-    
-    echo ""
-    log "Will ADD address: ${BOLD}${full_ipv6}${NC} to ${BOLD}${selected_iface}${NC}"
-    
-    if [[ -n "$existing_ipv6" ]]; then
-        info "Existing addresses will be kept (not replaced)"
-    fi
-    
-    echo ""
-    echo -n "Proceed with adding this address? (y/N): "
-    read -r confirm < /dev/tty
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        warning "Configuration cancelled"
-        return 1
-    fi
-    
-    echo ""
-    log "Adding IPv6 address to interface..."
-    
-    # Add the IPv6 address temporarily
-    if ip -6 addr add "$full_ipv6" dev "$selected_iface" 2>/dev/null; then
-        log "✅ IPv6 address added to $selected_iface"
-    else
-        # Check if address already exists
-        if ip -6 addr show dev "$selected_iface" | grep -q "$ipv6_addr"; then
-            warning "This exact IPv6 address already exists on this interface"
-            info "No changes were made"
-        else
-            error "Failed to add IPv6 address"
-            info "This could be due to invalid address or network configuration issues"
-            return 1
-        fi
-    fi
-    
-    # Make configuration persistent
-    log "Making configuration persistent..."
-    
-    # Detect the network configuration system
-    local config_method=""
-    
-    if [[ -d /etc/netplan ]] && ls /etc/netplan/*.yaml >/dev/null 2>&1; then
-        config_method="netplan"
-    elif [[ -f "$IFACES_FILE" ]]; then
-        config_method="interfaces"
-    elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        config_method="networkmanager"
-    else
-        warning "Could not detect network configuration method"
-        config_method="manual"
-    fi
-    
-    echo ""
-    info "Detected network configuration: $config_method"
-    
-    case "$config_method" in
-        netplan)
-            warning "Netplan detected. You need to manually edit your netplan configuration."
-            echo ""
-            echo "Add the following to your netplan config (e.g., /etc/netplan/01-netcfg.yaml):"
-            echo ""
-            echo "network:"
-            echo "  version: 2"
-            echo "  ethernets:"
-            echo "    ${selected_iface}:"
-            echo "      addresses:"
-            echo "        - ${full_ipv6}"
-            echo ""
-            echo "Then run: sudo netplan apply"
-            ;;
-        interfaces)
-            local iface_config="$IFACES_FILE"
-            log "Adding configuration to $iface_config..."
-            
-            # Check if interface section exists
-            if grep -q "^iface $selected_iface inet6" "$iface_config"; then
-                warning "IPv6 configuration for $selected_iface already exists in $iface_config"
-                info "Please manually edit $iface_config to add: up ip -6 addr add ${full_ipv6} dev ${selected_iface}"
-            else
-                # Backup the file
-                cp "$iface_config" "${iface_config}.backup_$(date +%Y%m%d_%H%M%S)"
-                
-                # Add IPv6 configuration
-                cat >> "$iface_config" << EOF
-
-# IPv6 configuration for ${selected_iface} - added by configure_ipv6.sh
-iface ${selected_iface} inet6 static
-    address ${full_ipv6}
-EOF
-                log "✅ Configuration added to $iface_config"
-            fi
-            ;;
-        networkmanager)
-            warning "NetworkManager detected. Configuration may not persist."
-            info "To make it persistent with NetworkManager, use:"
-            echo "  nmcli con modify <connection-name> +ipv6.addresses ${full_ipv6}"
-            ;;
-        manual)
-            warning "Manual configuration required for persistence."
-            info "Current configuration is active but may not survive reboot."
-            echo ""
-            echo "To make it persistent, add this command to /etc/rc.local or create a systemd service:"
-            echo "  ip -6 addr add ${full_ipv6} dev ${selected_iface}"
-            ;;
-    esac
-    
-    echo ""
-    log "Verifying configuration..."
-    
-    # Verify the address is configured
-    if ip -6 addr show dev "$selected_iface" | grep -q "$ipv6_addr"; then
-        log "✅ IPv6 address is configured on $selected_iface"
-        
-        echo ""
-        log "All IPv6 addresses on $selected_iface:"
-        ip -6 addr show dev "$selected_iface" scope global | grep inet6 | awk '{print "  " $2}'
-        
-        # Highlight the newly added address
-        if [[ -n "$existing_ipv6" ]]; then
-            echo ""
-            info "The address ${full_ipv6} has been added to your existing addresses"
-        fi
-        
-        echo ""
-        log "Testing IPv6 connectivity..."
-        if ping6 -c 1 -W 2 -I "$selected_iface" ff02::1 >/dev/null 2>&1; then
-            log "✅ IPv6 link-local connectivity working"
-        fi
-        
-        echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}IPv6 address added successfully!${NC}"
-        echo -e "${GREEN}========================================${NC}"
-        echo ""
-        
-        if [[ "$config_method" != "interfaces" ]]; then
-            warning "Remember to make the configuration persistent as shown above"
-        fi
-        
-    else
-        error "Failed to verify IPv6 address configuration"
-        return 1
-    fi
-}
-
-# Disable IPv6
+    sysctl -p "$SYSCTL_CONFIG" || exit 1
+    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" == "$value" ]] || { error 'IPv6 policy did not take effect'; exit 1; }
+    record_managed ipv6 "$SYSCTL_CONFIG" || exit 1
+    tx_commit
+    if [[ "$value" == 1 ]]; then log 'IPv6 is now disabled'; else log 'IPv6 is now enabled'; fi
+)
+enable_ipv6() { set_ipv6_policy 0; }
 disable_ipv6() {
-    echo ""
-    echo "=========================================="
-    echo "  Disable IPv6"
-    echo "=========================================="
-    echo ""
-
-    warning "Disabling IPv6 may affect some applications"
-    echo ""
-    echo "Services that may be affected:"
-    echo "  • SSH (if listening on IPv6)"
-    echo "  • Web servers (if configured for IPv6)"
-    echo "  • Some VPN clients"
-    echo ""
-
     if [[ "$IPV6_ASSUME_YES" != true ]]; then
-        echo -n "Are you sure you want to disable IPv6? (y/N): "
-        read -r confirm < /dev/tty
+        local answer
+        read -r -p 'Disable IPv6 on all interfaces? [y/N]: ' answer < /dev/tty || return 1
+        case "$answer" in y|Y) ;; *) warning 'IPv6 disable cancelled'; return 1 ;; esac
+    fi
+    set_ipv6_policy 1
+}
 
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            warning "IPv6 disable cancelled"
-            return 1
+# Infer a Netplan ID from its generated backend, not necessarily the NIC name
+# (match/set-name configurations often use a completely different YAML ID).
+netplan_target() {
+    local iface="$1" network_file="$2" connection="$3" id kind candidate
+    id="$NETPLAN_ID"
+    if [[ -z "$id" && "$network_file" == */10-netplan-*.network ]]; then
+        id="${network_file##*/10-netplan-}"; id="${id%.network}"
+    fi
+    if [[ -z "$id" && "$connection" == netplan-* ]]; then id="${connection#netplan-}"; fi
+    [[ -n "$id" ]] || id="$iface"
+    [[ "$id" =~ ^[a-zA-Z0-9_.-]+$ ]] || return 1
+    for kind in ethernets bridges bonds vlans tunnels wifis; do
+        candidate="$(netplan get "network.$kind.$id" 2>/dev/null || true)"
+        if [[ -n "$candidate" && "$candidate" != null && "$candidate" != '{}' ]]; then
+            printf '%s %s' "$kind" "$id"; return 0
+        fi
+    done
+    error 'Cannot identify the existing Netplan device; supply --netplan-id.'; return 1
+}
+
+# Follow ifupdown include directives so provider stanzas in interfaces.d are
+# extended in their actual file, rather than adding a duplicate inet6 stanza.
+ifupdown_ipv6_file() {
+    local iface="$1" file line directive pattern match index=0 seen=""
+    local files=("$IFACES_FILE") words=()
+    while (( index < ${#files[@]} && index < 100 )); do
+        file="${files[$index]}"; index=$((index + 1))
+        [[ -f "$file" && "$seen" != *"|$file|"* ]] || continue
+        seen+="|$file|"
+        if awk -v iface="$iface" '$1=="iface" && $2==iface && $3=="inet6" {found=1} END {exit !found}' "$file"; then
+            printf '%s' "$file"; return
+        fi
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            read -r -a words <<< "$line"
+            directive="${words[0]:-}"
+            case "$directive" in source|source-directory) ;; *) continue ;; esac
+            for pattern in "${words[@]:1}"; do
+                [[ "$pattern" == /* ]] || pattern="$(dirname "$file")/$pattern"
+                [[ "$directive" != source-directory ]] || pattern+='/*'
+                while IFS= read -r match; do
+                    if [[ "$directive" == source-directory && ! "${match##*/}" =~ ^[a-zA-Z0-9_-]+$ ]]; then continue; fi
+                    files+=("$match")
+                done < <(compgen -G "$pattern" || true)
+            done
+        done < "$file"
+    done
+    printf '%s' "$IFACES_FILE"
+}
+
+persist_ipv6_address() (
+    local iface="$1" address="$2" gateway="${3:-}" host prefix network_file connection uuid file key
+    local old_addresses="" old_gateway="" old_method=""
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { error 'Invalid interface name'; exit 1; }
+    host="${address%/*}"; prefix="${address##*/}"
+    valid_ipv6_address "$host" || { error 'Invalid IPv6 address format'; exit 1; }
+    [[ "$address" == */* && "$prefix" =~ ^[0-9]{1,3}$ ]] && (( 10#$prefix >= 1 && 10#$prefix <= 128 )) || { error 'Invalid IPv6 prefix length'; exit 1; }
+    [[ -z "$gateway" ]] || valid_ipv6_address "$gateway" || { error 'Invalid IPv6 gateway'; exit 1; }
+    ip link show dev "$iface" >/dev/null || exit 1
+    [[ "$(sysctl -n "net.ipv6.conf.$iface.disable_ipv6")" == 0 ]] || { error 'Enable IPv6 before adding an address'; exit 1; }
+    clikader_lock ipv6 || exit 1
+    network_file="$(LC_ALL=C networkctl status "$iface" --no-pager 2>/dev/null | sed -n 's/^[[:space:]]*Network File: //p' || true)"
+    connection="$(nmcli -g GENERAL.CONNECTION device show "$iface" 2>/dev/null || true)"
+    uuid="$(nmcli -g GENERAL.CON-UUID device show "$iface" 2>/dev/null || true)"
+    key="$(printf '%s' "$iface/$address" | sha256sum | cut -c1-16)"
+    local existed=0 route_before backend
+    ip -o -6 addr show dev "$iface" | grep -qF " $address " && existed=1
+    route_before="$(ip -6 route show default dev "$iface")"
+    restore_address() {
+        (( existed )) || ip -6 addr del "$address" dev "$iface" 2>/dev/null || true
+        if [[ -n "$gateway" ]]; then
+            ip -6 route del default via "$gateway" dev "$iface" 2>/dev/null || true
+            local route words
+            while IFS= read -r route; do
+                [[ -n "$route" ]] || continue
+                read -r -a words <<< "$route"
+                ip -6 route replace "${words[@]}" || return 1
+            done <<< "$route_before"
+        fi
+        case "${backend:-}" in
+            netplan) netplan generate ;;
+            networkd) networkctl reload ;;
+            nm) nmcli connection modify "$uuid" ipv6.addresses "$old_addresses" ipv6.gateway "$old_gateway" ipv6.method "$old_method" ;;
+        esac
+    }
+    tx_begin ipv6-address restore_address || exit 1
+    if [[ -d "$NETPLAN_DIR" ]] && compgen -G "$NETPLAN_DIR/*.yaml" >/dev/null; then
+        backend=netplan
+        local target kind id
+        target="$(netplan_target "$iface" "$network_file" "$connection")" || exit 1
+        read -r kind id <<< "$target"
+        file="$NETPLAN_DIR/90-clikader-$key.yaml"
+        tx_save "$file" || exit 1
+        printf 'network:\n  version: 2\n  %s:\n    %s:\n      addresses: ["%s"]\n' "$kind" "$id" "$address" > "$file" || exit 1
+        if [[ -n "$gateway" ]]; then
+            printf '      routes:\n        - to: "::/0"\n          via: "%s"\n          on-link: true\n' "$gateway" >> "$file"
+        fi
+        chmod 600 "$file"
+        netplan generate || exit 1
+    elif [[ -n "$uuid" && "$uuid" != -- ]]; then
+        old_addresses="$(nmcli -g ipv6.addresses connection show "$uuid")" || exit 1
+        old_gateway="$(nmcli -g ipv6.gateway connection show "$uuid")" || exit 1
+        old_method="$(nmcli -g ipv6.method connection show "$uuid")" || exit 1
+        backend="nm"
+        nmcli connection modify "$uuid" +ipv6.addresses "$address" || exit 1
+        case "$old_method" in disabled|ignore) nmcli connection modify "$uuid" ipv6.method manual || exit 1 ;; esac
+        [[ -z "$gateway" ]] || nmcli connection modify "$uuid" ipv6.gateway "$gateway" || exit 1
+        file="$CLIKADER_STATE_DIR/nm-ipv6-$key.conf"
+        tx_save "$file" || exit 1
+        printf 'uuid=%s\naddress=%s\ngateway=%s\n' "$uuid" "$address" "$gateway" > "$file"
+    elif [[ "$network_file" == /*.network ]]; then
+        backend=networkd
+        file="$NETWORKD_DIR/$(basename "$network_file").d/90-clikader-$key.conf"
+        tx_save "$file" || exit 1
+        mkdir -p "$(dirname "$file")" || exit 1
+        printf '[Address]\nAddress=%s\n' "$address" > "$file"
+        if [[ -n "$gateway" ]]; then printf '\n[Route]\nDestination=::/0\nGateway=%s\nGatewayOnLink=yes\n' "$gateway" >> "$file"; fi
+        chmod 644 "$file"
+        networkctl reload || exit 1
+    elif [[ -f "$IFACES_FILE" ]]; then
+        backend=interfaces
+        file="$(ifupdown_ipv6_file "$iface")" || exit 1
+        tx_save "$file" || exit 1
+        # ifupdown permits multiple iface stanzas. Use the existing IPv6
+        # method when present and append only owned up/down hooks.
+        if ! grep -qF "# clikader IPv6 $key" "$file"; then
+            printf '    # clikader IPv6 %s\n    up ip -6 addr replace %s dev %s\n    down ip -6 addr del %s dev %s || true\n' \
+                "$key" "$address" "$iface" "$address" "$iface" > "$TX_DIR/hooks"
+            if [[ -n "$gateway" ]]; then printf '    up ip -6 route replace default via %s dev %s onlink\n' "$gateway" "$iface" >> "$TX_DIR/hooks"; fi
+            awk -v dev="$iface" -v hooks="$TX_DIR/hooks" '
+                {print}
+                !added && $1=="iface" && $2==dev && $3=="inet6" {while ((getline line < hooks)>0) print line; close(hooks); added=1}
+                END {if (!added) {print "\nauto " dev "\niface " dev " inet6 manual"; while ((getline line < hooks)>0) print line}}
+            ' "$file" > "$TX_DIR/interfaces" || exit 1
+            cat "$TX_DIR/interfaces" > "$file" || exit 1
         fi
     else
-        log "Proceeding (--yes)"
+        error 'No supported network manager found; no temporary-only configuration was applied.'; exit 1
     fi
-    
-    echo ""
-    log "Creating IPv6 disable configuration..."
-    
-    # Create sysctl configuration
-    cat > "$SYSCTL_CONFIG" << 'EOF'
-# Disable IPv6 on all interfaces
-# Created by configure_ipv6.sh
+    # Apply only the IPv6 addition live; avoid restarting the NIC or touching
+    # its IPv4 settings. The native configuration supplies reboot persistence.
+    ip -6 addr replace "$address" dev "$iface" || exit 1
+    [[ -z "$gateway" ]] || ip -6 route replace default via "$gateway" dev "$iface" onlink || exit 1
+    local _attempt healthy=0
+    for _attempt in 1 2 3 4 5; do
+        if ip -o -6 addr show dev "$iface" | grep -F " $address " | grep -qvE 'tentative|dadfailed'; then healthy=1; break; fi
+        sleep 1
+    done
+    (( healthy )) || { error 'IPv6 address failed duplicate-address detection/verification'; exit 1; }
+    record_managed "ipv6-address-$key" "$file" || exit 1
+    tx_commit
+    log "IPv6 address added successfully and persisted ($backend): $address on $iface"
+)
 
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-net.ipv6.conf.lo.disable_ipv6=1
-EOF
-    
-    log "✅ Created $SYSCTL_CONFIG"
-    
-    # Apply configuration immediately
-    log "Applying IPv6 disable configuration..."
-    sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1
-    
-    log "✅ IPv6 disabled on all interfaces"
-    
-    echo ""
-    log "Verifying IPv6 status..."
-    
-    local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
-    
-    if [[ "$ipv6_disabled" == "1" ]]; then
-        log "✅ IPv6 is now disabled"
-        
-        echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}IPv6 disabled successfully!${NC}"
-        echo -e "${GREEN}========================================${NC}"
-        echo ""
-        info "Configuration is persistent across reboots"
-        info "To re-enable IPv6, run this script again and choose 'Enable'"
-        
-    else
-        error "Failed to disable IPv6"
-        return 1
-    fi
+configure_ipv6_address() {
+    local interfaces=() iface choice address gateway=""
+    while IFS= read -r iface; do interfaces+=("$iface"); done < <(ip -o link show | awk -F': ' '$2!="lo" {sub(/@.*/,"",$2); print $2}')
+    (( ${#interfaces[@]} )) || { error 'No network interfaces found'; return 1; }
+    local i
+    for i in "${!interfaces[@]}"; do echo "$((i+1))) ${interfaces[$i]}"; done
+    read -r -p 'Interface number: ' choice < /dev/tty || return 1
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= ${#interfaces[@]} )) || { error 'Invalid interface selection'; return 1; }
+    iface="${interfaces[$((choice-1))]}"
+    read -r -p 'IPv6 address/prefix: ' address < /dev/tty || return 1
+    [[ -n "$address" ]] || { error 'IPv6 address cannot be empty'; return 1; }
+    [[ "$address" == */* ]] || address+='/64'
+    read -r -p 'Default IPv6 gateway (blank to preserve routing): ' gateway < /dev/tty || return 1
+    persist_ipv6_address "$iface" "$address" "$gateway"
 }
 
-# Display interactive menu
 show_menu() {
-    clear
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║      IPv6 Configuration Tool          ║${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
-    
+    echo 'IPv6 Configuration Tool'
     check_ipv6_status || true
-    
-    echo ""
-    echo "What would you like to do?"
-    echo ""
-    echo "  1) Enable IPv6"
-    echo "  2) Disable IPv6"
-    echo "  3) Configure IPv6 address"
-    echo "  4) Check status only"
-    echo "  0) Exit"
-    echo ""
+    printf '1) Enable IPv6\n2) Disable IPv6\n3) Configure IPv6 address\n4) Check status\n0) Exit\n'
 }
-
-# Main entrypoint
 main() {
-    # Non-interactive mode: a flag was passed, so skip the menu.
     case "$IPV6_MODE" in
-        enable)  enable_ipv6; return $? ;;
-        disable) disable_ipv6; return $? ;;
-        status)
-            check_ipv6_status || true
-            echo ""
-            log "Detailed IPv6 status:"
-            sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
-            return 0
-            ;;
-        help|"")
-            ;; # fall through to interactive menu below
-    esac
-
-    show_menu
-
-    echo -n "Enter your choice [0-4]: "
-    read -r choice < /dev/tty
-
-    case "$choice" in
-        1)
-            enable_ipv6
-            ;;
-        2)
-            disable_ipv6
-            ;;
-        3)
-            configure_ipv6_address
-            ;;
-        4)
-            echo ""
-            log "Detailed IPv6 status:"
-            echo ""
-            sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
-            echo ""
-            ;;
-        0)
-            echo ""
-            log "Exiting..."
-            echo ""
-            ;;
+        enable) enable_ipv6 ;;
+        disable) disable_ipv6 ;;
+        status) check_ipv6_status ;;
+        address)
+            [[ -n "$INTERFACE" ]] || { error '--interface is required'; return 2; }
+            persist_ipv6_address "$INTERFACE" "$ADDRESS" "$GATEWAY" ;;
         *)
-            error "Invalid choice. Please enter 0-4."
-            exit 1
+            show_menu
+            local choice
+            read -r -p 'Choice: ' choice < /dev/tty || return 1
+            case "$choice" in 1) enable_ipv6 ;; 2) disable_ipv6 ;; 3) configure_ipv6_address ;; 4) check_ipv6_status ;; 0) log 'Exiting...' ;; *) error 'Invalid choice'; return 1 ;; esac
             ;;
     esac
 }
-
-# Run only when executed directly (not when sourced for tests).
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main; fi

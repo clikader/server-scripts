@@ -1,123 +1,75 @@
-#!/usr/bin/env bash
-# Tests for install.sh (top-to-bottom installer; no functions to source)
+#!/usr/bin/env bats
 load test_helper
 
 setup() {
     setup_mocks
+    export CLIKADER_INSTALL_ROOT="$BATS_TEST_TMPDIR/install"
+    export CLIKADER_BIN_DIR="$BATS_TEST_TMPDIR/bin"
 }
 
-@test "install.sh: refuses to run as non-root" {
-    run setpriv --reuid=65534 --regid=65534 --clear-groups -- \
-        env PATH="$PATH" bash "$REPO_ROOT/install.sh"
+@test "installer help is non-root and read-only" {
+    run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/install.sh" --help
+    [ "$status" -eq 0 ]
+    [ ! -e "$CLIKADER_INSTALL_ROOT" ]
+}
+
+@test "installer refuses installation as non-root" {
+    run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/install.sh"
     [ "$status" -eq 1 ]
-    assert_output_contains "must be run as root"
+    assert_output_contains 'must be run as root'
 }
 
-@test "install.sh: curl failure exits 1" {
+@test "complete local bundle installs and commands run with networking unavailable" {
     make_mock curl --status 1
-    # Point INSTALL by running a patched copy that writes to tmp
-    local copy="$BATS_TEST_TMPDIR/install.sh"
-    sed 's|INSTALL_DIR="/usr/local/bin"|INSTALL_DIR="'"$BATS_TEST_TMPDIR/bin"'"|' \
-        "$REPO_ROOT/install.sh" > "$copy"
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    run bash "$copy"
-    [ "$status" -eq 1 ]
-    assert_output_contains "Failed to download"
-}
-
-@test "install.sh: success writes executable clikader" {
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    cat > "$MOCK_BIN/curl" <<MOCK
-#!/usr/bin/env bash
-out="\${@: -1}"
-printf '#!/usr/bin/env bash\nCLIKADER_VERSION="9.9.9"\n' > "\$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
-    local copy="$BATS_TEST_TMPDIR/install.sh"
-    sed 's|INSTALL_DIR="/usr/local/bin"|INSTALL_DIR="'"$BATS_TEST_TMPDIR/bin"'"|' \
-        "$REPO_ROOT/install.sh" > "$copy"
-    # Ensure command -v clikader succeeds by putting the install dir on PATH
-    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
-    run bash "$copy"
+    run bash "$REPO_ROOT/install.sh" --from "$REPO_ROOT"
     [ "$status" -eq 0 ]
-    assert_output_contains "Installation Successful"
-    assert_output_contains "9.9.9"
-    [ -x "$BATS_TEST_TMPDIR/bin/clikader" ]
-}
-
-@test "install.sh (real file): downloads to /usr/local/bin" {
-    cat > "$MOCK_BIN/curl" <<'MOCK'
-#!/usr/bin/env bash
-out="${@: -1}"
-printf '#!/usr/bin/env bash\nCLIKADER_VERSION="9.9.9"\n' > "$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
-    export PATH="/usr/local/bin:$PATH"
-    run bash "$REPO_ROOT/install.sh"
+    [ -L "$CLIKADER_BIN_DIR/clikader" ]
+    [ -f "$CLIKADER_INSTALL_ROOT/current/components/setup_dns.sh" ]
+    [ "$(stat -c %u "$CLIKADER_INSTALL_ROOT/current/components/setup_dns.sh")" -eq 0 ]
+    run "$CLIKADER_BIN_DIR/clikader" dns --help
     [ "$status" -eq 0 ]
-    assert_output_contains "Installation Successful"
-    [ -x /usr/local/bin/clikader ]
+    assert_output_contains 'Usage: clikader dns'
+    [ ! -s "$MOCK_CFG_DIR/calls" ]
 }
 
-@test "install.sh (real file): reinstall path prints current version" {
-    mkdir -p /usr/local/bin
-    printf '#!/usr/bin/env bash\nCLIKADER_VERSION="0.1.0"\n' > /usr/local/bin/clikader
-    chmod +x /usr/local/bin/clikader
-    cat > "$MOCK_BIN/curl" <<'MOCK'
-#!/usr/bin/env bash
-out="${@: -1}"
-printf '#!/usr/bin/env bash\nCLIKADER_VERSION="9.9.9"\n' > "$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
-    export PATH="/usr/local/bin:$PATH"
-    run bash "$REPO_ROOT/install.sh"
-    [ "$status" -eq 0 ]
-    assert_output_contains "already installed"
-    assert_output_contains "Current version: 0.1.0"
-}
-
-@test "install.sh (real file): curl failure" {
+@test "failed download leaves the working bundle intact" {
+    bash "$REPO_ROOT/install.sh" --from "$REPO_ROOT"
+    original="$(readlink "$CLIKADER_INSTALL_ROOT/current")"
     make_mock curl --status 1
-    run bash "$REPO_ROOT/install.sh"
+    run bash "$REPO_ROOT/install.sh" --update --yes
     [ "$status" -eq 1 ]
-    assert_output_contains "Failed to download"
+    [ "$(readlink "$CLIKADER_INSTALL_ROOT/current")" = "$original" ]
+    run "$CLIKADER_BIN_DIR/clikader" --version
+    [ "$status" -eq 0 ]
 }
 
-@test "install.sh (real file): installed but not on PATH" {
-    cat > "$MOCK_BIN/curl" <<'MOCK'
-#!/usr/bin/env bash
-out="${@: -1}"
-printf '#!/usr/bin/env bash\nCLIKADER_VERSION="9.9.9"\n' > "$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
-    # Drop /usr/local/bin so command -v clikader fails after install
-    export PATH="$MOCK_BIN:/usr/bin:/bin"
-    run bash "$REPO_ROOT/install.sh"
-    [ "$status" -eq 0 ]
-    assert_output_contains "not found in PATH"
+@test "invalid staged bundle cannot replace an installed release" {
+    bash "$REPO_ROOT/install.sh" --from "$REPO_ROOT"
+    original="$(readlink "$CLIKADER_INSTALL_ROOT/current")"
+    mkdir "$BATS_TEST_TMPDIR/source"
+    cp -a "$REPO_ROOT/clikader.sh" "$REPO_ROOT/install.sh" "$REPO_ROOT/VERSION" "$REPO_ROOT/components" "$REPO_ROOT/lib" "$BATS_TEST_TMPDIR/source/"
+    printf 'if (\n' > "$BATS_TEST_TMPDIR/source/components/setup_dns.sh"
+    run bash "$REPO_ROOT/install.sh" --from "$BATS_TEST_TMPDIR/source"
+    [ "$status" -ne 0 ]
+    [ "$(readlink "$CLIKADER_INSTALL_ROOT/current")" = "$original" ]
 }
 
-@test "install.sh: reinstalls when already present" {
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    printf '#!/usr/bin/env bash\nCLIKADER_VERSION="0.0.1"\n' > "$BATS_TEST_TMPDIR/bin/clikader"
-    chmod +x "$BATS_TEST_TMPDIR/bin/clikader"
-    cat > "$MOCK_BIN/curl" <<MOCK
-#!/usr/bin/env bash
-out="\${@: -1}"
-printf '#!/usr/bin/env bash\nCLIKADER_VERSION="9.9.9"\n' > "\$out"
-exit 0
-MOCK
-    chmod +x "$MOCK_BIN/curl"
-    local copy="$BATS_TEST_TMPDIR/install.sh"
-    sed 's|INSTALL_DIR="/usr/local/bin"|INSTALL_DIR="'"$BATS_TEST_TMPDIR/bin"'"|' \
-        "$REPO_ROOT/install.sh" > "$copy"
-    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
-    run bash "$copy"
+@test "update and rollback switch entire bundles atomically" {
+    bash "$REPO_ROOT/install.sh" --from "$REPO_ROOT"
+    original="$(readlink "$CLIKADER_INSTALL_ROOT/current")"
+    mkdir "$BATS_TEST_TMPDIR/source"
+    cp -a "$REPO_ROOT/clikader.sh" "$REPO_ROOT/install.sh" "$REPO_ROOT/VERSION" "$REPO_ROOT/components" "$REPO_ROOT/lib" "$BATS_TEST_TMPDIR/source/"
+    printf '\n# new revision\n' >> "$BATS_TEST_TMPDIR/source/components/setup_dns.sh"
+    run bash "$REPO_ROOT/install.sh" --update --yes --from "$BATS_TEST_TMPDIR/source"
     [ "$status" -eq 0 ]
-    assert_output_contains "already installed"
-    assert_output_contains "Current version: 0.0.1"
+    [ "$(readlink "$CLIKADER_INSTALL_ROOT/current")" != "$original" ]
+    run "$CLIKADER_BIN_DIR/clikader" update --rollback
+    [ "$status" -eq 0 ]
+    [ "$(readlink "$CLIKADER_INSTALL_ROOT/current")" = "$original" ]
+}
+
+@test "installer rejects unknown arguments before changing files" {
+    run bash "$REPO_ROOT/install.sh" --nope
+    [ "$status" -eq 2 ]
+    [ ! -e "$CLIKADER_INSTALL_ROOT" ]
 }

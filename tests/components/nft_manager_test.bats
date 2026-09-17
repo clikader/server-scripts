@@ -7,6 +7,7 @@ setup() {
     make_mock nft
     make_mock systemctl
     make_mock sshd --out $'port 22\n'
+    make_mock ss
     export NFT_CONF="$BATS_TEST_TMPDIR/nftables.conf"
     cat > "$NFT_CONF" <<'EOF'
 #!/usr/sbin/nft -f
@@ -61,7 +62,7 @@ EOF
     [ -z "$output" ]
 }
 
-@test "get_ssh_port: prefers sshd -T, then sshd_config, then 22" {
+@test "get_ssh_port: uses effective ports and refuses to guess when unavailable" {
     make_mock sshd --out $'port 2222\n'
     run get_ssh_port
     [ "$output" = "2222" ]
@@ -72,7 +73,8 @@ EOF
     # get_ssh_port hardcodes /etc/ssh/sshd_config; fall through to default 22
     # when sshd -T is empty and we cannot override that path.
     run get_ssh_port
-    [ "$output" = "22" ]
+    [ "$status" -ne 0 ]
+    assert_output_contains 'Cannot determine SSH ports'
 }
 
 @test "read_allow_sets: populates tcp_ports and udp_ports from NFT_CONF" {
@@ -228,7 +230,11 @@ MOCK
     tcp_ports="22 80"
     # seed the file so read_allow_sets sees 80 already
     cat > "$NFT_CONF" <<'EOF'
+table inet clikader_filter {
+    chain input {
         tcp dport { 22, 80 } accept comment "ssh + extra tcp ports"
+    }
+}
 EOF
     run add_ports 80 tcp
     [ "$status" -eq 0 ]
@@ -250,8 +256,12 @@ EOF
 
 @test "delete_ports: mixed list deletes extras and keeps SSH" {
     cat > "$NFT_CONF" <<'EOF'
+table inet clikader_filter {
+    chain input {
         tcp dport { 22, 8080 } accept comment "ssh + extra tcp ports"
         udp dport { 8080 } accept comment "extra udp ports"
+    }
+}
 EOF
     cat > "$MOCK_BIN/nft" <<'MOCK'
 #!/usr/bin/env bash
@@ -374,4 +384,54 @@ MOCK
     inner="$(make_inner components/nft_manager.sh 'show_menu')"
     run_pty "$inner" "0"
     [ "$PTY_RC" -eq 0 ]
+}
+
+@test "reset preserves UDP rules in unrelated tables and chains" {
+    cat >> "$NFT_CONF" <<'EOF'
+table inet foreign {
+    chain forward {
+        udp dport { 51820 } accept comment "unrelated tunnel"
+    }
+}
+EOF
+    run reset_allowlist -y
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" 'udp dport { 51820 } accept comment "unrelated tunnel"'
+}
+
+@test "foreign allow rules preceding the managed table are never selected" {
+    cp "$NFT_CONF" "$BATS_TEST_TMPDIR/original"
+    printf 'table inet foreign {\n chain input {\n tcp dport { 25 } accept\n }\n}\n' > "$NFT_CONF"
+    cat "$BATS_TEST_TMPDIR/original" >> "$NFT_CONF"
+    run add_ports 443 tcp
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" 'tcp dport { 25 } accept'
+    assert_file_contains "$NFT_CONF" 'tcp dport { 22, 443 } accept'
+}
+
+@test "all configured SSH listeners are protected from delete and reset" {
+    make_mock sshd --out $'port 22\nport 2222\n'
+    run add_ports 2222 tcp
+    [ "$status" -eq 0 ]
+    run delete_ports 2222
+    [ "$status" -eq 1 ]
+    run reset_allowlist -y
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" '22, 2222'
+}
+
+@test "comma-space CLI syntax accepts every port" {
+    run main add 8080, 8443 tcp
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" '22, 8080, 8443'
+    run main delete 8080, 8443
+    [ "$status" -eq 0 ]
+    ! grep -q '8080\|8443' "$NFT_CONF"
+}
+
+@test "comments containing replacement metacharacters survive rewriting" {
+    sed -i 's/ssh + extra tcp ports/http \& https @ example/' "$NFT_CONF"
+    run add_ports 443 tcp
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" 'comment "http & https @ example"'
 }

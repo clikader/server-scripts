@@ -16,6 +16,7 @@
 # whole flow or --reset to wipe state and start over.
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -53,10 +54,15 @@ SSHD_CONF_DIR="${SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
 SSH_DIR="${SSH_DIR:-/root/.ssh}"
 AUTHORIZED_KEYS="${AUTHORIZED_KEYS:-${SSH_DIR}/authorized_keys}"
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
-FAIL2BAN_JAIL="${FAIL2BAN_JAIL:-/etc/fail2ban/jail.local}"
+FAIL2BAN_JAIL="${FAIL2BAN_JAIL:-/etc/fail2ban/jail.d/99-clikader.local}"
+BOOT_ID_FILE="${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+CLIKADER_ENTRYPOINT="${CLIKADER_ENTRYPOINT:-$(dirname "${BASH_SOURCE[0]}")/../clikader.sh}"
+MAINTENANCE_SCRIPT="${MAINTENANCE_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/maintenance.sh}"
+UPGRADE_APT_LIST="${UPGRADE_APT_LIST:-/etc/apt/sources.list}"
+UPGRADE_APT_DIR="${UPGRADE_APT_DIR:-/etc/apt/sources.list.d}"
 TARGET_DEBIAN_VERSION=13
 TARGET_CODENAME="trixie"
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 
 # Runtime state (defaults; overwritten by load_state when resuming)
 ssh_port=""
@@ -67,9 +73,16 @@ extra_ports=""
 last_step=0
 clikader_setup_completed=0
 completed_at=""
+upgrade_pending=""
+upgrade_boot_id=""
+upgrade_finished=0
+ipv6_policy=ask
+profile=proxy
 # Run-mode flags (from argv)
 force=0
 reset=0
+finish_upgrade=0
+profile_explicit=0
 # CLI-provided inputs (from argv). When set, the interactive prompts are skipped.
 cli_ssh_port=""
 cli_ssh_key=""
@@ -80,6 +93,11 @@ cli_extra_ports=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)            force=1;  shift ;;
+        --keep-ipv6)         ipv6_policy=keep; shift ;;
+        --disable-ipv6)      ipv6_policy=disable; shift ;;
+        --profile=proxy)    profile=proxy; profile_explicit=1; shift ;;
+        --profile=general)  profile=general; profile_explicit=1; shift ;;
+        --finish-upgrade)   finish_upgrade=1; shift ;;
         --reset)            reset=1;  shift ;;
         --ssh-port)
             [[ $# -ge 2 ]] || { error "--ssh-port requires a value"; exit 1; }
@@ -116,6 +134,9 @@ Setup parameters (omit any to be prompted for it interactively):
 Run modes:
   --force   Re-run the entire flow even if already completed.
   --reset   Wipe saved state and start over from scratch.
+  --profile=proxy|general   Proxy defaults, or preserve DNS/APT/TCP settings.
+  --keep-ipv6 / --disable-ipv6   Skip the IPv6 question with an explicit choice.
+  --finish-upgrade   Acknowledge a manually repaired interrupted release upgrade.
 
 When --ssh-port plus either --ssh-key or --password are provided, the run is
 fully non-interactive. State is kept in ${STATE_FILE}; after a release-upgrade
@@ -152,6 +173,7 @@ detect_os() {
     fi
     # VERSION_ID may carry a trailing qualifier on some images; strip to the major.
     debian_major="${VERSION_ID%%.*}"
+    case "$debian_major" in 11|12|13) ;; *) error "Unsupported Debian release: $debian_major"; exit 1 ;; esac
     debian_codename="${VERSION_CODENAME:-}"
     if [[ -z "$debian_codename" ]]; then
         case "$debian_major" in
@@ -174,10 +196,14 @@ escape_single_quotes() {
 
 save_state() {
     mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
     local escaped_key escaped_password
     escaped_key="$(escape_single_quotes "$ssh_public_key")"
     escaped_password="$(escape_single_quotes "$ssh_password")"
-    cat > "$STATE_FILE" <<EOF
+    local temporary
+    temporary="$(mktemp "$STATE_DIR/.state.XXXXXX")" || return 1
+    chmod 600 "$temporary"
+    cat > "$temporary" <<EOF
 # Managed by clikader setup. Do not edit by hand; use 'clikader setup --reset'.
 ssh_port='${ssh_port}'
 ssh_auth_method='${ssh_auth_method}'
@@ -187,8 +213,13 @@ extra_ports='${extra_ports}'
 last_step=${last_step}
 clikader_setup_completed=${clikader_setup_completed}
 completed_at='${completed_at}'
+upgrade_pending='${upgrade_pending}'
+upgrade_boot_id='${upgrade_boot_id}'
+upgrade_finished=${upgrade_finished}
+ipv6_policy='${ipv6_policy}'
+profile='${profile}'
 EOF
-    chmod 600 "$STATE_FILE"
+    mv -f "$temporary" "$STATE_FILE"
 }
 
 load_state() {
@@ -213,7 +244,8 @@ valid_port() {
     # Accepts a single token; returns 0 if it is an integer in 1..65535.
     local p="$1"
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
-    (( p >= 1 && p <= 65535 )) || return 1
+    [[ ${#p} -le 5 ]] || return 1
+    (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1
     return 0
 }
 
@@ -222,8 +254,15 @@ valid_ssh_pubkey() {
     # The key-type token may include a curve (ecdsa-sha2-nistp256) and/or a
     # host suffix (sk-ssh-ed25519@openssh.com), so we anchor on the prefix
     # followed by its non-space tail and then the required whitespace separator.
-    local key="$1"
-    [[ "$key" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9]+|sk-(ssh-ed25519|ecdsa-sha2-[a-z0-9]+)@openssh\.com)[[:space:]] ]]
+    local key="$1" temporary
+    [[ "$key" != *$'\n'* && "$key" != *$'\r'* ]] || return 1
+    [[ "$key" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-[a-z0-9]+|sk-(ssh-ed25519|ecdsa-sha2-[a-z0-9]+)@openssh\.com)[[:space:]] ]] || return 1
+    temporary="$(mktemp)" || return 1
+    printf '%s\n' "$key" > "$temporary"
+    local rc=0
+    ssh-keygen -l -f "$temporary" >/dev/null 2>&1 || rc=1
+    rm -f "$temporary"
+    return "$rc"
 }
 
 # Normalize a port list that may be comma or space separated into a clean
@@ -238,25 +277,28 @@ normalize_port_list() {
         printf ''
         return 0
     fi
-    local p
+    local p normalized=""
     for p in $raw; do
         if ! valid_port "$p"; then
             error "Invalid port '${p}' in port list"
             return 1
         fi
+        p=$((10#$p))
+        [[ " $normalized " == *" $p "* ]] || normalized+=" $p"
     done
-    printf '%s' "$raw"
+    printf '%s' "${normalized# }"
 }
 
 # Apply CLI-provided inputs, validating each. On any error, abort (these are
 # explicit user flags, so we fail loud rather than fall through to prompting).
 apply_cli_inputs() {
+    local previous_port="$ssh_port" previous_auth="$ssh_auth_method" previous_key="$ssh_public_key" previous_extra="$extra_ports"
     if [[ -n "$cli_ssh_port" ]]; then
         if ! valid_port "$cli_ssh_port"; then
             error "--ssh-port '${cli_ssh_port}' is not a valid port (1-65535)"
             exit 1
         fi
-        ssh_port="$cli_ssh_port"
+        ssh_port=$((10#$cli_ssh_port))
     fi
     # Auth method: --ssh-key and --password are mutually exclusive.
     if [[ -n "$cli_ssh_key" && -n "$cli_password" ]]; then
@@ -277,6 +319,7 @@ apply_cli_inputs() {
         ssh_password=""
     fi
     if [[ -n "$cli_password" ]]; then
+        [[ "$cli_password" != *$'\n'* && "$cli_password" != *$'\r'* ]] || { error 'Password cannot contain line breaks'; exit 1; }
         if [[ "${#cli_password}" -lt 8 ]]; then
             warning "--password is shorter than 8 characters; use a strong password."
         fi
@@ -287,6 +330,12 @@ apply_cli_inputs() {
     if [[ -n "$cli_extra_ports" ]]; then
         extra_ports="$(normalize_port_list "$cli_extra_ports")" || exit 1
     fi
+    if [[ "$previous_port" != "$ssh_port" || "$previous_auth" != "$ssh_auth_method" || "$previous_key" != "$ssh_public_key" || -n "$cli_password" ]]; then
+        (( last_step < 5 )) || last_step=4
+    elif [[ "$previous_extra" != "$extra_ports" ]]; then
+        (( last_step < 6 )) || last_step=5
+    fi
+    return 0
 }
 
 # --- Input collection (interactive, only when no saved answers) ---
@@ -418,11 +467,46 @@ step_banner() {
 # Advances one codename hop per invocation, then asks the user to reboot and
 # re-run. Progress is tracked by the OS codename itself, so on the next run the
 # advanced codename means the hop is already done.
+upgrade_preflight() {
+    local audit source_file free
+    audit="$(dpkg --audit)" || return 1
+    [[ -z "$audit" ]] || { error "Repair incomplete packages first: $audit"; return 1; }
+    free="$(df -Pk / | awk 'NR==2 {print $4}')" || return 1
+    [[ "$free" =~ ^[0-9]+$ ]] && (( free >= 1048576 )) || { error 'At least 1GiB of free root filesystem space is required'; return 1; }
+    for source_file in "$UPGRADE_APT_LIST" "$UPGRADE_APT_DIR/"*.list "$UPGRADE_APT_DIR/"*.sources; do
+        [[ -f "$source_file" ]] || continue
+        if grep -E '^(deb |deb-src |URIs:)' "$source_file" | grep -qvE '(deb\.debian\.org|security\.debian\.org|ftp\.[a-z.]*debian\.org)'; then
+            error "Non-official source in $source_file; run clikader apt-reset or disable it before upgrading."
+            return 1
+        fi
+        if grep -E '^(deb |deb-src |Suites:)' "$source_file" | grep -qwE 'stable|oldstable|oldoldstable|testing|unstable|sid'; then
+            error "Use explicit release codenames in $source_file before upgrading."; return 1
+        fi
+    done
+}
+
 step_upgrade_debian() {
     step_banner 1 "Upgrade to Debian 13 (Trixie)"
 
+    if [[ -n "$upgrade_pending" ]]; then
+        if [[ "$upgrade_finished" != 1 ]]; then
+            error "The upgrade to $upgrade_pending was interrupted. Run dpkg --configure -a and apt-get full-upgrade, then rerun setup with --finish-upgrade."
+            return 1
+        fi
+        if [[ "$upgrade_boot_id" == "$(cat "$BOOT_ID_FILE")" ]]; then
+            error "Reboot before continuing the upgrade to $upgrade_pending."; return 1
+        fi
+        [[ "$debian_codename" == "$upgrade_pending" ]] || { error "Expected $upgrade_pending after upgrade, detected $debian_codename"; return 1; }
+        dpkg --audit | grep . && { error 'Incomplete package configuration; repair dpkg before continuing.'; return 1; }
+        upgrade_pending=""
+        upgrade_boot_id=""
+    fi
     if [[ "$debian_codename" == "$TARGET_CODENAME" ]]; then
-        log "Already on Debian ${TARGET_DEBIAN_VERSION} (${TARGET_CODENAME}). Nothing to upgrade."
+        log "Already on Debian ${TARGET_DEBIAN_VERSION} (${TARGET_CODENAME}); refreshing and applying updates."
+        clikader_lock apt || return 1
+        apt_refresh || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confold upgrade -y || return 1
+        clikader_unlock apt || return 1
         last_step=1
         save_state
         return 0
@@ -442,49 +526,55 @@ step_upgrade_debian() {
     info "Note: a multi-hop upgrade (e.g. bullseye -> trixie) is done one release"
     info "at a time, with a reboot between each hop."
     echo ""
+    upgrade_preflight || return 1
+    clikader_lock apt || return 1
 
     # First bring the current release fully up to date.
     log "Updating current system (apt update/upgrade/full-upgrade)..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get upgrade -y
-    apt-get full-upgrade -y
-    apt-get --purge autoremove -y
+    apt_refresh || return 1
+    apt-get -o Dpkg::Options::=--force-confold upgrade -y || return 1
+    apt-get -o Dpkg::Options::=--force-confold full-upgrade -y || return 1
+    apt-get --purge autoremove -y || return 1
 
     # Backup sources before rewriting codenames.
     local ts
     ts="$(date +%Y%m%d_%H%M%S)"
-    local backup_dir="/etc/apt/sources.backup_${ts}"
-    mkdir -p "$backup_dir"
-    [[ -f /etc/apt/sources.list ]] && cp /etc/apt/sources.list "$backup_dir/" || true
-    if [[ -d /etc/apt/sources.list.d ]]; then
-        cp -r /etc/apt/sources.list.d/. "$backup_dir/" 2>/dev/null || true
+    local backup_dir
+    backup_dir="$(dirname "$UPGRADE_APT_LIST")/sources.backup_${ts}"
+    mkdir -p "$backup_dir" || return 1
+    if [[ -f "$UPGRADE_APT_LIST" ]]; then cp "$UPGRADE_APT_LIST" "$backup_dir/" || return 1; fi
+    if [[ -d "$UPGRADE_APT_DIR" ]]; then
+        cp -r "$UPGRADE_APT_DIR/." "$backup_dir/" || return 1
     fi
     log "Backed up APT sources to ${backup_dir}"
 
-    # Rewrite codename everywhere apt reads sources (sources.list + .list/.sources).
+    # Persist the in-progress hop before base-files can change os-release.
+    upgrade_pending="$to"
+    upgrade_boot_id="$(cat "$BOOT_ID_FILE")"
+    upgrade_finished=0
+    save_state
+    # Rewrite codename in the validated official sources.
     log "Rewriting codename '${from}' -> '${to}' in APT sources..."
-    if [[ -f /etc/apt/sources.list ]]; then
-        sed -i "s/${from}/${to}/g" /etc/apt/sources.list
-    fi
-    if [[ -d /etc/apt/sources.list.d ]]; then
-        # Quote the glob; zsh users sourcing paths are not a concern here (run under bash).
-        sed -i "s/${from}/${to}/g" /etc/apt/sources.list.d/*.list 2>/dev/null || true
-        sed -i "s/${from}/${to}/g" /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-    fi
+    local source_file
+    for source_file in "$UPGRADE_APT_LIST" "$UPGRADE_APT_DIR/"*.list "$UPGRADE_APT_DIR/"*.sources; do
+        [[ -f "$source_file" ]] || continue
+        sed -i "s/${from}/${to}/g" "$source_file" || return 1
+    done
 
     log "Running apt update against new sources..."
-    apt-get update
+    apt_refresh || return 1
 
     log "Upgrading without pulling new packages first (safer for the first pass)..."
-    apt-get upgrade --without-new-pkgs -y
+    apt-get -o Dpkg::Options::=--force-confold upgrade --without-new-pkgs -y || return 1
 
     log "Full-upgrade to ${to}..."
-    apt-get full-upgrade -y
-    apt-get --purge autoremove -y
+    apt-get -o Dpkg::Options::=--force-confold full-upgrade -y || return 1
+    apt-get --purge autoremove -y || return 1
 
     # Record that step 1 ran, so a re-run after reboot continues from step 2.
-    last_step=1
+    last_step=0
+    upgrade_finished=1
     save_state
 
     echo ""
@@ -522,6 +612,7 @@ step_install_packages() {
     local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables fping)
     log "Installing: ${pkgs[*]}"
     export DEBIAN_FRONTEND=noninteractive
+    apt_refresh
     apt-get install -y "${pkgs[@]}"
     log "Base packages installed"
     last_step=3
@@ -551,13 +642,46 @@ step_enable_chrony() {
 # So this step scrubs the drop-ins, puts a managed block at the very top of
 # the main config, disables socket activation, then VERIFIES the effective
 # config and the actual listener instead of trusting the sshd -t syntax check.
-step_ssh_hardening() {
+step_ssh_hardening() (
     step_banner 5 "SSH hardening + authorized key"
 
     local sshd_config="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
     local sshd_conf_dir="${SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
     local ts f
     ts="$(date +%Y%m%d_%H%M%S)"
+    local socket_active=0 socket_enabled=0 service_enabled=0
+    systemctl is-active --quiet ssh.socket && socket_active=1
+    systemctl is-enabled --quiet ssh.socket && socket_enabled=1
+    systemctl is-enabled --quiet ssh.service && service_enabled=1
+    if [[ "$ssh_auth_method" == key ]]; then
+        local key_path
+        key_path="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 | awk '$1=="authorizedkeysfile" {print $2; exit}')" || exit 1
+        if [[ -n "$key_path" ]]; then
+            [[ "$key_path" != none ]] || { error 'AuthorizedKeysFile is disabled for root'; exit 1; }
+            key_path="${key_path//%h//root}"
+            key_path="${key_path//%u/root}"
+            key_path="${key_path//%U/0}"
+            [[ "$key_path" != *%* ]] || { error 'Unsupported AuthorizedKeysFile expansion for root'; exit 1; }
+            [[ "$key_path" == /* ]] || key_path="/root/$key_path"
+            AUTHORIZED_KEYS="$key_path"
+        fi
+    fi
+    restore_ssh() {
+        if (( socket_enabled )); then systemctl enable ssh.socket; fi
+        if (( socket_active )); then
+            systemctl stop ssh.service
+            systemctl start ssh.socket || systemctl restart ssh.service
+        else
+            systemctl restart ssh.service
+        fi
+        (( service_enabled )) || systemctl disable ssh.service
+        if [[ -f "$TX_DIR/root-password" ]]; then chpasswd -e < "$TX_DIR/root-password"; fi
+    }
+    if [[ "$ssh_auth_method" == key ]]; then
+        valid_ssh_pubkey "$ssh_public_key" || { error 'Invalid SSH public key'; exit 1; }
+    fi
+    tx_begin ssh restore_ssh || exit 1
+    tx_save "$sshd_config" "$sshd_conf_dir" "$AUTHORIZED_KEYS" || exit 1
 
     # Directives this step owns, wherever sshd reads them from.
     local managed_keywords='Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication'
@@ -636,7 +760,8 @@ step_ssh_hardening() {
     if [[ "$ssh_auth_method" == "password" ]]; then
         # Set the root password BEFORE enabling password auth and restarting
         # sshd, so login works the moment the listener comes up.
-        if ! echo "root:${ssh_password}" | chpasswd; then
+        getent shadow root | cut -d: -f1,2 > "$TX_DIR/root-password" || exit 1
+        if ! printf 'root:%s\n' "$ssh_password" | chpasswd; then
             error "Failed to set root password (chpasswd)."
             return 1
         fi
@@ -646,15 +771,22 @@ step_ssh_hardening() {
         # turned off, so the key must already be in place or root gets locked
         # out.
         mkdir -p "$SSH_DIR"
+        mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
         chmod 700 "$SSH_DIR"
         touch "$AUTHORIZED_KEYS"
         chmod 600 "$AUTHORIZED_KEYS"
-        if [[ -n "$ssh_public_key" ]] && ! grep -qF "$ssh_public_key" "$AUTHORIZED_KEYS"; then
+        chown root:root "$SSH_DIR" "$AUTHORIZED_KEYS" || exit 1
+        if [[ -n "$ssh_public_key" ]] && ! grep -qxF "$ssh_public_key" "$AUTHORIZED_KEYS"; then
             echo "$ssh_public_key" >> "$AUTHORIZED_KEYS"
             log "Added public key to $AUTHORIZED_KEYS"
         else
             log "Public key already present in $AUTHORIZED_KEYS"
         fi
+    fi
+    # Allow the new port in the running firewall before moving the listener.
+    # The port manager preserves old listeners until the subsequent firewall step.
+    if nft list table inet clikader_filter >/dev/null 2>&1 && [[ -f "$NFT_CONF" ]]; then
+        bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$ssh_port" tcp || exit 1
     fi
 
     # Socket activation: while ssh.socket holds the listener, Port in
@@ -665,7 +797,7 @@ step_ssh_hardening() {
         systemctl disable --now ssh.socket
         systemctl enable ssh.service >/dev/null 2>&1
     fi
-    systemctl restart sshd
+    systemctl restart ssh.service || exit 1
 
     # --- Verify: effective config AND real listener, not just exit codes. ---
     local effective eff_ports eff_pw eff_pk eff_prl eff_kbd fail=0
@@ -679,7 +811,8 @@ step_ssh_hardening() {
         expected_prl="prohibit-password"
         expected_kbd="no"
     fi
-    effective="$(sshd -T 2>/dev/null)"
+    local remote_address="${SSH_CONNECTION:-127.0.0.1}"
+    effective="$(sshd -T -C "user=root,host=localhost,addr=${remote_address%% *}" 2>/dev/null)"
     eff_ports="$(awk '$1 == "port" {print $2}' <<<"$effective" | tr '\n' ' ' | sed 's/ $//')"
     eff_pw="$(awk '$1 == "passwordauthentication" {print $2}' <<<"$effective")"
     eff_pk="$(awk '$1 == "pubkeyauthentication" {print $2}' <<<"$effective")"
@@ -751,7 +884,9 @@ step_ssh_hardening() {
 
     last_step=5
     save_state
-}
+    record_managed ssh "$sshd_config" "$AUTHORIZED_KEYS" || exit 1
+    tx_commit
+)
 
 # --- Step 6: nftables firewall ---
 # INBOUND-ONLY firewall: exactly the ufw mental model — allow the ports you
@@ -763,15 +898,38 @@ step_ssh_hardening() {
 # `nft flush ruleset`), which would also wipe fail2ban's f2b-table and Docker's
 # tables while those services are running. fail2ban's nftables ban action hooks
 # its own drop chain in ahead of this filter table.
-step_configure_nftables() {
+step_configure_nftables() (
     step_banner 6 "Configure nftables firewall"
+    if grep -qE 'table inet clikader_filter' "$NFT_CONF" 2>/dev/null; then
+        bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$ssh_port" tcp || exit 1
+        if [[ -n "$extra_ports" ]]; then
+            bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$extra_ports" both || exit 1
+        fi
+        last_step=6
+        save_state
+        return 0
+    fi
+    clikader_lock nft || exit 1
+    tx_begin nft || exit 1
+    tx_save "$NFT_CONF" || exit 1
+    nft list table inet clikader_filter > "$TX_DIR/filter.nft" 2>/dev/null || : > "$TX_DIR/filter.nft"
+    restore_firewall() {
+        if [[ -s "$TX_DIR/filter.nft" ]]; then
+            printf 'add table inet clikader_filter\ndelete table inet clikader_filter\n' > "$TX_DIR/restore.nft"
+            cat "$TX_DIR/filter.nft" >> "$TX_DIR/restore.nft"
+            nft -f "$TX_DIR/restore.nft"
+        else
+            nft delete table inet clikader_filter 2>/dev/null || true
+        fi
+    }
+    # shellcheck disable=SC2034 # Consumed by the common transaction EXIT trap.
+    TX_ROLLBACK=restore_firewall
 
     # Migrate servers set up by older clikader versions that used ufw.
-    if command -v ufw &>/dev/null; then
+    if command -v ufw &>/dev/null && ufw status | grep -q '^Status: active'; then
         warning "ufw is installed; migrating its rules to nftables."
-        ufw --force disable 2>/dev/null || true
-        apt-get purge -y ufw || true
-        log "ufw disabled and removed"
+        error 'UFW is installed. Preserve/export its rules and remove it explicitly before switching firewall ownership.'
+        exit 1
     fi
 
     local nft_conf="${NFT_CONF:-/etc/nftables.conf}"
@@ -820,6 +978,7 @@ table inet clikader_filter {
         # 'udp sport 67 dport 68' fails 'nft -c' with "No symbol type
         # information" at the bare second 'dport' (ports 67=bootps, 68=bootpc).
         udp sport 67 udp dport 68 accept comment "DHCP client replies"
+        udp sport 547 udp dport 546 accept comment "DHCPv6 client replies"
 
         tcp dport { ${tcp_list} } accept comment "ssh + extra tcp ports"
 ${udp_rule}
@@ -903,7 +1062,9 @@ EOF
     nft list table inet clikader_filter
     last_step=6
     save_state
-}
+    record_managed nft "$NFT_CONF" || exit 1
+    tx_commit
+)
 
 # --- Step 7: fail2ban (SSH protection) ---
 # Pinned explicitly so the jail cannot silently fail:
@@ -915,10 +1076,14 @@ EOF
 #   * port must match the custom sshd port; the default `port = ssh` token
 #     resolves to 22 and would watch the wrong port.
 # A test ban at the end proves the journal->jail->nftables path really works.
-step_setup_fail2ban() {
+step_setup_fail2ban() (
     step_banner 7 "Configure fail2ban for SSH"
+    tx_begin fail2ban restore_fail2ban || exit 1
+    restore_fail2ban() { systemctl restart fail2ban; }
+    tx_save "$FAIL2BAN_JAIL" || exit 1
+    mkdir -p "$(dirname "$FAIL2BAN_JAIL")" || exit 1
     cat > "$FAIL2BAN_JAIL" <<EOF
-[DEFAULT]
+[sshd]
 # Never ban localhost, even under a flood of failed attempts.
 ignoreip = 127.0.0.1/8 ::1
 bantime = 3600
@@ -929,13 +1094,12 @@ maxretry = 5
 banaction = nftables-multiport
 banaction_allports = nftables-allports
 
-[sshd]
 enabled = true
 port = ${ssh_port}
 backend = systemd
 # Debian's unit is ssh.service; sshd.service is the upstream name. The '+'
 # ORs the two journal matches so either journal name is picked up.
-journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service
+journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session
 EOF
     log "Wrote $FAIL2BAN_JAIL (sshd port ${ssh_port}, backend systemd, nftables bans)"
 
@@ -949,7 +1113,10 @@ EOF
 
     systemctl enable --now fail2ban
     sleep 2
-    systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban
+    # Restart just this jail when its action changes. A plain reload on
+    # fail2ban 1.1 can remove both the old and new action, leaving a running
+    # jail that records bans but has "No actions" (caught by integration).
+    fail2ban-client reload --restart sshd || return 1
     sleep 2
     fail2ban-client status sshd
 
@@ -957,40 +1124,75 @@ EOF
     # 192.0.2.1 is TEST-NET-1 (RFC 5737 documentation range, never routable).
     local test_ip="192.0.2.1"
     if fail2ban-client set sshd banip "$test_ip" >/dev/null 2>&1; then
-        if nft list ruleset 2>/dev/null | grep -q "$test_ip"; then
+        local _attempt ban_visible=0
+        for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if nft list table inet f2b-table 2>/dev/null | grep -qF "$test_ip"; then ban_visible=1; break; fi
+            sleep 0.2
+        done
+        if (( ban_visible )); then
             log "Self-test passed: test ban ${test_ip} appeared in the nftables ruleset"
         else
-            warning "Self-test: ${test_ip} was banned but NOT found in 'nft list ruleset'."
-            warning "The banaction is broken; bans would be invisible to the firewall."
+            fail2ban-client set sshd unbanip "$test_ip" >/dev/null 2>&1 || true
+            nft list ruleset >&2 || true
+            fail2ban-client get sshd actions >&2 || true
+            tail -20 /var/log/fail2ban.log >&2 || true
+            error "Test ban ${test_ip} is missing from nftables"; exit 1
         fi
         fail2ban-client set sshd unbanip "$test_ip" >/dev/null 2>&1 || true
     else
-        warning "Self-test: 'fail2ban-client set sshd banip' failed; the sshd jail"
-        warning "may not be running. Check: systemctl status fail2ban"
+        error 'fail2ban test ban failed'; exit 1
     fi
+    verify_ssh_journal || exit 1
     info "Bans are logged to /var/log/fail2ban.log; live view: fail2ban-client get sshd banned"
     last_step=7
     save_state
+    record_managed fail2ban "$FAIL2BAN_JAIL" || exit 1
+    tx_commit
+)
+
+verify_ssh_journal() {
+    local since probe log_file
+    since="$(date '+%Y-%m-%d %H:%M:%S')"
+    probe="clikader-probe-$$"
+    log_file="$(mktemp)" || return 1
+    # Trigger a genuine SSH failure from localhost, which ignoreip prevents
+    # from banning the management connection. Inspect the same journal scope
+    # as the jail and prove the shipped filter recognizes the actual event.
+    ssh -F /dev/null -o BatchMode=yes -o PreferredAuthentications=none \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        -p "$ssh_port" "$probe@127.0.0.1" true >/dev/null 2>&1 || true
+    sleep 2
+    journalctl --since "$since" -o short-iso --no-pager \
+        _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session \
+        | grep -F "$probe" > "$log_file" || { rm -f "$log_file"; error 'SSH failures did not appear in the jail journal scope'; return 1; }
+    local report
+    report="$(fail2ban-regex "$log_file" /etc/fail2ban/filter.d/sshd.conf 2>&1)" || { rm -f "$log_file"; return 1; }
+    rm -f "$log_file"
+    grep -qE '[1-9][0-9]* matched' <<< "$report" || { error 'SSH journal messages did not match the fail2ban filter'; printf '%s\n' "$report" >&2; return 1; }
 }
 
 # --- Step 8: Run `clikader o` for the rest of onboarding ---
 step_run_onboard() {
     step_banner 8 "Run clikader onboarding (clikader o)"
-    if ! command -v clikader &>/dev/null; then
-        warning "'clikader' is not installed on PATH; skipping onboard step."
-        info "Install it with:"
-        echo "  curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash"
-        echo "Then run 'sudo clikader o' manually."
-    else
-        clikader o
-    fi
+    bash "$CLIKADER_ENTRYPOINT" o "--profile=$profile" "--${ipv6_policy}-ipv6" || return 1
     last_step=8
+    save_state
+}
+
+step_security_updates() {
+    step_banner 9 'Enable unattended security updates (manual reboot)'
+    bash "$MAINTENANCE_SCRIPT" enable-security-updates || return 1
+    last_step=9
     save_state
 }
 
 # --- Run a step by number, if not already completed ---
 run_step_if_needed() {
     local num="$1"
+    if [[ "$num" == 1 && ( "$debian_codename" != "$TARGET_CODENAME" || -n "$upgrade_pending" ) ]]; then
+        step_upgrade_debian
+        return $?
+    fi
     if (( last_step >= num )); then
         info "Step ${num} already completed; skipping."
         return 0
@@ -1004,6 +1206,7 @@ run_step_if_needed() {
         6) step_configure_nftables ;;
         7) step_setup_fail2ban ;;
         8) step_run_onboard ;;
+        9) step_security_updates ;;
         *) error "Unknown step ${num}"; return 1 ;;
     esac
 }
@@ -1016,6 +1219,12 @@ main() {
     echo ""
 
     detect_os
+    # Refuse conflicting firewall ownership before moving the SSH listener.
+    if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+        error 'UFW is active. Migrate or disable it explicitly before running setup.'
+        exit 1
+    fi
+    clikader_lock setup || exit 1
     log "Detected: Debian ${debian_major} (${debian_codename})"
 
     # --reset wipes state and starts completely fresh.
@@ -1029,7 +1238,18 @@ main() {
         completed_at=""
     fi
 
+    local requested_ipv6="$ipv6_policy" requested_profile="$profile"
     load_state || true
+    [[ "$requested_ipv6" == ask ]] || ipv6_policy="$requested_ipv6"
+    # Profile flags override state; absent flags preserve the saved profile.
+    if (( profile_explicit )); then profile="$requested_profile"; fi
+    if (( finish_upgrade )); then
+        [[ -n "$upgrade_pending" && "$debian_codename" == "$upgrade_pending" ]] || { error 'OS does not match the pending upgrade'; exit 1; }
+        [[ -z "$(dpkg --audit)" ]] || { error 'dpkg still reports incomplete packages'; exit 1; }
+        apt-get check || exit 1
+        upgrade_finished=1
+        save_state
+    fi
 
     # Refuse to re-run on an already-configured server unless forced.
     if (( clikader_setup_completed )) && (( ! force )); then
@@ -1049,6 +1269,7 @@ main() {
         clikader_setup_completed=0
         completed_at=""
     fi
+    ipv6_policy="$(choose_ipv6 "$ipv6_policy")" || exit 1
 
     # Resolve setup parameters. Precedence: CLI flags > saved state > prompt.
     # CLI flags win so an explicit `--ssh-port`/`--ssh-key` always applies.
@@ -1088,10 +1309,13 @@ main() {
     local step
     for step in $(seq 1 $TOTAL_STEPS); do
         run_step_if_needed "$step"
+        load_state || true
     done
 
     # All done: mark complete.
     clikader_setup_completed=1
+    last_step=9
+    ssh_password=""
     completed_at="$(date -Iseconds 2>/dev/null || date)"
     save_state
 

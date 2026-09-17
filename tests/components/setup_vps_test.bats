@@ -13,6 +13,12 @@ setup() {
     export AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
     export NFT_CONF="$BATS_TEST_TMPDIR/nftables.conf"
     export FAIL2BAN_JAIL="$BATS_TEST_TMPDIR/jail.local"
+    export UPGRADE_APT_LIST="$BATS_TEST_TMPDIR/sources.list"
+    export UPGRADE_APT_DIR="$BATS_TEST_TMPDIR/sources.list.d"
+    export BOOT_ID_FILE="$BATS_TEST_TMPDIR/boot-id"
+    mkdir -p "$UPGRADE_APT_DIR"
+    printf 'boot-one\n' > "$BOOT_ID_FILE"
+    printf 'deb https://deb.debian.org/debian bullseye main\n' > "$UPGRADE_APT_LIST"
     mkdir -p "$STATE_DIR" "$SSHD_CONF_DIR" "$SSH_DIR"
     : > "$GAI_CONF"
     printf '# sshd\nPort 22\n' > "$SSHD_CONFIG"
@@ -24,11 +30,15 @@ setup() {
     make_mock nft
     make_mock fail2ban-client
     make_mock chpasswd
+    make_mock ssh-keygen
     make_mock ss --out "LISTEN 0 128 0.0.0.0:2222 sshd"
-    make_mock ufw --status 1
     make_mock clikader
+    make_mock maintenance
+    export CLIKADER_ENTRYPOINT="$MOCK_BIN/clikader"
+    export MAINTENANCE_SCRIPT="$MOCK_BIN/maintenance"
     make_mock sleep
     load_component components/setup_vps.sh
+    verify_ssh_journal() { return 0; }
 }
 
 @test "escape_single_quotes: round-trips apostrophes" {
@@ -313,7 +323,7 @@ MOCK
     assert_output_contains "already set up"
 }
 
-@test "main: --reset wipes state file" {
+@test "main: reset replaces partial state and completes the mocked setup" {
     mkdir -p "$STATE_DIR"
     printf "last_step=3\n" > "$STATE_FILE"
     reset=1
@@ -322,10 +332,10 @@ MOCK
     cli_ssh_port=2222
     cli_ssh_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI me@h"
     cli_extra_ports="none"
-    # detect_os + steps will run; mock heavy ones by marking last_step high after reset
-    # Easier: just assert --reset path through the flag parser by invoking main --reset --help
-    run main --reset --help
+    run main
     [ "$status" -eq 0 ]
+    assert_file_contains "$STATE_FILE" 'clikader_setup_completed=1'
+    assert_file_contains "$STATE_FILE" 'last_step=9'
 }
 
 @test "step_ssh_hardening: key-only writes managed block and authorized_keys" {
@@ -434,4 +444,111 @@ MOCK
     run step_upgrade_debian
     [ "$status" -eq 0 ]
     assert_output_contains "Already on Debian"
+}
+
+@test "public key validation rejects malformed key material using real OpenSSH" {
+    rm "$MOCK_BIN/ssh-keygen"
+    run valid_ssh_pubkey 'ssh-ed25519 '
+    [ "$status" -eq 1 ]
+    run valid_ssh_pubkey 'ssh-ed25519 definitely-not-a-key'
+    [ "$status" -eq 1 ]
+    ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/key"
+    run valid_ssh_pubkey "$(cat "$BATS_TEST_TMPDIR/key.pub")"
+    [ "$status" -eq 0 ]
+}
+
+@test "bookworm resume after the bullseye hop schedules the second upgrade" {
+    debian_codename=bookworm
+    last_step=1
+    step_upgrade_debian() { echo second-hop; }
+    run run_step_if_needed 1
+    [ "$status" -eq 0 ]
+    assert_output_contains second-hop
+}
+
+@test "changing a resumed SSH port invalidates SSH and firewall steps" {
+    last_step=6
+    ssh_port=2222
+    cli_ssh_port=4444
+    apply_cli_inputs
+    [ "$last_step" -eq 4 ]
+    [ "$ssh_port" = 4444 ]
+}
+
+@test "release upgrade refuses to resume in the same boot" {
+    debian_codename=bookworm
+    upgrade_pending=bookworm
+    upgrade_finished=1
+    upgrade_boot_id="$(cat "$BOOT_ID_FILE")"
+    run step_upgrade_debian
+    [ "$status" -eq 1 ]
+    assert_output_contains 'Reboot before continuing'
+    ! grep -q apt-get "$MOCK_CFG_DIR/calls"
+}
+
+@test "state containing credentials is created private and atomically replaced" {
+    ssh_auth_method=password
+    ssh_password="credential with ' quote"
+    save_state
+    [ "$(stat -c %a "$STATE_FILE")" = 600 ]
+    [ "$(stat -c %a "$STATE_DIR")" = 700 ]
+    ssh_password=''
+    load_state
+    [ "$ssh_password" = "credential with ' quote" ]
+}
+
+@test "failed fail2ban ban verification cannot mark the step complete" {
+    ssh_port=2222
+    last_step=6
+    make_mock fail2ban-client --status 0
+    make_mock nft --out ''
+    run step_setup_fail2ban
+    [ "$status" -eq 1 ]
+    [ ! -f "$STATE_FILE" ]
+}
+
+@test "two release hops rewrite sources and require separate reboots" {
+    debian_codename=bullseye
+    run step_upgrade_debian
+    [ "$status" -eq 0 ]
+    load_state
+    [ "$upgrade_pending" = bookworm ]
+    [ "$upgrade_finished" = 1 ]
+    [ "$last_step" = 0 ]
+    assert_file_contains "$UPGRADE_APT_LIST" bookworm
+    printf 'boot-two\n' > "$BOOT_ID_FILE"
+    debian_codename=bookworm
+    run step_upgrade_debian
+    [ "$status" -eq 0 ]
+    load_state
+    [ "$upgrade_pending" = trixie ]
+    assert_file_contains "$UPGRADE_APT_LIST" trixie
+    printf 'boot-three\n' > "$BOOT_ID_FILE"
+    debian_codename=trixie
+    run step_upgrade_debian
+    [ "$status" -eq 0 ]
+    load_state
+    [ -z "$upgrade_pending" ]
+    [ "$last_step" = 1 ]
+}
+
+@test "release preflight rejects vendor and floating repositories before package changes" {
+    debian_codename=bullseye
+    printf 'deb https://vendor.example/debian bullseye main\n' > "$UPGRADE_APT_LIST"
+    run step_upgrade_debian
+    [ "$status" -eq 1 ]
+    ! grep -q apt-get "$MOCK_CFG_DIR/calls"
+    printf 'deb https://deb.debian.org/debian oldoldstable main\n' > "$UPGRADE_APT_LIST"
+    run step_upgrade_debian
+    [ "$status" -eq 1 ]
+    ! grep -q apt-get "$MOCK_CFG_DIR/calls"
+}
+
+@test "interrupted release upgrade is not mistaken for a completed hop" {
+    debian_codename=trixie
+    upgrade_pending=trixie
+    upgrade_finished=0
+    run step_upgrade_debian
+    [ "$status" -eq 1 ]
+    assert_output_contains 'was interrupted'
 }

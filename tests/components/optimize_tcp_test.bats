@@ -15,6 +15,8 @@ setup() {
     export INITCWND_SERVICE="$BATS_TEST_TMPDIR/systemd/clikader-tcp-initcwnd.service"
     export SWAPFILE_PATH="$BATS_TEST_TMPDIR/swapfile"
     export FSTAB="$BATS_TEST_TMPDIR/fstab"
+    export IFUP_HOOK_DIR="$BATS_TEST_TMPDIR/ifup"
+    export NM_DISPATCHER_DIR="$BATS_TEST_TMPDIR/nm-dispatcher"
     export MEM_TOTAL_KB=1048576     # 1GB
     export BANDWIDTH_MBPS=1000
     mkdir -p "$DROPIN_DIR" "$BACKUP_DIR" "$SYSTEMD_OVERRIDE_DIR"
@@ -36,7 +38,14 @@ elif [[ "$1" == "-w" ]]; then
     kv="$2"; key="${kv%%=*}"; val="${kv#*=}"
     printf '%s' "$val" > "$MOCK_CFG_DIR/sysctl.$(enc "$key")"
     exit 0
-elif [[ "$1" == "-p" || "$1" == "--system" ]]; then
+elif [[ "$1" == "-p" ]]; then
+    while IFS='=' read -r key val; do
+        key="$(xargs <<< "$key")"; val="$(xargs <<< "$val")"
+        [[ -n "$key" && "$key" != \#* ]] || continue
+        printf '%s' "$val" > "$MOCK_CFG_DIR/sysctl.$(enc "$key")"
+    done < "$2"
+    exit 0
+elif [[ "$1" == "--system" ]]; then
     exit 0
 fi
 exit 0
@@ -314,7 +323,7 @@ set_sysctl() {
 @test "verify_applied: warns when live values do not match desired" {
     build_desired
     run verify_applied
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     assert_output_contains "Verify:"
 }
 
@@ -336,7 +345,8 @@ set_sysctl() {
     [ -f "$INITCWND_SERVICE" ]
     mock_last_args ip | grep -q "route replace"
     mock_last_args ip | grep -q "initcwnd 32"
-    grep -q "proto dhcp metric 100" "$INITCWND_SERVICE"
+    grep -q 'ip -4 route show default' "$BACKUP_DIR/initcwnd.sh"
+    ! grep -q '10.0.0.1' "$INITCWND_SERVICE"
 }
 
 @test "apply_initcwnd: uses networkd-dispatcher hook when available" {
@@ -404,4 +414,32 @@ set_sysctl() {
     run do_apply
     [ "$status" -eq 0 ]
     grep -q "vm.swappiness" "$DROPIN"
+}
+
+@test "dry run never loads modules or writes persistent files" {
+    make_mock modprobe --status 0
+    run do_dryrun
+    [ "$status" -eq 0 ]
+    [ ! -f "$BBR_MODULE_FILE" ]
+    ! grep -q '^modprobe' "$MOCK_CFG_DIR/calls"
+}
+
+@test "revert preserves unrelated settings added after apply" {
+    run do_apply
+    [ "$status" -eq 0 ]
+    printf 'unrelated.setting=7\n' >> "$SYSCONF"
+    printf 'app hard nofile 8192\n' >> "$LIMITS_FILE"
+    run do_revert
+    [ "$status" -eq 0 ]
+    assert_file_contains "$SYSCONF" 'unrelated.setting=7'
+    assert_file_contains "$LIMITS_FILE" 'app hard nofile 8192'
+}
+
+@test "failed swapoff preserves the owned swapfile and fstab entry" {
+    apply_swap 1G
+    make_mock swapoff --status 1
+    run revert_swap
+    [ "$status" -eq 1 ]
+    [ -f "$SWAPFILE_PATH" ]
+    assert_file_contains "$FSTAB" "$SWAPFILE_PATH"
 }

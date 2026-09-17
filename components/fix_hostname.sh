@@ -4,6 +4,7 @@
 # Supports: Debian 11/12/13, Ubuntu 20.04/22.04/24.04/24.10
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -17,6 +18,13 @@ NC='\033[0m' # No Color
 # File paths (env-overridable so tests can target temp files; defaults unchanged)
 HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
 HOSTNAME_FILE="${HOSTNAME_FILE:-/etc/hostname}"
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) echo 'Usage: clikader hostname [--fix|--check]'; exit 0 ;;
+        --fix|--check) ;;
+        *) echo "Unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
 
 # Logging functions
 log() {
@@ -61,7 +69,8 @@ get_current_hostname() {
 
 # Check if hostname resolves
 check_hostname_resolution() {
-    local current_hostname=$(get_current_hostname)
+    local current_hostname
+    current_hostname="$(get_current_hostname)" || return 1
     
     echo ""
     log "Current hostname: ${BOLD}${current_hostname}${NC}"
@@ -69,7 +78,8 @@ check_hostname_resolution() {
     
     # Check if hostname resolves
     if getent hosts "$current_hostname" > /dev/null 2>&1; then
-        local resolved_ip=$(getent hosts "$current_hostname" | awk '{print $1}')
+        local resolved_ip
+        resolved_ip="$(getent hosts "$current_hostname" | awk '{print $1}')" || return 1
         log "✅ Hostname resolves to: $resolved_ip"
         
         if [[ "$resolved_ip" == "127.0.0.1" ]] || [[ "$resolved_ip" == "127.0.1.1" ]] || [[ "$resolved_ip" == "::1" ]]; then
@@ -86,8 +96,9 @@ check_hostname_resolution() {
 }
 
 # Fix hostname resolution
-fix_hostname_resolution() {
-    local current_hostname=$(get_current_hostname)
+fix_hostname_resolution() (
+    local current_hostname
+    current_hostname="$(get_current_hostname)" || exit 1
     
     echo ""
     echo "=========================================="
@@ -97,30 +108,10 @@ fix_hostname_resolution() {
     
     log "Current hostname: ${BOLD}${current_hostname}${NC}"
     
-    # Backup HOSTS_FILE
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    cp "$HOSTS_FILE" "${HOSTS_FILE}.backup_${timestamp}"
-    log "✅ Backed up $HOSTS_FILE to ${HOSTS_FILE}.backup_${timestamp}"
-    
-    # Check if hostname is already in HOSTS_FILE
-    if grep -qE "^127\.0\.(0\.1|1\.1)[[:space:]]+.*${current_hostname}" "$HOSTS_FILE"; then
-        log "Hostname entry already exists in $HOSTS_FILE, updating..."
-        # Remove existing entries
-        sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" "$HOSTS_FILE"
-        sed -i "/[[:space:]]${current_hostname}\$/d" "$HOSTS_FILE"
-    fi
-    
-    # Add hostname to HOSTS_FILE
-    # Check if 127.0.1.1 line exists
-    if grep -q "^127\.0\.1\.1" "$HOSTS_FILE"; then
-        # Update existing 127.0.1.1 line
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${current_hostname}/" "$HOSTS_FILE"
-        log "✅ Updated 127.0.1.1 entry with hostname: ${current_hostname}"
-    else
-        # Add new 127.0.1.1 line after 127.0.0.1
-        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${current_hostname}" "$HOSTS_FILE"
-        log "✅ Added new entry: 127.0.1.1 ${current_hostname}"
-    fi
+    clikader_lock hostname || exit 1
+    tx_begin hostname || exit 1
+    tx_save "$HOSTS_FILE" || exit 1
+    rewrite_hosts "$current_hostname" "$current_hostname" || exit 1
     
     echo ""
     log "Current $HOSTS_FILE content:"
@@ -129,24 +120,50 @@ fix_hostname_resolution() {
     echo ""
     
     # Verify resolution
-    if getent hosts "$current_hostname" > /dev/null 2>&1; then
-        local resolved_ip=$(getent hosts "$current_hostname" | awk '{print $1}')
+    if check_hostname_resolution; then
+        local resolved_ip
+        resolved_ip="$(getent hosts "$current_hostname" | awk '{print $1}')" || exit 1
         log "✅ Hostname now resolves to: $resolved_ip"
         echo ""
         echo -e "${GREEN}========================================${NC}"
         echo -e "${GREEN}Hostname resolution fixed successfully!${NC}"
         echo -e "${GREEN}========================================${NC}"
         echo ""
+        record_managed hostname "$HOSTS_FILE" || exit 1
+        tx_commit
         return 0
     else
         error "Failed to fix hostname resolution"
         return 1
     fi
+)
+
+# Parse aliases as tokens, never as a regex and never discard unrelated names.
+rewrite_hosts() {
+    local old="$1" new="$2" tmp
+    tmp="$(mktemp "${HOSTS_FILE}.XXXXXX")" || return 1
+    if ! awk -v old="$old" -v new="$new" '
+        /^[[:space:]]*#/ || NF == 0 { print; next }
+        {
+            line=$0; sub(/#.*/, "", line); n=split(line, fields, /[[:space:]]+/)
+            out=""; aliases=0
+            for (i=1; i<=n; i++) {
+                if (fields[i] == "") continue
+                if (out == "") { out=fields[i]; continue }
+                if (fields[i] != old && fields[i] != new) { out=out "\t" fields[i]; aliases++ }
+            }
+            if (aliases) { if (index($0,"#")) out=out " " substr($0,index($0,"#")); print out }
+        }
+        END { print "127.0.1.1\t" new }
+    ' "$HOSTS_FILE" > "$tmp"; then rm -f "$tmp"; return 1; fi
+    chmod --reference="$HOSTS_FILE" "$tmp" || return 1
+    mv -f "$tmp" "$HOSTS_FILE"
 }
 
 # Change hostname
-change_hostname() {
-    local current_hostname=$(get_current_hostname)
+change_hostname() (
+    local current_hostname
+    current_hostname="$(get_current_hostname)" || exit 1
     local new_hostname=""
     
     echo ""
@@ -205,51 +222,47 @@ change_hostname() {
     
     echo ""
     log "Changing hostname..."
+    clikader_lock hostname || exit 1
+    restore_hostname() { hostname "$current_hostname"; }
+    tx_begin hostname restore_hostname || exit 1
+    tx_save "$HOSTS_FILE" "$HOSTNAME_FILE" || exit 1
     
     # Set hostname using hostnamectl (systemd)
     if command -v hostnamectl &> /dev/null; then
-        hostnamectl set-hostname "$new_hostname"
+        hostnamectl set-hostname "$new_hostname" || exit 1
         log "✅ Set hostname using hostnamectl"
     else
         # Fallback for systems without systemd
-        echo "$new_hostname" > "$HOSTNAME_FILE"
-        hostname "$new_hostname"
+        echo "$new_hostname" > "$HOSTNAME_FILE" || exit 1
+        hostname "$new_hostname" || exit 1
         log "✅ Updated $HOSTNAME_FILE and current hostname"
     fi
     
-    # Update HOSTS_FILE
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    cp "$HOSTS_FILE" "${HOSTS_FILE}.backup_${timestamp}"
-    log "✅ Backed up $HOSTS_FILE"
-    
-    # Remove old hostname entries
-    sed -i "/[[:space:]]${current_hostname}[[:space:]]*$/d" "$HOSTS_FILE"
-    sed -i "/[[:space:]]${current_hostname}\$/d" "$HOSTS_FILE"
-    
-    # Add new hostname to HOSTS_FILE
-    if grep -q "^127\.0\.1\.1" "$HOSTS_FILE"; then
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${new_hostname}/" "$HOSTS_FILE"
-    else
-        sed -i "/^127\.0\.0\.1/a 127.0.1.1\t${new_hostname}" "$HOSTS_FILE"
-    fi
+    rewrite_hosts "$current_hostname" "$new_hostname" || exit 1
     
     log "✅ Updated $HOSTS_FILE with new hostname"
     
     echo ""
     log "Verifying hostname change..."
     
-    local verify_hostname=$(get_current_hostname)
+    local verify_hostname
+    verify_hostname="$(get_current_hostname)" || exit 1
     if [[ "$verify_hostname" == "$new_hostname" ]]; then
         log "✅ Hostname verified: $verify_hostname"
     else
-        warning "Hostname verification mismatch (this may require a reboot)"
+        error "Hostname verification mismatch"; exit 1
     fi
     
     # Check resolution
     if getent hosts "$new_hostname" > /dev/null 2>&1; then
-        local resolved_ip=$(getent hosts "$new_hostname" | awk '{print $1}')
+        local resolved_ip
+        resolved_ip="$(getent hosts "$new_hostname" | awk '{print $1}')" || exit 1
         log "✅ New hostname resolves to: $resolved_ip"
+    else
+        error 'New hostname does not resolve'; exit 1
     fi
+    record_managed hostname "$HOSTS_FILE" "$HOSTNAME_FILE" || exit 1
+    tx_commit
     
     echo ""
     echo -e "${GREEN}========================================${NC}"
@@ -262,7 +275,7 @@ change_hostname() {
     info "Note: Some services may require restart to recognize the new hostname"
     info "You may need to reconnect your SSH session"
     echo ""
-}
+)
 
 # Display interactive menu
 show_menu() {
@@ -288,8 +301,8 @@ main() {
     # Non-interactive modes (skip the menu).
     case "$HOSTNAME_MODE" in
         check)
-            check_hostname_resolution || true
-            return 0
+            check_hostname_resolution
+            return $?
             ;;
         fix)
             echo ""

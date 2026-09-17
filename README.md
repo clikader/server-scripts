@@ -21,7 +21,13 @@ clikader --help
 - ✅ Run from anywhere with `clikader`
 - ✅ Version tracking
 
-**Note:** All component scripts are downloaded automatically from GitHub when needed.
+The installer resolves a Git commit once and installs the complete toolbox under
+`/usr/local/lib/clikader/releases/`. The command points at the active bundle;
+component commands work without contacting GitHub. A failed update keeps the
+previous bundle usable. `clikader update --rollback` switches back offline.
+
+Existing single-file installations should run the Quick Start installer once to
+migrate to the bundled layout. After migration, use `clikader update` normally.
 
 ---
 
@@ -33,7 +39,7 @@ Master entrypoint with direct sub-commands for all server management tasks.
 **Features:**
 - Direct command execution with aliases
 - Built-in update command with version checking
-- Automatically downloads component scripts from GitHub if not found locally
+- Complete, revision-pinned installation with atomic bundle updates
 - Color-coded interface
 
 **Commands:**
@@ -47,6 +53,8 @@ Master entrypoint with direct sub-commands for all server management tasks.
 - `clikader apt-reset` / `clikader aptreset`
 - `clikader hostname`
 - `clikader ipv6` / `clikader 6`
+- `clikader doctor` / `clikader status` (also `--json`)
+- `clikader maintenance --help`
 
 ---
 
@@ -64,7 +72,19 @@ One-shot setup for a freshly installed Debian server. Runs the full baseline:
 5. SSH hardening — custom port, and either key-only auth (default: `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, your public key) or password login (`--password`: `PermitRootLogin yes`, `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, root password set); neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
 6. Configure nftables — **inbound-only**: allow the SSH port + custom ports, drop everything else *addressed to this host*. Forwarded traffic (containers) is never filtered — a `forward` drop policy silently breaks every container, since container traffic never traverses the input chain — and output is never filtered
 7. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
-8. Run `clikader o` for the remaining onboarding (DNS, TCP, APT, IPv6, hostname)
+8. Run onboarding (profile-dependent DNS, TCP and APT; IPv6 policy; hostname)
+9. Enable unattended **security-only** updates, with automatic reboots disabled
+
+The default `--profile=proxy` retains public DNS, relay-oriented TCP tuning and
+official APT sources. `--profile=general` preserves provider DNS, repository
+configuration and existing TCP/routing settings. Both profiles configure SSH,
+the host firewall, fail2ban, time synchronization and security updates.
+
+Before networking changes, setup asks whether to **keep IPv6** only when a usable
+global IPv6 address is present. The default answer is **no**. Without a global
+address it disables IPv6 without asking. Use `--keep-ipv6` or `--disable-ipv6` for
+automation; the choice is saved across upgrade reboots. Link-local, tentative,
+deprecated and duplicate-address-failed addresses do not trigger the question.
 
 Prompts for the SSH port, the login method (SSH key or password), and any extra ports
 to open — or pass them as flags for a fully non-interactive run. Survives the
@@ -76,6 +96,16 @@ so re-running `clikader setup` after the reboot resumes from where it stopped.
 - `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`) — key-only login
 - `--password <password>` — root SSH password; enables password login instead of a key (mutually exclusive with `--ssh-key`)
 - `--additional-ports <ports>` — extra ports to open in nftables, comma/space separated (e.g. `36158,443`)
+- `--profile=proxy|general` — select the onboarding policy (default: proxy)
+- `--keep-ipv6` / `--disable-ipv6` — explicitly choose the IPv6 policy
+- `--finish-upgrade` — acknowledge an interrupted release upgrade after repairing
+  packages with `dpkg --configure -a` and `apt-get full-upgrade`
+
+Release upgrades use one codename hop per reboot. The saved boot ID prevents
+continuing in the same boot; interrupted upgrades require explicit repair.
+Third-party or floating-suite APT sources must be resolved before a major upgrade.
+Changing SSH parameters during resume invalidates the dependent SSH/firewall steps.
+On Debian 13, setup refreshes package indexes and applies package updates too.
 
 **Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
 will refuse to run again. Use `--force` to re-run the whole flow or `--reset` to wipe
@@ -86,10 +116,10 @@ state and start over.
 sudo clikader setup
 
 # Fully non-interactive — key login
-sudo clikader setup --ssh-port 14419 --ssh-key "ssh-ed25519 AAAA... me@host" --additional-ports 36158,443
+sudo clikader setup --ssh-port 14419 --ssh-key "$(cat ~/.ssh/id_ed25519.pub)" --additional-ports 36158,443 --disable-ipv6
 
 # Fully non-interactive — password login (sets the root password, enables password auth)
-sudo clikader setup --ssh-port 14419 --password "S3curePassw0rd!" --additional-ports 36158,443
+sudo clikader setup --ssh-port 14419 --password "S3curePassw0rd!" --additional-ports 36158,443 --disable-ipv6
 
 # After the upgrade reboot (auto-resumes from where it stopped)
 sudo clikader setup
@@ -106,7 +136,8 @@ sudo clikader setup --reset    # wipe state and start fresh
 - `/root/.ssh/authorized_keys` (your public key in key mode; untouched in password mode)
 - root account password (set via `chpasswd` in password mode)
 - `/etc/nftables.conf` (clikader-owned `clikader_filter`/`clikader_nat` tables) + `.backup_<timestamp>`
-- `/etc/fail2ban/jail.local`
+- `/etc/fail2ban/jail.d/99-clikader.local` (existing jails are preserved)
+- `/etc/apt/apt.conf.d/99-clikader-security`
 - `/etc/clikader/setup.state` (saved answers + progress)
 
 ---
@@ -116,20 +147,22 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 
 **Supported Systems:**
 - Debian 13 (Trixie), 12 (Bookworm), 11 (Bullseye)
-- Ubuntu 24.10, 24.04 LTS, 22.04 LTS, 20.04 LTS
+- Ubuntu 26.04 LTS, 24.04 LTS, 22.04 LTS, 20.04 LTS
+- Ubuntu ARM64 and other ports architectures use `ports.ubuntu.com`
 
 **Features:**
 - Automatic backup of existing sources
 - Supports both traditional `.list` and modern DEB822 `.sources` formats
-- Cleans all third-party sources (`.list`, `.sources`, `.gpg`, backups)
-- Updates and verifies APT cache
+- Replaces active third-party `.list` / `.sources` files; preserves inactive backups, keys and official Ubuntu Pro/ESM feeds
+- Rejects unsupported releases/architectures before cleanup
+- Authenticates repository metadata and restores previous sources on update failure
+- `--help` is read-only; unknown arguments are rejected
 
 **Files modified by this script:**
 - `/etc/apt/sources.list`
-- `/etc/apt/sources.list.d/ubuntu.sources` (Ubuntu 24.04/24.10 DEB822 mode)
-- `/etc/apt/sources.list.d/*` (removes third-party `*.list`, `*.sources`, `*.list.save`, `*.distUpgrade`, `*.gpg`)
-- `/etc/apt/sources.list.save` (removed when present)
-- `/etc/apt/sources.list.backup_<timestamp>/` (created for backups)
+- `/etc/apt/sources.list.d/ubuntu.sources` (supported Ubuntu LTS releases)
+- `/etc/apt/sources.list.d/*` (replaces active `*.list` and `*.sources`)
+- `/var/lib/clikader/transactions/apt/` (configuration snapshots)
 
 ---
 
@@ -143,18 +176,22 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 
 **Features:**
 - Defaults to plain direct-IP DNS
-- Optional secure DNS with DNS-over-TLS (DoT) and DNSSEC validation (forward mode)
+- Optional strict, certificate-validated DNS-over-TLS (DoT) and DNSSEC validation (forward mode)
 - IPv6 support (optional)
 - **Auto mode (default):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies
 - Manually select specific providers if preferred
 - Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
-- Static last-resort `FallbackDNS` (OpenDNS — operator-independent) for when all primaries are down. systemd-resolved consults it only when no `DNS=` server is configured at all, so it does **not** cover a dead unbound in recursive mode
+- Static `FallbackDNS` is used only when no DNS server is configured; it does **not** rescue unreachable configured servers
 - **Negative caching disabled** (`Cache=no-negative`, or `Cache=no` on systemd < 250): a cached stale NODATA answer pins ACME DNS-01 challenges (1Panel/lego, certbot, acme.sh) for the zone's SOA minimum — 30 minutes on Cloudflare zones — and hangs certificate issuance. The setting is also pinned in a drop-in so hand-edits of `resolved.conf` can't revert it
 - Automatic conflict resolution
+- Refuses forward-mode cutover if all provider probes fail
+- Restores configuration and service state after failed cutover or resolution verification
+- Recursive mode requires a DNSSEC trust anchor and disables aggressive NSEC synthesis
 
 **Files modified by this script:**
 - `/etc/systemd/resolved.conf`
 - `/etc/systemd/resolved.conf.d/10-setup-dns-cache.conf` (pins the `Cache=` setting)
+- `/etc/systemd/resolved.conf.d/zz-clikader-dns.conf` (authoritative managed settings)
 - `/etc/resolv.conf` (re-created as symlink to systemd-resolved stub)
 - `/etc/dhcp/dhclient.conf`
 - `/etc/network/if-up.d/resolved` (removes execute permission when present)
@@ -179,7 +216,10 @@ sudo: unable to resolve host your-hostname
 **Files modified by this script:**
 - System hostname configuration (via `hostnamectl`; fallback writes `/etc/hostname`)
 - `/etc/hosts`
-- `/etc/hosts.backup_<timestamp>` (created before changes)
+- `/var/lib/clikader/transactions/hostname/` (configuration snapshots)
+
+Hosts-file edits preserve `localhost` and unrelated aliases. Failed hostname
+verification restores the previous files and runtime hostname.
 
 ---
 
@@ -196,16 +236,17 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 - Automatic verification and connectivity testing
 
 **Files modified by this script:**
-- `/etc/sysctl.d/99-disable-ipv6.conf` (created/removed depending on enable/disable action)
-- `/etc/sysctl.conf` (removes `disable_ipv6` lines during enable action)
+- `/etc/sysctl.d/zz-clikader-ipv6.conf` (persistent enable/disable policy)
+- `/etc/sysctl.conf` (conflicting IPv6 policy entries are tagged and commented)
 - `/etc/network/interfaces` (only when interface-based persistent config is selected)
-- `/etc/network/interfaces.backup_<timestamp>` (created before editing `/etc/network/interfaces`)
+- Native network configuration: Netplan overlays, networkd drop-ins, or the active NetworkManager connection
+- `/var/lib/clikader/transactions/ipv6*/` (configuration snapshots)
 
 **What it does:**
-- **Enable:** Removes disable configuration, enables IPv6 on all interfaces, tests connectivity
-- **Disable:** Creates `/etc/sysctl.d/99-disable-ipv6.conf` with persistent disable settings
+- **Enable:** Persists an enabled policy without restarting IPv4 networking
+- **Disable:** Creates `/etc/sysctl.d/zz-clikader-ipv6.conf` with persistent disable settings
 - **Configure Address:** 
-  - Checks for existing IPv6 addresses and warns user
+  - Preserves existing IPv6 addresses
   - Allows adding addresses from your allocated prefix (e.g., `2001:db8::/48`)
   - Supports CIDR notation like `2001:db8::1/64`
   - Keeps existing addresses (adds, doesn't replace)
@@ -214,17 +255,27 @@ Enable or disable IPv6 on Debian/Ubuntu systems, or manually configure IPv6 addr
 - `/etc/network/interfaces` (Debian/Ubuntu)
 - Netplan (Ubuntu 18.04+)
 - NetworkManager
-- Manual configuration
+- systemd-networkd, including provider-generated network files
+
+```bash
+sudo clikader ipv6 --address 2001:db8::2/64 --interface eth0 --gateway fe80::1
+```
+
+The gateway is optional; omit it to preserve routing. Netplan IDs are inferred
+from the active backend; `--netplan-id` handles custom IDs. Unsupported network
+managers are rejected before applying temporary-only addresses. Address additions
+are verified after duplicate-address detection and persisted for reboot.
 
 ---
 
 ### 6. NFTables Port Manager (`nft` / `nftables`)
 Manage the inbound TCP/UDP allowlist in the clikader-managed `/etc/nftables.conf`
-without hand-editing the ruleset. Only the two clikader allow rules are touched
+without hand-editing the ruleset. Only the unambiguous allow rules inside
+`table inet clikader_filter` → `chain input` are touched
 (`tcp dport { ... } accept comment "ssh + extra tcp ports"` and its UDP
 counterpart); forward/nat chains and any user additions are left intact. Every
-change is validated with `nft -c` before reloading, and a timestamped backup of
-`/etc/nftables.conf` is kept. The file is applied with `nft -f` — never
+change is validated with `nft -c` before reloading, and a configuration snapshot
+is kept. Only the managed filter table is applied with `nft -f` — never
 `systemctl restart nftables`, because Debian's unit declares
 `ExecStop=/usr/sbin/nft flush ruleset`, making a restart a **global** flush that
 also deletes Docker's `ip filter`/`ip nat` rules (killing all container
@@ -245,8 +296,10 @@ directly, exactly as `docker run -p` implies — bind a published port to
 - `clikader nft delete <ports>` — remove `<ports>` from the allowlist (both tcp and udp); the SSH port is protected and skipped (if mixed with other ports, the others are still deleted and a warning is shown)
 - `clikader nft reset [-y]` — clear the allowlist except the SSH port (grabbed from the effective sshd config); `-y` skips the confirmation prompt
 
-**Safety:** the SSH port is always kept in the TCP allow set and is protected
-from `delete`/`reset`, so this tool can never lock you out.
+All effective SSH ports, live sshd listeners, ssh.socket listeners and the current
+SSH connection port are protected. The manager refuses to guess if it cannot
+identify SSH ports. Host firewall checks cannot verify a provider's external
+firewall or security-group rules.
 
 ```bash
 sudo clikader nft                          # interactive menu
@@ -258,15 +311,54 @@ sudo clikader nft reset -y                 # same, without confirmation
 ```
 
 **Files modified by this script:**
-- `/etc/nftables.conf` (the two clikader allow rules only) + `.backup_<timestamp>`
+- `/etc/nftables.conf` (managed input allow rules only)
+- `/var/lib/clikader/transactions/nft/` (persistent and live-table snapshots)
+
+### 7. TCP / relay tuning
+
+`clikader tcp` applies the proxy workload profile. `--dry-run` is read-only;
+`--status` displays current settings. Unsupported kernel keys are skipped, but a
+supported setting that fails verification makes the operation fail and roll back.
+`--revert` removes owned settings while preserving later unrelated administrator
+edits. `--initcwnd` discovers current routes when applying its persistent hooks.
+`--swap 2G` is optional; a failed `swapoff` preserves the swapfile and fstab entry.
+
+### 8. Health and maintenance
+
+```bash
+sudo clikader doctor
+sudo clikader doctor --json
+sudo clikader maintenance enable-security-updates
+sudo clikader maintenance disable-security-updates
+sudo clikader maintenance upgrade
+sudo clikader maintenance backups
+sudo clikader maintenance prune
+```
+
+Doctor is read-only. It checks failed services, real SSH listeners, DNS, managed
+firewall policy, fail2ban, configuration hashes, live TCP settings, disk/inode and
+memory pressure, pending package upgrades and reboots, and security-update policy.
+Exit codes: `0` healthy, `1` warnings/failures, `2` usage/dependency error. Package
+availability uses existing APT indexes; doctor does not refresh or install packages.
+
+Security updates are automatic after setup, but reboots are always manual. The
+manual `maintenance upgrade` command refreshes indexes and upgrades packages
+without initiating a distribution upgrade.
+
+Configuration transactions live in `/var/lib/clikader/transactions/`; ownership
+hashes live in `/var/lib/clikader/managed/`. Failed configuration changes restore
+their files and supported runtime state. The newest five committed snapshots per
+component are retained; `maintenance prune` removes snapshots older than 30 days.
+These are configuration snapshots, not application-data or full-server backups.
+OS/package upgrades cannot be undone by a configuration snapshot.
 
 ---
 
 ## 🔧 Requirements
 
-- **OS**: Debian 11/12/13 or Ubuntu 20.04/22.04/24.04/24.10
+- **OS**: Debian 11/12/13 or Ubuntu 20.04/22.04/24.04/26.04 (full VPS setup is Debian-only)
 - **Privileges**: Root access (sudo)
-- **Network**: Internet connection (for downloading scripts from GitHub)
+- **Network**: Internet for installation, updates and package operations; installed components run offline
 - **Shell runtime**: `bash` (scripts can be launched from `bash`, `zsh`, or `fish` as long as Bash is installed)
 
 ---
@@ -276,10 +368,12 @@ sudo clikader nft reset -y                 # same, without confirmation
 See [Quick Start](#-quick-start) above for installation instructions.
 
 **What the installer does:**
-1. Downloads `clikader` from GitHub
-2. Installs it to `/usr/local/bin/clikader`
-3. Makes it executable
-4. Verifies installation
+1. Resolves `main` to one immutable Git commit and downloads that bundle
+2. Validates required components and Bash syntax
+3. Installs the complete bundle under `/usr/local/lib/clikader/releases/`
+4. Atomically switches the active bundle and `/usr/local/bin/clikader` symlink
+
+To install a local checkout: `sudo bash install.sh --from "$PWD"`.
 
 After installation, you can run `clikader` from anywhere on your system.
 
@@ -300,7 +394,8 @@ sudo clikader update
 #   - Create a backup before updating
 ```
 
-**Automatic version detection** - only updates if a newer version is available.
+Updates compare bundle revisions. `sudo clikader update --yes` is non-interactive;
+`sudo clikader update --rollback` restores the previous installed bundle offline.
 
 ---
 
@@ -313,7 +408,7 @@ sudo clikader update
 - Error handling
 
 **Specific safeguards:**
-- **APT Reset**: Timestamped backups in `/etc/apt/sources.list.backup_*/`
+- **APT Reset**: Timestamped snapshots in `/var/lib/clikader/transactions/apt/`
 - **DNS Setup**: Health checks before modifications
 - **Hostname**: Validates hostname format (RFC 1123)
 - **IPv6**: Confirmation prompt before disabling
@@ -321,6 +416,16 @@ sudo clikader update
 ---
 
 ## 🧑‍💻 Development
+
+```bash
+just test         # Hermetic unit tests and real CLI failure-path regressions
+just coverage     # kcov line coverage, 80% gate
+just integration  # Disposable Linux/systemd container with real services
+```
+
+Integration checks exercise actual OpenSSH authentication, nftables application,
+fail2ban's journal/filter/ban path, Netplan generation and unattended-update
+configuration. The integration container is privileged and is removed on exit.
 
 ### Git hooks (keeping `clikader.sh` executable)
 

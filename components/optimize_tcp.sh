@@ -58,6 +58,7 @@
 #   --help            Show this help
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # --------------------------------------------------------------------------
 # Color / logging
@@ -68,7 +69,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
-DIM='\033[2m'
 NC='\033[0m'
 
 log()      { echo -e "${GREEN}-->${NC} $1"; }
@@ -124,15 +124,6 @@ FSTAB="${FSTAB:-/etc/fstab}"
 # --------------------------------------------------------------------------
 # Pre-flight
 # --------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root"
-    exit 1
-fi
-
-for d in "$DROPIN_DIR" "$BACKUP_DIR"; do
-    [[ -d "$d" ]] || mkdir -p "$d"
-done
-
 # --- Argument parsing ---
 MODE="apply"
 OPT_INITCWND=0
@@ -161,6 +152,12 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+if [[ $EUID -ne 0 && "$MODE" != status && "$MODE" != dryrun ]]; then
+    error 'This script must be run as root'; exit 1
+fi
+if [[ -n "${BANDWIDTH_MBPS:-}" && ! "$BANDWIDTH_MBPS" =~ ^[1-9][0-9]{0,6}$ ]]; then
+    error '--bandwidth must be a positive integer in Mbps'; exit 2
+fi
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -218,8 +215,7 @@ detect_bandwidth_mbps() {
         awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
     if [[ -n "$iface" ]]; then
         speed="$(cat "/sys/class/net/$iface/speed" 2>/dev/null || true)"
-        speed="${speed//[!0-9]/}"
-        if [[ -n "$speed" && "$speed" -gt 0 ]]; then echo "$speed"; return; fi
+        if [[ "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then echo "$speed"; return; fi
     fi
     echo 1000
 }
@@ -482,13 +478,11 @@ build_desired() {
 # pre-script state is preserved across re-applies).
 # --------------------------------------------------------------------------
 snapshot_live() {
-    if [[ -f "${BACKUP_DIR}/live-values.snapshot" ]]; then
-        return 0   # already have the original snapshot; keep it
-    fi
-    : > "${BACKUP_DIR}/live-values.snapshot"
+    touch "${BACKUP_DIR}/live-values.snapshot"
     local i key val
     for i in "${!DK_KEYS[@]}"; do
         key="${DK_KEYS[$i]}"
+        grep -qF "$key"$'\t' "${BACKUP_DIR}/live-values.snapshot" && continue
         val="$(get_live "$key")"
         # "key<TAB>value"; missing keys recorded empty so revert knows to skip.
         printf '%s\t%s\n' "$key" "$val" >> "${BACKUP_DIR}/live-values.snapshot"
@@ -507,13 +501,12 @@ backup_sysctl_conf() {
 # Idempotent: already-commented / already-marked lines are left as-is.
 neutralize_sysctl_conf() {
     [[ -f "$SYSCONF" ]] || return 0
-    local key re tmp
+    local key tmp
     tmp="$(mktemp)"
     cp -a "$SYSCONF" "${tmp}"
     for key in "${DK_KEYS[@]}"; do
         # Escape key for use in a regex (dots -> \.). Anchor at line start,
         # optional whitespace, then the key, then whitespace/= .
-        re="^([[:space:]]*)(${key//./\\.})([[:space:]]*=)"
         # Comment out lines that are active AND not already tagged by us.
         # Use perl for in-place safety; fall back to awk if perl is absent.
         if command -v perl >/dev/null 2>&1; then
@@ -522,6 +515,8 @@ neutralize_sysctl_conf() {
                     $_ = "# ['"${MARKER}"'] $_";
                 }
             ' "$tmp"
+        else
+            sed -i -E "s/^([[:space:]]*${key//./\\.}[[:space:]]*=)/# [${MARKER}] \1/" "$tmp"
         fi
     done
     cat "$tmp" > "$SYSCONF"
@@ -531,7 +526,7 @@ neutralize_sysctl_conf() {
 # Count how many of our keys were active in sysctl.conf (for reporting).
 count_neutralized() {
     [[ -f "$SYSCONF" ]] || { echo 0; return; }
-    grep -c "# \[${MARKER}\]" "$SYSCONF" 2>/dev/null || echo 0
+    grep -c "# \[${MARKER}\]" "$SYSCONF" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
@@ -570,9 +565,6 @@ apply_live() {
 # also drop a system-wide systemd override (DefaultLimitNOFILE) so sing-box etc.
 # actually inherit the higher limit on restart. See revert_files() for restore.
 apply_limits_files() {
-    local ts
-    ts="$(date +%Y%m%d_%H%M%S)"
-
     # 1) /etc/security/limits.conf — for interactive/PAM sessions.
     if [[ -f "$LIMITS_FILE" ]] && [[ ! -f "${BACKUP_DIR}/limits.conf.orig" ]]; then
         cp -a "$LIMITS_FILE" "${BACKUP_DIR}/limits.conf.orig"
@@ -644,6 +636,7 @@ verify_applied() {
         log "Verified: all ${#DK_KEYS[@]} keys match live state"
     else
         warning "${fails} key(s) did not take effect (see above)."
+        return 1
     fi
 }
 
@@ -688,11 +681,25 @@ apply_initcwnd() {
 
 persist_initcwnd() {
     local route="$1"
+    local helper="${BACKUP_DIR}/initcwnd.sh"
+    # Query the current route on every invocation. Never resurrect a gateway
+    # captured before a DHCP renewal or restore an obsolete route on revert.
+    cat > "$helper" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+while IFS= read -r route; do
+    [[ -n "$route" ]] || continue
+    cleaned="$(sed -E 's/[[:space:]]+initcwnd [0-9]+//g; s/[[:space:]]+initrwnd [0-9]+//g' <<< "$route")"
+    read -r -a words <<< "$cleaned"
+    ip route replace "${words[@]}" initcwnd 32 initrwnd 32
+done < <(ip -4 route show default)
+EOF
+    chmod 700 "$helper"
     if [[ -d "$INITCWND_HOOK_DIR" ]]; then
         cat > "${INITCWND_HOOK_DIR}/50-clikader-initcwnd" <<EOF
 #!/bin/sh
 # Managed by clikader tcp -- re-applies initcwnd when the route is recreated.
-ip route replace $route initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE 2>/dev/null || true
+exec /bin/bash "$helper"
 EOF
         chmod 0755 "${INITCWND_HOOK_DIR}/50-clikader-initcwnd"
         log "Wrote networkd-dispatcher hook ${INITCWND_HOOK_DIR}/50-clikader-initcwnd"
@@ -708,7 +715,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'ip route replace $route initcwnd $INITCWND_VALUE initrwnd $INITCWND_VALUE || true'
+ExecStart=/bin/bash "$helper"
 
 [Install]
 WantedBy=multi-user.target
@@ -717,14 +724,27 @@ EOF
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable --now "$(basename "$INITCWND_SERVICE")" 2>/dev/null || true
     fi
+    # Also cover ifupdown and NetworkManager route reconfiguration events.
+    local hook
+    for hook in "${IFUP_HOOK_DIR:-/etc/network/if-up.d}/clikader-initcwnd" \
+        "${NM_DISPATCHER_DIR:-/etc/NetworkManager/dispatcher.d}/90-clikader-initcwnd"; do
+        [[ -d "$(dirname "$hook")" ]] || continue
+        printf '#!/bin/sh\nexec /bin/bash "%s"\n' "$helper" > "$hook"
+        chmod 755 "$hook"
+    done
 }
 
 revert_initcwnd() {
     [[ -f "${BACKUP_DIR}/initcwnd.owned" ]] || return 0
     local route=""
-    if [[ -f "${BACKUP_DIR}/default-route.snapshot" ]]; then
-        route="$(cat "${BACKUP_DIR}/default-route.snapshot")"
-    fi
+    route="$(ip -4 route show default | head -1)"
+    local old old_cwnd old_rwnd
+    old="$(cat "${BACKUP_DIR}/default-route.snapshot" 2>/dev/null || true)"
+    old_cwnd="$(awk '{for(i=1;i<NF;i++) if($i=="initcwnd") print $(i+1)}' <<< "$old")"
+    old_rwnd="$(awk '{for(i=1;i<NF;i++) if($i=="initrwnd") print $(i+1)}' <<< "$old")"
+    route="$(sed -E 's/[[:space:]]+initcwnd [0-9]+//g; s/[[:space:]]+initrwnd [0-9]+//g' <<< "$route")"
+    [[ -z "$old_cwnd" ]] || route+=" initcwnd $old_cwnd"
+    [[ -z "$old_rwnd" ]] || route+=" initrwnd $old_rwnd"
     # Intentional word-splitting: $route is an ip-route token list.
     if [[ -n "$route" ]] && ip route replace $route 2>/dev/null; then
         log "Restored original default route (initcwnd removed)"
@@ -736,6 +756,8 @@ revert_initcwnd() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     rm -f "${BACKUP_DIR}/initcwnd.owned" "${BACKUP_DIR}/default-route.snapshot"
+    rm -f "${BACKUP_DIR}/initcwnd.sh" "${IFUP_HOOK_DIR:-/etc/network/if-up.d}/clikader-initcwnd" \
+        "${NM_DISPATCHER_DIR:-/etc/NetworkManager/dispatcher.d}/90-clikader-initcwnd"
 }
 
 # --------------------------------------------------------------------------
@@ -745,11 +767,13 @@ revert_initcwnd() {
 # --------------------------------------------------------------------------
 apply_swap() {
     local size="$1" gb
-    gb="${size%[Gg]}"; gb="${gb//[!0-9]/}"
-    if [[ -z "$gb" ]]; then
+    if [[ ! "$size" =~ ^[0-9]+[Gg]?$ ]]; then
         error "Invalid --swap size: '$size' (use e.g. 2G)"
         exit 2
     fi
+    gb="${size%[Gg]}"
+    [[ ${#gb} -le 2 ]] || { error 'Swap size must be 1-20G'; exit 2; }
+    gb=$((10#$gb))
     (( gb < 1 )) && gb=1
     (( gb > 20 )) && gb=20
     if [[ -e "$SWAPFILE_PATH" && ! -f "${BACKUP_DIR}/swapfile.owned" ]]; then
@@ -784,7 +808,8 @@ EOF
 revert_swap() {
     [[ -f "${BACKUP_DIR}/swapfile.owned" ]] || return 0
     if ! swapoff "$SWAPFILE_PATH" 2>/dev/null; then
-        warning "swapoff $SWAPFILE_PATH failed (was it active?)"
+        error "swapoff $SWAPFILE_PATH failed; preserving the swapfile and fstab entry"
+        return 1
     fi
     if [[ -f "$FSTAB" ]]; then
         sed -i '/# BEGIN clikader-tcp swap/,/# END clikader-tcp swap/d' "$FSTAB"
@@ -798,9 +823,29 @@ revert_swap() {
 # Modes
 # --------------------------------------------------------------------------
 
-do_apply() {
+do_apply() (
     section "TCP/network optimization — apply"
     take_lock
+    mkdir -p "$DROPIN_DIR" "$BACKUP_DIR"
+    local new_swap=0
+    [[ -e "$SWAPFILE_PATH" ]] || new_swap=1
+    restore_tcp_runtime() {
+        local key value
+        if [[ -f "$TX_DIR/runtime" ]]; then
+            while IFS=$'\t' read -r key value; do
+                [[ -z "$value" ]] || sysctl -w "$key=$value" >/dev/null || return 1
+            done < "$TX_DIR/runtime"
+        fi
+        if [[ -n "$OPT_SWAP" && "$new_swap" == 1 && -e "$SWAPFILE_PATH" ]]; then
+            if swapon --show=NAME --noheadings | grep -qxF "$SWAPFILE_PATH"; then
+                swapoff "$SWAPFILE_PATH" || return 1
+            fi
+            rm -f "$SWAPFILE_PATH" "$BACKUP_DIR/swapfile.owned"
+        fi
+        systemctl daemon-reload
+    }
+    tx_begin tcp restore_tcp_runtime || exit 1
+    tx_save "$DROPIN" "$SYSCONF" "$LIMITS_FILE" "$SYSTEMD_OVERRIDE" "$BBR_MODULE_FILE" "$FSTAB" || exit 1
 
     # Swap first: build_desired() includes vm.swappiness only when our swap
     # marker exists, so the drop-in written below picks it up on the same run.
@@ -809,6 +854,19 @@ do_apply() {
     fi
 
     build_desired
+    # Omit genuinely unavailable keys; failure to apply a supported key is fatal.
+    local present_keys=() present_vals=() present_why=() j
+    for j in "${!DK_KEYS[@]}"; do
+        if [[ -n "$(get_live "${DK_KEYS[$j]}")" ]]; then
+            present_keys+=("${DK_KEYS[$j]}"); present_vals+=("${DK_VALS[$j]}"); present_why+=("${DK_WHY[$j]}")
+        else
+            info "Unsupported kernel key skipped: ${DK_KEYS[$j]}"
+        fi
+    done
+    DK_KEYS=("${present_keys[@]}"); DK_VALS=("${present_vals[@]}"); DK_WHY=("${present_why[@]}")
+    for j in "${!DK_KEYS[@]}"; do
+        printf '%s\t%s\n' "${DK_KEYS[$j]}" "$(get_live "${DK_KEYS[$j]}")" >> "$TX_DIR/runtime"
+    done
 
     # BBR: warn clearly if the kernel can't do it; we still skip the CC key
     # rather than write a value that sysctl will reject.
@@ -832,7 +890,7 @@ do_apply() {
     neutralize_sysctl_conf
     write_dropin
     apply_live
-    verify_applied
+    verify_applied || { error 'TCP tuning failed verification; run clikader tcp --revert to restore the snapshot'; return 1; }
     apply_limits_files
     if conntrack_present; then
         apply_conntrack_hashsize
@@ -849,7 +907,9 @@ do_apply() {
     log "Set per-process nofile=${NOFILE_LIMIT} (limits.conf + systemd override)"
     echo -e "${GREEN}Done. Boot-time order is correct: zz- drop-in wins.${NC}"
     info "Proxy daemons (sing-box) must be restarted to pick up the new nofile limit."
-}
+    record_managed tcp "$DROPIN" "$SYSTEMD_OVERRIDE" "$LIMITS_FILE" || exit 1
+    tx_commit
+)
 
 do_revert() {
     section "TCP/network optimization — revert"
@@ -867,10 +927,7 @@ do_revert() {
     fi
 
     # 2. Restore original /etc/sysctl.conf (un-neutralizes any keys we tagged).
-    if [[ -f "${BACKUP_DIR}/sysctl.conf.orig" ]]; then
-        cp -a "${BACKUP_DIR}/sysctl.conf.orig" "$SYSCONF"
-        log "Restored original ${SYSCONF}"
-    else
+    if [[ -f "$SYSCONF" ]]; then
         # No backup (e.g. sysctl.conf didn't exist originally): just strip our
         # marker comments in case any remain.
         if [[ -f "$SYSCONF" ]] && grep -q "\[${MARKER}\]" "$SYSCONF"; then
@@ -878,6 +935,7 @@ do_revert() {
             log "Untagged marker comments in ${SYSCONF}"
         fi
     fi
+    sysctl --system >/dev/null 2>&1 || true
 
     # 3. Reapply the live snapshot so runtime returns to pre-script state.
     if [[ -f "${BACKUP_DIR}/live-values.snapshot" ]]; then
@@ -893,13 +951,9 @@ do_revert() {
     fi
 
     # 4. Reload from files so any non-snapshot drop-ins reassert themselves.
-    sysctl --system >/dev/null 2>&1 || true
 
     # 5. Restore file-descriptor limits (limits.conf + systemd override).
-    if [[ -f "${BACKUP_DIR}/limits.conf.orig" ]]; then
-        cp -a "${BACKUP_DIR}/limits.conf.orig" "$LIMITS_FILE"
-        log "Restored original ${LIMITS_FILE}"
-    elif [[ -f "$LIMITS_FILE" ]]; then
+    if [[ -f "$LIMITS_FILE" ]]; then
         # No backup: just strip our tagged block.
         sed -i '/# BEGIN clikader-tcp limits/,/# END clikader-tcp limits/d' "$LIMITS_FILE"
         log "Removed clikader-tcp block from ${LIMITS_FILE}"
@@ -917,6 +971,8 @@ do_revert() {
     # 7. Revert opt-in features (each is a no-op unless its marker exists).
     revert_initcwnd
     revert_swap
+    rm -f "$BACKUP_DIR/live-values.snapshot" "$BACKUP_DIR/sysctl.conf.orig" "$BACKUP_DIR/limits.conf.orig" \
+        "$CLIKADER_STATE_DIR/managed/tcp.sha256"
 
     echo ""
     echo -e "${GREEN}Reverted to pre-script state.${NC}"
@@ -929,7 +985,7 @@ do_revert() {
 do_dryrun() {
     section "TCP/network optimization — dry run (no changes will be made)"
     build_desired
-    if ! ensure_bbr; then
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
         warning "BBR unavailable on this kernel -> tcp_congestion_control would be SKIPPED."
     fi
     echo ""

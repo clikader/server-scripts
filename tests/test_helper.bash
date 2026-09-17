@@ -23,6 +23,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # fake executable with canned stdout/stderr/status. Every invocation is logged
 # to $MOCK_CFG_DIR/calls as "<name> <args...>".
 setup_mocks() {
+    export CLIKADER_STATE_DIR="${BATS_TEST_TMPDIR}/clikader-state"
+    export CLIKADER_LOCK_DIR="${BATS_TEST_TMPDIR}/locks"
     MOCK_BIN="${BATS_TEST_TMPDIR}/mockbin"
     MOCK_CFG_DIR="${BATS_TEST_TMPDIR}/mockcfg"
     mkdir -p "$MOCK_BIN" "$MOCK_CFG_DIR"

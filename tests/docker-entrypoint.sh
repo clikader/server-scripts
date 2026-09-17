@@ -25,12 +25,17 @@ fi
 
 echo "== Running bats under kcov (threshold: ${THRESHOLD}%) =="
 rm -rf "$COV_DIR"
-kcov \
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+if ! kcov \
     --include-path="$REPO" \
     --exclude-path="${REPO}/tests" \
     --clean \
     "$COV_DIR" \
-    bats "${REPO}/tests"/*.bats "${REPO}/tests/components"/*.bats
+    bats "${REPO}/tests"/*.bats "${REPO}/tests/components"/*.bats 2> "$tmp/kcov.log"; then
+    tail -60 "$tmp/kcov.log" >&2
+    exit 1
+fi
 
 # kcov writes a <binary>.<hash>/coverage.json per traced binary. Collect them
 # all and merge the line counts for our report (normally a single one).
@@ -45,8 +50,6 @@ if [[ ${#json_files[@]} -eq 0 ]]; then
 fi
 
 # Merge all files: sum lines per source file across the runs.
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 cat "${json_files[@]}" | jq -s '
     [ .[].files[] ] | group_by(.file) | map({
         file: .[0].file,

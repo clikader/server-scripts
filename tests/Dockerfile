@@ -29,6 +29,7 @@ RUN apt-get update \
         gawk \
         sed \
         perl \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

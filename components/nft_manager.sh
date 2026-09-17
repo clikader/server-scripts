@@ -11,15 +11,15 @@
 # be locked out by this tool.
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-NFT_MANAGER_REVISION="1.11.3"
+NFT_MANAGER_REVISION="1.12.0"
 
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
@@ -29,6 +29,7 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
+NFT_RULE_PARSER="$(dirname "${BASH_SOURCE[0]}")/../lib/nft_rules.awk"
 # The allowlist rules are identified by SHAPE — a braced dport set followed by
 # accept at the start of a line — never by their trailing comment.
 #
@@ -41,8 +42,6 @@ NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
 #
 # Braces stay escaped (\{ \}) so the same regex works under GNU sed (Debian
 # targets) and BSD sed (macOS dev/test). Group 1 is the line's indentation.
-TCP_RULE_RE='^([[:space:]]*)tcp dport \{[^}]*\} accept([[:space:]]+comment "[^"]*")?'
-UDP_RULE_RE='^([[:space:]]*)udp dport \{[^}]*\} accept([[:space:]]+comment "[^"]*")?'
 TCP_RULE_CMT='comment "ssh + extra tcp ports"'
 UDP_RULE_CMT='comment "extra udp ports"'
 
@@ -54,7 +53,8 @@ udp_ports=""
 valid_port() {
     local p="$1"
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
-    (( p >= 1 && p <= 65535 )) || return 1
+    [[ ${#p} -le 5 ]] || return 1
+    (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1
     return 0
 }
 
@@ -75,6 +75,7 @@ normalize_ports() {
             error "Invalid port '${p}'"
             return 1
         fi
+        p=$((10#$p))
         if [[ " $result " != *" $p "* ]]; then
             result+=" $p"
         fi
@@ -103,15 +104,17 @@ extract_set() {
 
 # --- Effective SSH port ---
 get_ssh_port() {
-    local p=""
-    p="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
-    if [[ -z "$p" ]]; then
-        p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+    local ports
+    ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true)"
+    # Include actual listeners (including ssh.socket) and this SSH session.
+    ports+=" $(ss -H -ltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}' || true)"
+    if systemctl is-active --quiet ssh.socket; then
+        ports+=" $(systemctl show ssh.socket -p Listen --value | grep -oE '[0-9]+ \(Stream\)' | cut -d' ' -f1 || true)"
     fi
-    if [[ -z "$p" ]]; then
-        p="22"
-    fi
-    printf '%s' "$p"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then ports+=" ${SSH_CONNECTION##* }"; fi
+    ports="$(printf '%s\n' $ports | sort -nu | xargs)"
+    [[ -n "$ports" ]] || { error 'Cannot determine SSH ports; refusing firewall changes.'; return 1; }
+    normalize_ports "$ports"
 }
 
 # Trailing `comment "..."` of a rule line, or empty when the line has none.
@@ -124,7 +127,10 @@ rule_comment() {
 # 1-based line number of the first line matching <re>, or empty.
 rule_line_number() {
     local re="$1"
-    grep -nE "$re" "$NFT_CONF" 2> /dev/null | head -n1 | cut -d: -f1
+    awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | cut -f3- | grep -nE "$re" >/dev/null || return 1
+    awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | while IFS=$'\t' read -r number _protocol line; do
+        if [[ "$line" =~ $re ]]; then echo "$number"; break; fi
+    done
 }
 
 # --- Read current allow sets from nftables.conf ---
@@ -137,8 +143,8 @@ read_allow_sets() {
     udp_ports=""
     if [[ -f "$NFT_CONF" ]]; then
         local tcp_line="" udp_line=""
-        tcp_line="$(grep -E "$TCP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
-        udp_line="$(grep -E "$UDP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
+        tcp_line="$(awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | awk -F'\t' '$2=="tcp" {sub(/^[^\t]*\t[^\t]*\t/,""); print; exit}')"
+        udp_line="$(awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | awk -F'\t' '$2=="udp" {sub(/^[^\t]*\t[^\t]*\t/,""); print; exit}')"
         if [[ -n "$tcp_line" ]]; then tcp_ports="$(extract_set "$tcp_line")"; fi
         if [[ -n "$udp_line" ]]; then udp_ports="$(extract_set "$udp_line")"; fi
     fi
@@ -190,87 +196,60 @@ sed_inplace() {
 # Rewrites the TCP/UDP allow rules in place, preserving everything else in the
 # file (forward/nat chains, comments, user additions). Backs up first, and on
 # validation failure restores the backup and does not touch the firewall.
-rewrite_allowlist() {
-    local tcp_s="$1" udp_s="$2"
-    local ts
-    ts="$(date +%Y%m%d_%H%M%S)"
-
-    local tcp_line tcp_ln tcp_comment
-    tcp_line="$(grep -E "$TCP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
-    if [[ -z "$tcp_line" ]]; then
-        error "Cannot find the clikader TCP allow rule in ${NFT_CONF}."
-        error "Expected a line of the form:  tcp dport { 22, 8080 } accept comment \"...\""
-        error "Refusing to edit an unrecognized nftables.conf."
-        return 1
+rewrite_allowlist() (
+    local tcp_s="$1" udp_s="$2" matches tcp_ln udp_ln tcp_comment udp_comment
+    local tcp_rendered udp_rendered candidate scoped
+    matches="$(awk -f "$NFT_RULE_PARSER" "$NFT_CONF")" || exit 1
+    if [[ "$(awk -F'\t' '$2=="tcp" {n++} END {print n+0}' <<< "$matches")" != 1 ]]; then
+        error 'Cannot find the clikader TCP allow rule (require exactly one in inet clikader_filter/input).'
+        error 'Refusing to edit an unrecognized nftables.conf.'
+        exit 1
     fi
-    tcp_ln="$(rule_line_number "$TCP_RULE_RE")"
-    tcp_comment="$(rule_comment "$tcp_line")"
+    if (( $(awk -F'\t' '$2=="udp" {n++} END {print n+0}' <<< "$matches") > 1 )); then
+        error 'Ambiguous UDP allowlist in clikader_filter/input'; exit 1
+    fi
+    tcp_ln="$(awk -F'\t' '$2=="tcp" {print $1}' <<< "$matches")"
+    udp_ln="$(awk -F'\t' '$2=="udp" {print $1}' <<< "$matches")"
+    tcp_comment="$(rule_comment "$(sed -n "${tcp_ln}p" "$NFT_CONF")")"
     [[ -n "$tcp_comment" ]] || tcp_comment="$TCP_RULE_CMT"
-
-    cp "$NFT_CONF" "${NFT_CONF}.backup_${ts}"
-    log "Backed up ${NFT_CONF} to ${NFT_CONF}.backup_${ts}"
-
-    local tcp_rendered udp_rendered udp_line udp_ln udp_comment
+    udp_comment="$UDP_RULE_CMT"
+    [[ -z "$udp_ln" ]] || udp_comment="$(rule_comment "$(sed -n "${udp_ln}p" "$NFT_CONF")")"
+    [[ -n "$udp_comment" ]] || udp_comment="$UDP_RULE_CMT"
+    tx_begin nft || exit 1
+    tx_save "$NFT_CONF" || exit 1
+    candidate="$TX_DIR/candidate"
+    scoped="$TX_DIR/filter.nft"
     tcp_rendered="$(render_set "$tcp_s")"
-    # Anchor each substitution to the exact line number found above, so a second
-    # braced `tcp dport` rule elsewhere in the file (a port-forward stanza, say)
-    # is never rewritten by accident. -i '' keeps in-place editing portable
-    # (BSD sed otherwise swallows the next arg as a backup suffix).
-    sed_inplace -E "${tcp_ln}s@${TCP_RULE_RE}@\1tcp dport { ${tcp_rendered} } accept ${tcp_comment}@" "$NFT_CONF"
-
-    if [[ -n "$udp_s" ]]; then
-        udp_rendered="$(render_set "$udp_s")"
-        udp_line="$(grep -E "$UDP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
-        if [[ -n "$udp_line" ]]; then
-            udp_ln="$(rule_line_number "$UDP_RULE_RE")"
-            udp_comment="$(rule_comment "$udp_line")"
-            [[ -n "$udp_comment" ]] || udp_comment="$UDP_RULE_CMT"
-            sed_inplace -E "${udp_ln}s@${UDP_RULE_RE}@\1udp dport { ${udp_rendered} } accept ${udp_comment}@" "$NFT_CONF"
-        else
-            # No UDP rule yet — insert one right after the TCP rule, reusing its
-            # indentation.
-            sed_inplace -E "${tcp_ln}s@${TCP_RULE_RE}@&\n\1udp dport { ${udp_rendered} } accept ${UDP_RULE_CMT}@" "$NFT_CONF"
+    udp_rendered="$(render_set "$udp_s")"
+    TCP_TEXT="        tcp dport { $tcp_rendered } accept $tcp_comment" \
+    UDP_TEXT="        udp dport { $udp_rendered } accept $udp_comment" \
+    awk -v tcp="$tcp_ln" -v udp="${udp_ln:-0}" -v hasudp="$([[ -n "$udp_s" ]] && echo 1 || echo 0)" '
+        NR==tcp { print ENVIRON["TCP_TEXT"]; if (!udp && hasudp) print ENVIRON["UDP_TEXT"]; next }
+        NR==udp { if (hasudp) print ENVIRON["UDP_TEXT"]; next }
+        {print}
+    ' "$NFT_CONF" > "$candidate" || exit 1
+    nft -c -f "$candidate" || { error 'nftables ruleset failed validation'; exit 1; }
+    printf 'add table inet clikader_filter\ndelete table inet clikader_filter\n' > "$scoped"
+    awk -v mode=table -f "$NFT_RULE_PARSER" "$candidate" >> "$scoped" || exit 1
+    nft list table inet clikader_filter > "$TX_DIR/live.nft" 2>/dev/null || : > "$TX_DIR/live.nft"
+    restore_filter() {
+        if [[ -s "$TX_DIR/live.nft" ]]; then
+            printf 'add table inet clikader_filter\ndelete table inet clikader_filter\n' > "$TX_DIR/restore.nft"
+            cat "$TX_DIR/live.nft" >> "$TX_DIR/restore.nft"
+            nft -f "$TX_DIR/restore.nft"
         fi
-    else
-        # No UDP ports left — drop the UDP rule entirely.
-        sed_inplace -E "/${UDP_RULE_RE}/d" "$NFT_CONF"
-    fi
-
-    # Validate the edited config before touching the running firewall.
-    local check
-    if ! check="$(nft -c -f "$NFT_CONF" 2>&1)"; then
-        error "nftables ruleset failed validation; restoring backup."
-        [[ -n "$check" ]] && error "$check"
-        mv "${NFT_CONF}.backup_${ts}" "$NFT_CONF"
-        return 1
-    fi
-
-    systemctl enable nftables >/dev/null 2>&1 || true
-
-    # Apply with `nft -f`, NEVER `systemctl restart nftables`. Debian's
-    # nftables.service declares `ExecStop=/usr/sbin/nft flush ruleset`, so a
-    # restart is a GLOBAL flush: it deletes every table in every family, not
-    # just ours. Verified 2026-09-17 — one restart silently wiped Docker's
-    # ip filter/ip nat rules (all container networking died, including
-    # published ports) and fail2ban's inet f2b-table (every active ban gone).
-    # `nft -f` is scoped to the tables this file declares.
-    if ! nft -f "$NFT_CONF"; then
-        error "Failed to apply ${NFT_CONF}."
-        return 1
-    fi
-
-    # Keep the unit enabled and in sync for boot. `start` runs ExecStart
-    # (`nft -f`), which is idempotent and never flushes.
-    if ! systemctl is-active nftables &>/dev/null; then
-        systemctl start nftables
-    fi
-
-    if ! nft list table inet clikader_filter &>/dev/null; then
-        error "clikader_filter is not loaded after applying ${NFT_CONF}; inspect manually."
-        return 1
-    fi
+    }
+    # shellcheck disable=SC2034 # Consumed by the common transaction EXIT trap.
+    TX_ROLLBACK=restore_filter
+    nft -c -f "$scoped" || exit 1
+    nft -f "$scoped" || exit 1
+    nft list table inet clikader_filter >/dev/null || exit 1
+    install_config "$candidate" "$NFT_CONF" || exit 1
+    systemctl enable nftables >/dev/null || exit 1
+    record_managed nft "$NFT_CONF" || exit 1
+    tx_commit
     log "nftables apply OK. TCP allow: ${tcp_rendered:-none}; UDP allow: ${udp_rendered:-none}"
-}
+)
 
 # --- Actions ---
 add_ports() {
@@ -287,8 +266,10 @@ add_ports() {
 
     local ports ssh_port changed=0
     ports="$(normalize_ports "$raw")" || return 1
+    clikader_lock nft || return 1
     read_allow_sets
-    ssh_port="$(get_ssh_port)"
+    ssh_port="$(get_ssh_port)" || return 1
+    set_add tcp_ports $ssh_port
 
     if [[ "$type" == "both" || "$type" == "tcp" ]]; then
         set_add tcp_ports $ports
@@ -312,14 +293,16 @@ delete_ports() {
     fi
     local ports ssh_port changed=0 p deletable="" protected=""
     ports="$(normalize_ports "$raw")" || return 1
+    clikader_lock nft || return 1
     read_allow_sets
-    ssh_port="$(get_ssh_port)"
+    ssh_port="$(get_ssh_port)" || return 1
+    set_add tcp_ports $ssh_port
 
     # Split requested ports into deletable vs the protected SSH port. The SSH
     # port is never removed; if it is mixed with other ports, the others are
     # still deleted and we report that the SSH port was left in place.
     for p in $ports; do
-        if [[ "$p" == "$ssh_port" ]]; then
+        if [[ " $ssh_port " == *" $p "* ]]; then
             protected+=" $p"
         else
             deletable+=" $p"
@@ -340,7 +323,7 @@ delete_ports() {
     set_remove udp_ports $deletable
 
     if (( changed )); then
-        rewrite_allowlist "$tcp_ports" "$udp_ports"
+        rewrite_allowlist "$tcp_ports" "$udp_ports" || return 1
         if [[ -n "$protected" ]]; then
             log "Deleted ${deletable// /, } from the allowlist; SSH port ${ssh_port} left intact."
         fi
@@ -373,12 +356,13 @@ reset_allowlist() {
         esac
     fi
 
+    clikader_lock nft || return 1
     read_allow_sets
     local ssh_port
-    ssh_port="$(get_ssh_port)"
+    ssh_port="$(get_ssh_port)" || return 1
     tcp_ports="$ssh_port"
     udp_ports=""
-    rewrite_allowlist "$tcp_ports" "$udp_ports"
+    rewrite_allowlist "$tcp_ports" "$udp_ports" || return 1
     log "Allowlist reset; only SSH port ${ssh_port} is allowed (tcp)."
 }
 
@@ -440,6 +424,7 @@ reset_prompt() {
 usage() {
     cat <<EOF
 Usage: clikader nft [options]
+Component revision: $NFT_MANAGER_REVISION
 
 Manage inbound ports in the clikader nftables allowlist (${NFT_CONF}).
 
@@ -495,11 +480,15 @@ main() {
             ;;
         add)
             shift
-            add_ports "$@"
+            local type=both raw="" token
+            for token in "$@"; do
+                case "$token" in tcp|udp|both) type="$token" ;; *) raw+=" $token" ;; esac
+            done
+            add_ports "$raw" "$type"
             ;;
         delete)
             shift
-            delete_ports "$@"
+            delete_ports "$*"
             ;;
         reset)
             shift

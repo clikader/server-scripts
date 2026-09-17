@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.11.3"
+CLIKADER_VERSION="1.12.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -17,15 +17,21 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-# GitHub raw URL base
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/components"
-
 # Script directory (works in bash and zsh)
 SCRIPT_PATH="$0"
 if [[ -n "${BASH_SOURCE:-}" ]]; then
     SCRIPT_PATH="${BASH_SOURCE[0]}"
 fi
+if [[ -L "$SCRIPT_PATH" ]]; then
+    SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH")"
+fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+if [[ ! -f "$SCRIPT_DIR/lib/common.sh" ]]; then
+    echo 'This installation needs the complete CLiKader bundle. Migrate once with:' >&2
+    echo 'curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash' >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/lib/common.sh"
 
 # Logging functions
 log() {
@@ -78,6 +84,8 @@ echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off +
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
 echo "  nft, nftables               Manage inbound ports in the nftables allowlist"
+echo "  doctor, status              Read-only health and configuration drift checks (--json)"
+echo "  maintenance                 Security updates, package upgrades and backup retention"
 echo "  apt-reset, aptreset         Run APT source reset tool"
 echo "  hostname                    Run hostname fix tool"
 echo "  ipv6, 6                     Run IPv6 configuration tool"
@@ -116,9 +124,7 @@ run_script() {
     shift 2 || true
 
     local local_script="${SCRIPT_DIR}/components/${script_name}"
-    local tmp_script="/tmp/${script_name}.clikader.$$"
     local script_to_run=""
-    local downloaded=0
 
     echo -e "${BLUE}Selected:${NC} ${BOLD}${script_title}${NC}"
     echo ""
@@ -127,28 +133,9 @@ run_script() {
         log "Found local script: ${local_script}"
         script_to_run="$local_script"
     else
-        warning "Local script not found, downloading from GitHub..."
-        # Cache-bust: raw.githubusercontent.com is CDN-cached (max-age=300).
-        # A query string keeps VPS downloads aligned with this clikader version.
-        local download_url="${GITHUB_RAW_BASE}/${script_name}?v=${CLIKADER_VERSION}"
-        info "URL: ${download_url}"
-        echo ""
-
-        if curl -fsSL \
-            -H 'Cache-Control: no-cache' \
-            -H 'Pragma: no-cache' \
-            "$download_url" -o "$tmp_script"; then
-            log "Downloaded successfully"
-            script_to_run="$tmp_script"
-            downloaded=1
-        else
-            error "Failed to download script from GitHub"
-            warning "Please check your internet connection and try again"
-            return 1
-        fi
+        error "Installed bundle is incomplete: missing $local_script. Reinstall CLiKader."
+        return 1
     fi
-
-    chmod +x "$script_to_run"
     echo ""
 
     if bash "$script_to_run" "$@"; then
@@ -158,98 +145,18 @@ run_script() {
         local exit_code=$?
         echo ""
         error "Script encountered an error (exit code: ${exit_code})"
-        if (( downloaded )); then
-            rm -f "$tmp_script"
-        fi
         return "$exit_code"
     fi
 
-    if (( downloaded )); then
-        rm -f "$tmp_script"
-    fi
 }
 
 update_clikader() {
-    echo -e "${CYAN}${BOLD}Update CLiKader${NC}"
-    echo ""
-    echo -e "${BLUE}Current version:${NC} ${BOLD}${CLIKADER_VERSION}${NC}"
-    echo ""
-
-    local install_path=""
-    if command -v clikader &>/dev/null; then
-        install_path="$(command -v clikader)"
-        log "CLiKader is installed at: ${install_path}"
-    else
-        warning "CLiKader is not installed system-wide (running from local file)"
-        echo ""
-        echo "To install CLiKader system-wide, run:"
-        echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/clikader/server-scripts/refs/heads/main/install.sh | sudo bash${NC}"
-        return 1
-    fi
-
-    echo ""
-    info "Checking for updates..."
-
-    local tmp_file="/tmp/clikader_latest.sh"
-    # Cache-bust so update checks are not stuck on a stale CDN object.
-    if ! curl -fsSL \
-        -H 'Cache-Control: no-cache' \
-        -H 'Pragma: no-cache' \
-        "${GITHUB_RAW_BASE%/components}/clikader.sh?v=$(date +%s)" \
-        -o "$tmp_file" 2>/dev/null; then
-        error "Failed to check for updates"
-        echo "Please check your internet connection"
-        return 1
-    fi
-
-    local remote_version
-    remote_version="$(grep '^CLIKADER_VERSION=' "$tmp_file" | head -n1 | cut -d'"' -f2)"
-
-    if [[ -z "$remote_version" ]]; then
-        error "Could not determine remote version"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    echo -e "${BLUE}Latest version:${NC} ${BOLD}${remote_version}${NC}"
-    echo ""
-
-    if [[ "$CLIKADER_VERSION" == "$remote_version" ]]; then
-        echo -e "${GREEN}CLiKader is up to date${NC}"
-        rm -f "$tmp_file"
-        return 0
-    fi
-
-    echo -e "${YELLOW}Update available:${NC} ${CLIKADER_VERSION} -> ${remote_version}"
-    echo ""
-    read -r -p "Do you want to update CLiKader? (y/N): " confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Update cancelled"
-        rm -f "$tmp_file"
-        return 0
-    fi
-
-    echo ""
-    info "Installing update..."
-
-    cp "$install_path" "${install_path}.backup"
-
-    if mv "$tmp_file" "$install_path" && chmod +x "$install_path"; then
-        echo -e "${GREEN}CLiKader updated successfully${NC}"
-        echo "Updated to version: ${remote_version}"
-        echo "Backup saved to: ${install_path}.backup"
-        echo "Run 'clikader --version' to verify."
-    else
-        error "Update failed"
-        echo "Restoring backup..."
-        mv "${install_path}.backup" "$install_path"
-        rm -f "$tmp_file"
-        return 1
-    fi
+    bash "$SCRIPT_DIR/install.sh" --update "$@"
 }
 
 uninstall_clikader() {
+    if has_help_flag "$@"; then echo 'Usage: clikader uninstall (prompts before removing installed code)'; return 0; fi
+    [[ $# -eq 0 ]] || { error "Unknown uninstall option: $1"; return 2; }
     echo -e "${CYAN}${BOLD}Uninstall CLiKader${NC}"
     echo ""
 
@@ -269,6 +176,10 @@ uninstall_clikader() {
     echo "  - ${install_path}"
     if [[ -f "${install_path}.backup" ]]; then
         echo "  - ${install_path}.backup"
+    fi
+    local bundle_root="${CLIKADER_INSTALL_ROOT:-/usr/local/lib/clikader}"
+    if [[ "$SCRIPT_DIR" == "$bundle_root/releases/"* ]]; then
+        echo "  - ${bundle_root} (installed code bundles)"
     fi
     echo ""
     read -r -p "Are you sure you want to uninstall CLiKader? (y/N): " confirm
@@ -291,6 +202,11 @@ uninstall_clikader() {
     if [[ -f "${install_path}.backup" ]]; then
         rm -f "${install_path}.backup"
         log "Removed backup file"
+    fi
+    if [[ "$SCRIPT_DIR" == "$bundle_root/releases/"* ]]; then
+        rm -rf -- "$bundle_root/releases" "$bundle_root/current" "$bundle_root/previous" "$bundle_root/install.lock"
+        rmdir "$bundle_root" 2>/dev/null || true
+        log 'Removed installed CLiKader bundles'
     fi
 
     echo ""
@@ -328,14 +244,25 @@ onboard_clikader() {
     # Recognized options:
     #   --recursive / -r   run the DNS step with a local unbound recursive
     #                      resolver instead of forwarding to public DNS
-    local dns_extra_args=""
+    local dns_extra_args="" profile=proxy ipv6_policy=ask failed=0
     local arg
     for arg in "$@"; do
         case $arg in
             -r|--recursive) dns_extra_args="--recursive" ;;
-            *) warning "Ignoring unknown onboard option: $arg" ;;
+            --profile=proxy) profile=proxy ;;
+            --profile=general) profile=general ;;
+            --keep-ipv6) ipv6_policy=keep ;;
+            --disable-ipv6) ipv6_policy=disable ;;
+            -h|--help) echo 'Usage: clikader onboard [--profile=proxy|general] [--recursive] [--keep-ipv6|--disable-ipv6]'; return 0 ;;
+            *) error "Unknown onboard option: $arg"; return 2 ;;
         esac
     done
+    if [[ "$profile" == general && -n "$dns_extra_args" ]]; then
+        error '--recursive changes DNS; use the proxy profile or clikader dns --recursive explicitly.'
+        return 2
+    fi
+    ipv6_policy="$(choose_ipv6 "$ipv6_policy")" || return 1
+    clikader_lock onboard || return 1
 
     echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║       CLiKader Onboarding (5 steps)     ${NC}"
@@ -349,26 +276,34 @@ onboard_clikader() {
     fi
     info "  2. TCP   (network-stack optimization)"
     info "  3. APT   (reset to official sources)"
-    info "  4. IPv6  (disabled)"
+    info "  Profile: $profile; IPv6: $ipv6_policy"
     info "  5. Hostname (fix to 127.0.0.1 if not already)"
     echo ""
 
     ONBOARD_RESULTS=()
 
     # 1. DNS — --yes uses direct-IP mode + default providers + proceeds past rerun
-    onboard_step 1 "setup_dns.sh"        "Setup DNS"            --yes $dns_extra_args
+    if [[ "$profile" == proxy ]]; then
+        onboard_step 1 "setup_dns.sh" "Setup DNS" --yes $dns_extra_args || failed=1
 
     # 2. TCP — non-interactive, apply tuning
-    onboard_step 2 "optimize_tcp.sh"     "TCP/Network Optimization"
+        onboard_step 2 "optimize_tcp.sh" "TCP/Network Optimization" || failed=1
 
     # 3. APT — already non-interactive
-    onboard_step 3 "reset_apt_source.sh" "Reset APT Sources"
+        onboard_step 3 "reset_apt_source.sh" "Reset APT Sources" || failed=1
+    else
+        ONBOARD_RESULTS+=("Provider DNS, APT repositories and network tuning preserved (general profile)")
+    fi
 
     # 4. IPv6 — disable, skip confirm
-    onboard_step 4 "configure_ipv6.sh"   "Disable IPv6"         "--disable" "--yes"
+    if [[ "$ipv6_policy" == disable ]]; then
+        onboard_step 4 "configure_ipv6.sh" "Disable IPv6" --disable --yes || failed=1
+    else
+        ONBOARD_RESULTS+=("IPv6 kept enabled")
+    fi
 
     # 5. Hostname — auto-fix if not pointing to localhost
-    onboard_step 5 "fix_hostname.sh"     "Fix Hostname"         "--fix"
+    onboard_step 5 "fix_hostname.sh" "Fix Hostname" --fix || failed=1
 
     echo ""
     echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
@@ -378,6 +313,11 @@ onboard_clikader() {
         echo -e "  • $r"
     done
     echo ""
+    if (( failed == 0 )); then
+        mkdir -p "$CLIKADER_STATE_DIR"
+        printf 'profile=%s\nipv6=%s\n' "$profile" "$ipv6_policy" > "$CLIKADER_STATE_DIR/onboard.conf"
+    fi
+    return "$failed"
 }
 
 dispatch_command() {
@@ -392,8 +332,8 @@ dispatch_command() {
             echo "$CLIKADER_VERSION"
             ;;
         "update" | "upgrade")
-            require_root "$command"
-            update_clikader
+            has_help_flag "$@" || require_root "$command"
+            update_clikader "$@"
             ;;
         "setup" | "vpssetup")
             # Help must be reachable without root so any user can see usage.
@@ -403,11 +343,11 @@ dispatch_command() {
             run_script "setup_vps.sh" "VPS Setup" "$@"
             ;;
         "dns")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             run_script "setup_dns.sh" "Setup DNS" "$@"
             ;;
         "tcp")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             run_script "optimize_tcp.sh" "TCP/Network Optimization" "$@"
             ;;
         "nft" | "nftables")
@@ -418,24 +358,31 @@ dispatch_command() {
             run_script "nft_manager.sh" "NFTables Port Manager" "$@"
             ;;
         "apt-reset" | "aptreset")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             run_script "reset_apt_source.sh" "Reset APT Sources" "$@"
             ;;
         "hostname")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             run_script "fix_hostname.sh" "Fix Hostname" "$@"
             ;;
         "ipv6" | "6")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             run_script "configure_ipv6.sh" "Configure IPv6" "$@"
             ;;
         "onboard" | "o")
-            require_root "$command"
+            has_help_flag "$@" || require_root "$command"
             onboard_clikader "$@"
             ;;
+        "doctor" | "status")
+            bash "$SCRIPT_DIR/components/doctor.sh" "$@"
+            ;;
+        "maintenance" | "maintain")
+            has_help_flag "$@" || require_root "$command"
+            run_script "maintenance.sh" "Server maintenance" "$@"
+            ;;
         "uninstall" | "remove")
-            require_root "$command"
-            uninstall_clikader
+            has_help_flag "$@" || require_root "$command"
+            uninstall_clikader "$@"
             ;;
         *)
             error "Unknown command: ${command}"

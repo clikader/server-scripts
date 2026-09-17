@@ -1,169 +1,115 @@
-#!/usr/bin/env bash
-# Tests for components/reset_apt_source.sh
+#!/usr/bin/env bats
 load ../test_helper
 
 setup() {
     setup_mocks
     make_mock apt-get
+    export APT_ARCH=amd64
     export APT_SOURCES_LIST="$BATS_TEST_TMPDIR/sources.list"
     export APT_SOURCES_LIST_D="$BATS_TEST_TMPDIR/sources.list.d"
     mkdir -p "$APT_SOURCES_LIST_D"
-    printf '# old\n' > "$APT_SOURCES_LIST"
+    printf 'deb https://provider.example/ stable main\n' > "$APT_SOURCES_LIST"
+    printf 'provider config\n' > "$APT_SOURCES_LIST_D/provider.sources"
     load_component components/reset_apt_source.sh
 }
 
-@test "backup_sources: copies sources.list and sources.list.d" {
-    printf 'deb http://example\n' > "$APT_SOURCES_LIST"
-    printf 'extra\n' > "$APT_SOURCES_LIST_D/extra.list"
-    run backup_sources
+@test "APT help and unknown flags never modify sources" {
+    run bash "$REPO_ROOT/components/reset_apt_source.sh" --help
     [ "$status" -eq 0 ]
-    assert_output_contains "Backup location"
+    run bash "$REPO_ROOT/components/reset_apt_source.sh" --nope
+    [ "$status" -eq 2 ]
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.sources" 'provider config'
+    [ ! -s "$MOCK_CFG_DIR/calls" ]
 }
 
-@test "generate_debian_sources_deb822: debian 13 and 12, rejects others" {
-    run generate_debian_sources_deb822 13
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" "trixie"
-    run generate_debian_sources_deb822 12
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" "bookworm"
+@test "unsupported OS is rejected before cleanup" {
+    os_name=fedora; os_version=40
+    run main
+    [ "$status" -eq 1 ]
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.sources" 'provider config'
+}
+
+@test "EOL Ubuntu release is rejected before cleanup" {
+    os_name=ubuntu; os_version=24.10
+    run main
+    [ "$status" -eq 1 ]
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.sources" 'provider config'
+}
+
+@test "Debian 11 12 13 emit signed official sources with correct firmware components" {
+    local version
+    for version in 11 12 13; do
+        run generate_debian_sources_deb822 "$version"
+        [ "$status" -eq 0 ]
+        assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg'
+    done
     run generate_debian_sources_deb822 11
-    [ "$status" -eq 1 ]
+    ! grep -q non-free-firmware "$APT_SOURCES_LIST_D/debian.sources"
+    run generate_debian_sources_deb822 13
+    assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" 'non-free-firmware'
 }
 
-@test "generate_debian_sources: 13 / 12 / 11 / unsupported" {
-    run generate_debian_sources 13
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "trixie"
-    run generate_debian_sources 12
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "bookworm"
-    run generate_debian_sources 11
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "bullseye"
-    run generate_debian_sources 10
-    [ "$status" -eq 1 ]
-    assert_output_contains "Unsupported Debian version"
+@test "Ubuntu LTS releases use correct suites" {
+    local pair version codename
+    for pair in '20.04 focal' '22.04 jammy' '24.04 noble' '26.04 resolute'; do
+        read -r version codename <<< "$pair"
+        run generate_ubuntu_sources_deb822 "$version"
+        [ "$status" -eq 0 ]
+        assert_file_contains "$APT_SOURCES_LIST_D/ubuntu.sources" "Suites: $codename $codename-updates"
+    done
 }
 
-@test "generate_ubuntu_sources_deb822: 24.10 / 24.04 / other" {
-    run generate_ubuntu_sources_deb822 24.10 oracular
+@test "Ubuntu arm64 uses ports archive for both updates and security" {
+    APT_ARCH=arm64
+    run generate_ubuntu_sources_deb822 24.04
     [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST_D/ubuntu.sources" "oracular"
-    run generate_ubuntu_sources_deb822 24.04 noble
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST_D/ubuntu.sources" "noble"
-    run generate_ubuntu_sources_deb822 22.04 jammy
-    [ "$status" -eq 1 ]
+    [ "$(grep -c '^URIs: https://ports.ubuntu.com/ubuntu-ports' "$APT_SOURCES_LIST_D/ubuntu.sources")" -eq 2 ]
+    ! grep -q archive.ubuntu.com "$APT_SOURCES_LIST_D/ubuntu.sources"
 }
 
-@test "generate_ubuntu_sources: 24.10 / 24.04 / 22.04 / 20.04 / unsupported" {
-    run generate_ubuntu_sources 24.10 oracular
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "oracular"
-    run generate_ubuntu_sources 24.04 noble
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "noble"
-    run generate_ubuntu_sources 22.04 jammy
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "jammy"
-    run generate_ubuntu_sources 20.04 focal
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "focal"
-    run generate_ubuntu_sources 18.04 bionic
-    [ "$status" -eq 1 ]
-}
-
-@test "clean_sources_list_d: removes list/sources/save/distUpgrade/gpg files" {
-    printf 'x\n' > "$APT_SOURCES_LIST_D/foo.list"
-    printf 'x\n' > "$APT_SOURCES_LIST_D/foo.sources"
-    printf 'x\n' > "$APT_SOURCES_LIST_D/foo.list.save"
-    printf 'x\n' > "$APT_SOURCES_LIST_D/foo.distUpgrade"
-    printf 'x\n' > "$APT_SOURCES_LIST_D/foo.gpg"
-    printf 'x\n' > "${APT_SOURCES_LIST}.save"
-    run clean_sources_list_d
-    [ "$status" -eq 0 ]
-    [ ! -e "$APT_SOURCES_LIST_D/foo.list" ]
-    [ ! -e "$APT_SOURCES_LIST_D/foo.sources" ]
-    [ ! -e "${APT_SOURCES_LIST}.save" ]
-}
-
-@test "clean_sources_list_d: empty dir is a no-op info" {
-    run clean_sources_list_d
-    [ "$status" -eq 0 ]
-    assert_output_contains "No third-party sources found"
-}
-
-@test "update_apt_cache: success and fallback warning" {
-    make_mock apt-get --status 0
-    run update_apt_cache
-    [ "$status" -eq 0 ]
-    assert_output_contains "APT cache updated successfully"
-
-    make_mock apt-get --status 1 --out "err"
-    run update_apt_cache
-    [ "$status" -eq 1 ]
-    assert_output_contains "encountered some issues"
-}
-
-@test "verify_sources: finds traditional list, deb822, or neither" {
-    printf 'deb http://deb.debian.org/debian trixie main\n' > "$APT_SOURCES_LIST"
-    run verify_sources
-    [ "$status" -eq 0 ]
-    assert_output_contains "sources.list exists"
-
-    printf '# comment only\n' > "$APT_SOURCES_LIST"
-    printf 'Types: deb\n' > "$APT_SOURCES_LIST_D/debian.sources"
-    run verify_sources
-    [ "$status" -eq 0 ]
-    assert_output_contains "debian.sources"
-
-    printf '# comment\n' > "$APT_SOURCES_LIST"
-    rm -f "$APT_SOURCES_LIST_D"/*.sources
-    run verify_sources
-    [ "$status" -eq 1 ]
-    assert_output_contains "No APT sources found"
-}
-
-@test "main: debian 13 uses DEB822" {
-    os_name="debian"
-    os_version="13"
-    run main
-    [ "$status" -eq 0 ]
-    assert_output_contains "APT sources reset successfully"
-    assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" "trixie"
-}
-
-@test "main: debian 11 uses legacy sources.list" {
-    os_name="debian"
-    os_version="11"
-    run main
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "bullseye"
-}
-
-@test "main: ubuntu 24.04 uses DEB822" {
-    os_name="ubuntu"
-    os_version="24.04"
-    os_codename="noble"
-    run main
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST_D/ubuntu.sources" "noble"
-}
-
-@test "main: ubuntu 22.04 uses traditional sources.list" {
-    os_name="ubuntu"
-    os_version="22.04"
-    os_codename="jammy"
-    run main
-    [ "$status" -eq 0 ]
-    assert_file_contains "$APT_SOURCES_LIST" "jammy"
-}
-
-@test "main: unsupported OS exits 1" {
-    os_name="fedora"
-    os_version="40"
+@test "unsupported architecture leaves existing sources intact" {
+    APT_ARCH=unknown
     run main
     [ "$status" -eq 1 ]
-    assert_output_contains "Unsupported OS"
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.sources" 'provider config'
+}
+
+@test "failed authenticated apt refresh restores all source files" {
+    make_mock apt-get --status 100
+    run main
+    [ "$status" -eq 1 ]
+    assert_file_contains "$APT_SOURCES_LIST" 'provider.example'
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.sources" 'provider config'
+    [ ! -f "$APT_SOURCES_LIST_D/debian.sources" ]
+}
+
+@test "successful reset verifies apt and records configuration ownership" {
+    run main
+    [ "$status" -eq 0 ]
+    assert_file_contains "$APT_SOURCES_LIST_D/debian.sources" trixie
+    [ ! -f "$APT_SOURCES_LIST_D/provider.sources" ]
+    [ -f "$CLIKADER_STATE_DIR/managed/apt.sha256" ]
+    grep -q 'APT::Update::Error-Mode=any' "$MOCK_CFG_DIR/calls"
+}
+
+@test "reset is idempotent and preserves inactive backups and keys" {
+    printf 'key material\n' > "$APT_SOURCES_LIST_D/provider.gpg"
+    printf 'old backup\n' > "$APT_SOURCES_LIST_D/provider.list.save"
+    run main
+    [ "$status" -eq 0 ]
+    first="$(cat "$APT_SOURCES_LIST_D/debian.sources")"
+    run main
+    [ "$status" -eq 0 ]
+    [ "$(cat "$APT_SOURCES_LIST_D/debian.sources")" = "$first" ]
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.gpg" 'key material'
+    assert_file_contains "$APT_SOURCES_LIST_D/provider.list.save" 'old backup'
+}
+
+@test "Ubuntu reset preserves official entitlement-managed ESM security sources" {
+    os_name=ubuntu; os_version=20.04
+    printf 'Types: deb\nURIs: https://esm.ubuntu.com/infra/ubuntu\nSuites: focal-infra-security\n' > "$APT_SOURCES_LIST_D/ubuntu-esm-infra.sources"
+    run main
+    [ "$status" -eq 0 ]
+    assert_file_contains "$APT_SOURCES_LIST_D/ubuntu-esm-infra.sources" 'focal-infra-security'
+    [ ! -f "$APT_SOURCES_LIST_D/provider.sources" ]
 }

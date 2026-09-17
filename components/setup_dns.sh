@@ -10,10 +10,11 @@
 # Other OS versions may work but are user-tested, not officially supported.
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.11.3"
+SETUP_DNS_REVISION="1.12.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -93,7 +94,7 @@ AUTO_PICK_TOP=3
 DNS_PROVIDERS=(
     "Cloudflare|1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com|2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
     "Google|8.8.8.8#dns.google 8.8.4.4#dns.google|2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
-    "Quad9|9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net|2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
+    "Quad9|9.9.9.10#dns10.quad9.net 149.112.112.10#dns10.quad9.net|2620:fe::10#dns10.quad9.net 2620:fe::fe:10#dns10.quad9.net"
 )
 # Index of the "Custom DNS" menu entry (always last, after the catalogue).
 CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
@@ -113,8 +114,13 @@ while [[ $# -gt 0 ]]; do
             non_interactive=true
             shift
             ;;
+        -h|--help)
+            echo 'Usage: clikader dns [--yes] [--recursive] [--ipv6]'
+            exit 0
+            ;;
         *)
-            shift
+            echo "Unknown option: $1" >&2
+            exit 2
             ;;
     esac
 done
@@ -219,7 +225,7 @@ probe_server() {
 # because "auto" mode probes the whole pool.
 # Args: <space-separated choices>
 order_by_latency() {
-    local choices=($@)
+    local choices=("$@")
     local choice probe_ip ms name
     local results=""
     SORTED_SELECTIONS=""
@@ -276,12 +282,8 @@ order_by_latency() {
     rm -rf "$tmpdir"
 
     if [[ -z "$results" ]]; then
-        warning "All probes failed. Keeping your selected order (network may block DNS)."
-        for choice in "${choices[@]}"; do
-            [[ -z "${dns_ipv4[$choice]:-}" ]] && continue
-            SORTED_SELECTIONS+="$choice "
-        done
-        return 0
+        error 'All probes failed. Refusing to replace the working resolver.'
+        return 1
     fi
 
     # Explicit return 0 so a `while read` that ends on EOF cannot leak a
@@ -582,7 +584,7 @@ select_dns_providers() {
     done
 
     if [[ ${#probeable_selections[@]} -gt 0 ]]; then
-        order_by_latency "${probeable_selections[@]}"
+        order_by_latency "${probeable_selections[@]}" || return 1
     else
         SORTED_SELECTIONS=""
     fi
@@ -636,31 +638,8 @@ select_dns_providers() {
     done
 
     if [[ -z "$primary_dns" ]]; then
-        if [[ "$use_secure_dns" == true ]]; then
-            warning "No valid selection made. Using default: Cloudflare, Google, Quad9."
-            primary_dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
-            primary_dns+=" 8.8.8.8#dns.google 8.8.4.4#dns.google"
-            primary_dns+=" 9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net"
-
-            if [[ "$ipv6_support" == true ]]; then
-                primary_dns+=" 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
-                primary_dns+=" 2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
-                primary_dns+=" 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net"
-            fi
-        else
-            warning "No valid selection made. Using default: Cloudflare, Google, Quad9 (direct IP)."
-            primary_dns="1.1.1.1 1.0.0.1"
-            primary_dns+=" 8.8.8.8 8.8.4.4"
-            primary_dns+=" 9.9.9.9 149.112.112.112"
-
-            if [[ "$ipv6_support" == true ]]; then
-                primary_dns+=" 2606:4700:4700::1111 2606:4700:4700::1001"
-                primary_dns+=" 2001:4860:4860::8888 2001:4860:4860::8844"
-                primary_dns+=" 2620:fe::fe 2620:fe::9"
-            fi
-        fi
-
-        selected_names=("Cloudflare" "Google" "Quad9")
+        error 'No valid DNS provider selected; leaving the current resolver intact.'
+        return 1
     fi
 
     primary_dns=$(echo "$primary_dns" | xargs)
@@ -715,7 +694,7 @@ generate_resolved_config() {
     if [[ "$use_secure_dns" == true ]]; then
         dnssec_setting="yes"
         if [[ "$has_dot_support" == true ]]; then
-            dot_setting="opportunistic"
+            dot_setting="yes"
         fi
     fi
 
@@ -822,8 +801,8 @@ recursion_is_possible() {
     RECURSION_TRACE_EVIDENCE=""
 
     if ! command -v dig &> /dev/null; then
-        warning "dig not available — cannot verify recursion support before installing"
-        return 0
+        error 'dig is required to verify recursion support'
+        return 1
     fi
 
     local attempt out
@@ -837,7 +816,7 @@ recursion_is_possible() {
         # Failed: record which servers stayed silent so the cause is obvious.
         RECURSION_TRACE_EVIDENCE="$(printf '%s\n' "$out" \
             | grep -oE 'communications error to [0-9.]+#53' \
-            | awk '{print $4}' | sed 's/#53$//' | sort -u | head -3 | tr '\n' ' ')"
+            | awk '{print $4}' | sed 's/#53$//' | sort -u | head -3 | tr '\n' ' ' || true)"
         return 1
     done
 
@@ -855,7 +834,7 @@ recursion_is_possible() {
 unbound_resolves() {
     local name
     for name in example.com cloudflare.com; do
-        if [[ -n "$(dig_query 127.0.0.1 "$name" A)" ]]; then
+        if dig_query 127.0.0.1 "$name" A | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             return 0
         fi
     done
@@ -876,7 +855,7 @@ configure_recursive_resolver() {
             error "apt-get update failed while installing unbound"
             return 1
         fi
-        if ! apt-get install -y unbound; then
+        if ! apt-get install -y unbound dns-root-data; then
             error "Failed to install unbound"
             return 1
         fi
@@ -906,8 +885,8 @@ configure_recursive_resolver() {
     fi
     local trust_anchor_line="    auto-trust-anchor-file: \"$trust_anchor\""
     if [[ ! -f "$trust_anchor" ]]; then
-        warning "DNSSEC trust anchor not available; unbound will run without DNSSEC validation"
-        trust_anchor_line="    # DNSSEC validation disabled: no trust anchor available"
+        error 'DNSSEC trust anchor not available. Install dns-root-data and repair the unbound trust anchor before continuing.'
+        return 1
     fi
 
     # Refuse to install a recursive resolver on a network that cannot recurse.
@@ -931,8 +910,10 @@ configure_recursive_resolver() {
     fi
     log "✅ Iterative lookups complete — recursion is possible on this network"
 
-    log "Writing managed $UNBOUND_CONF..."
-    cat > "$UNBOUND_CONF" << EOF
+    log "Staging managed $UNBOUND_CONF..."
+    local candidate
+    candidate="$(mktemp "${UNBOUND_CONF}.XXXXXX")" || return 1
+    cat > "$candidate" << EOF
 # Managed by setup_dns.sh (full overwrite on every run) — local recursive
 # resolver. Resolves via the authoritative nameservers directly, so no public
 # resolver cache (and its stale negative answers) sits in the path.
@@ -967,7 +948,7 @@ ${trust_anchor_line}
     hide-version: yes
     harden-glue: yes
     harden-below-nxdomain: yes
-    aggressive-nsec: yes
+    aggressive-nsec: no
     edns-buffer-size: 1232
 
     # Caches sized for a single VPS
@@ -978,18 +959,23 @@ remote-control:
     control-enable: no
 EOF
 
+    if [[ $? -ne 0 ]]; then rm -f "$candidate"; return 1; fi
+
     # Validate before restarting anything; skip with a warning only when the
     # tool is absent (e.g. stripped images) so real config errors still abort.
     if command -v unbound-checkconf &> /dev/null; then
-        if ! unbound-checkconf "$UNBOUND_CONF" &> /dev/null; then
+        if ! unbound-checkconf "$candidate" &> /dev/null; then
             error "unbound-checkconf rejected $UNBOUND_CONF — keeping the old resolver config"
-            unbound-checkconf "$UNBOUND_CONF" || true
+            unbound-checkconf "$candidate" || true
+            rm -f "$candidate"
             return 1
         fi
         log "✅ unbound-checkconf passed"
     else
-        warning "unbound-checkconf not found; skipping config validation"
+        error 'unbound-checkconf is required'; rm -f "$candidate"; return 1
     fi
+    chmod 644 "$candidate" || { rm -f "$candidate"; return 1; }
+    mv -f "$candidate" "$UNBOUND_CONF" || return 1
 
     # unbound-resolvconf.service (shipped by the Debian/Ubuntu package) tries
     # to register unbound with resolvconf and meddle with resolv.conf. Both
@@ -997,7 +983,7 @@ EOF
     systemctl disable --now unbound-resolvconf.service &> /dev/null || true
 
     systemctl unmask unbound &> /dev/null || true
-    systemctl enable unbound &> /dev/null || true
+    systemctl enable unbound &> /dev/null || return 1
     if ! systemctl restart unbound; then
         error "Failed to restart unbound — keeping the old resolver config"
         return 1
@@ -1025,7 +1011,33 @@ EOF
 }
 
 # Main purification function
-purify_dns() {
+purify_dns() (
+    clikader_lock dns || exit 1
+    local resolved_was_active=0 unbound_was_active=0 resolved_was_enabled=0 unbound_was_enabled=0
+    systemctl is-active --quiet systemd-resolved && resolved_was_active=1
+    systemctl is-active --quiet unbound && unbound_was_active=1
+    systemctl is-enabled --quiet systemd-resolved && resolved_was_enabled=1
+    systemctl is-enabled --quiet unbound && unbound_was_enabled=1
+    restore_dns_runtime() {
+        if (( unbound_was_active )); then systemctl restart unbound; else systemctl stop unbound; fi
+        if (( resolved_was_active )); then systemctl restart systemd-resolved; else systemctl stop systemd-resolved; fi
+        (( unbound_was_enabled )) || systemctl disable unbound
+        (( resolved_was_enabled )) || systemctl disable systemd-resolved
+        return 0
+    }
+    tx_begin dns restore_dns_runtime || exit 1
+    tx_save "$RESOLV_CONF" "$RESOLVED_CONF" "$RESOLVED_CONF_D" "$DHCLIENT_CONF" "$IFUPD_RESOLVED" || exit 1
+    if [[ -L "$RESOLV_CONF" ]]; then
+        local resolver_target
+        resolver_target="$(readlink -f "$RESOLV_CONF")" || exit 1
+        tx_save "$resolver_target" || exit 1
+    fi
+    if [[ -d "$CLOUD_CFG_DIR" ]]; then tx_save "$CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg" || exit 1; fi
+    if [[ "$use_recursive" == true ]]; then
+        tx_save "$UNBOUND_CONF" || exit 1
+        recursion_is_possible || exit 1
+        configure_recursive_resolver || exit 1
+    fi
     echo "--- Starting DNS purification and hardening process ---"
     
     unlock_resolv_conf
@@ -1039,13 +1051,13 @@ purify_dns() {
         # Remove any previously-added override block (idempotent re-runs). We
         # strip everything between our markers, including the markers and the
         # legacy unmarked supersede/prepend lines from older script versions.
-        sed -i '/^# BEGIN setup_dns.sh DNS override$/,/^# END setup_dns.sh DNS override$/d' $DHCLIENT_CONF
-        sed -i '/^# DNS override configuration - added by setup_dns.sh$/,/^prepend domain-name-servers 127\.0\.0\.53;$/d' $DHCLIENT_CONF
-        sed -i '/^supersede domain-name-servers/d' $DHCLIENT_CONF
-        sed -i '/^prepend domain-name-servers/d' $DHCLIENT_CONF
+        sed -i '/^# BEGIN setup_dns.sh DNS override$/,/^# END setup_dns.sh DNS override$/d' "$DHCLIENT_CONF" || exit 1
+        sed -i '/^# DNS override configuration - added by setup_dns.sh$/,/^prepend domain-name-servers 127\.0\.0\.53;$/d' "$DHCLIENT_CONF" || exit 1
+        sed -i '/^supersede domain-name-servers/d' "$DHCLIENT_CONF" || exit 1
+        sed -i '/^prepend domain-name-servers/d' "$DHCLIENT_CONF" || exit 1
 
         # Add our configuration (marked so future runs can remove it cleanly)
-        cat >> $DHCLIENT_CONF << 'EOF'
+        cat >> "$DHCLIENT_CONF" << 'EOF' || exit 1
 
 # BEGIN setup_dns.sh DNS override
 supersede domain-name-servers 127.0.0.53;
@@ -1058,7 +1070,7 @@ EOF
     # Disable the if-up.d resolved script
     log "Disabling conflicting if-up.d script..."
     if [[ -f $IFUPD_RESOLVED ]]; then
-        chmod -x $IFUPD_RESOLVED 2>/dev/null || true
+        chmod a-x "$IFUPD_RESOLVED" || exit 1
         log "✅ Removed execute permission from $IFUPD_RESOLVED"
     fi
 
@@ -1072,7 +1084,7 @@ EOF
     # could leave the box offline after reboot).
     log "Disabling cloud-init DNS management (prevents reboot rollback)..."
     if [[ -d $CLOUD_CFG_DIR ]]; then
-        cat > $CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg << 'EOF'
+        cat > "$CLOUD_CFG_DIR/99-disable-dns-mgmt.cfg" << 'EOF' || exit 1
 # Managed by setup_dns.sh -- prevents cloud-init from overwriting DNS on boot.
 # This is what keeps the clikader DNS config from being rolled back after reboot.
 manage_resolv_conf: false
@@ -1101,32 +1113,22 @@ EOF
         fi
     fi
     
-    # Remove resolvconf if present (common on older Debian/Ubuntu)
-    if dpkg -s resolvconf &> /dev/null 2>&1; then
-        log "Detected 'resolvconf' package, uninstalling..."
-        apt-get remove -y resolvconf || true
-        rm -f $RESOLV_CONF
-        log "✅ 'resolvconf' successfully uninstalled"
-    fi
-    
     log "Enabling and starting systemd-resolved service..."
     # systemctl returns non-zero in several non-fatal cases (already enabled,
     # masked edge cases, etc.). Never let that kill the script under set -e.
     systemctl unmask systemd-resolved 2> /dev/null || true
-    systemctl enable systemd-resolved 2> /dev/null || true
-    systemctl start systemd-resolved 2> /dev/null || true
-
-    # Recursive mode: bring unbound up BEFORE resolved is pointed at it, so
-    # any failure here aborts with the previous resolver still in place.
-    if [[ "$use_recursive" == true ]]; then
-        if ! configure_recursive_resolver; then
-            return 1
-        fi
-    fi
+    systemctl enable systemd-resolved || exit 1
+    systemctl start systemd-resolved || exit 1
 
     log "Applying final DNS security configuration (DoT, DNSSEC...)"
     generate_resolved_config
-    echo -e "${SECURE_RESOLVED_CONFIG}" > $RESOLVED_CONF
+    printf '%s\n' "$SECURE_RESOLVED_CONFIG" > "$TX_DIR/resolved.conf" || exit 1
+    install_config "$TX_DIR/resolved.conf" "$RESOLVED_CONF" || exit 1
+    mkdir -p "$RESOLVED_CONF_D" || exit 1
+    {
+        printf '[Resolve]\nDNS=\nFallbackDNS=\nDomains=\n'
+        printf '%s\n' "$SECURE_RESOLVED_CONFIG"
+    } > "$RESOLVED_CONF_D/zz-clikader-dns.conf" || exit 1
 
     # Also pin the Cache= setting in a drop-in so a later hand-edit of the main
     # resolved.conf (e.g. someone changing DNS= and rewriting the file) cannot
@@ -1140,20 +1142,26 @@ EOF
 [Resolve]
 Cache=$CACHE_SETTING
 EOF
+        [[ $? -eq 0 ]] || exit 1
     fi
 
     unlock_resolv_conf
-    rm -f $RESOLV_CONF 2>/dev/null || true
-    ln -sf $STUB_RESOLV_CONF $RESOLV_CONF
+    rm -f "$RESOLV_CONF" || exit 1
+    ln -sf "$STUB_RESOLV_CONF" "$RESOLV_CONF" || exit 1
     systemctl restart systemd-resolved || {
         error "Failed to restart systemd-resolved"
         return 1
     }
     sleep 2
+    resolvectl flush-caches >/dev/null || exit 1
+    verify_dns || exit 1
+    record_managed dns "$RESOLVED_CONF" "$RESOLVED_CONF_D/10-setup-dns-cache.conf" "$RESOLVED_CONF_D/zz-clikader-dns.conf" || exit 1
+    if [[ "$use_recursive" == true ]]; then record_managed unbound "$UNBOUND_CONF" || exit 1; fi
+    tx_commit
     
     log "✅ DNS purification and hardening complete!"
     echo ""
-}
+)
 
 # Verification function
 verify_dns() {
@@ -1185,20 +1193,29 @@ verify_dns() {
     
     echo ""
     log "Testing DNS resolution..."
+    if ! timeout 10 resolvectl query google.com >/dev/null 2>&1; then
+        error 'systemd-resolved query failed'
+        return 1
+    fi
     if nslookup google.com >/dev/null 2>&1; then
         log "✅ DNS resolution is working"
     else
-        warning "DNS resolution test failed"
+        error "DNS resolution test failed"
+        return 1
     fi
     
     echo ""
     log "Current $RESOLV_CONF:"
-    cat $RESOLV_CONF
+    cat "$RESOLV_CONF" || return 1
     echo ""
 }
 
 # Main execution
 main() {
+    if ! command -v dig >/dev/null || ! command -v nslookup >/dev/null; then
+        apt_refresh || exit 1
+        apt-get install -y dnsutils || exit 1
+    fi
     if health_check; then
         echo "Existing DNS configuration detected and healthy."
         echo "Re-running will probe providers by latency and overwrite the current config."
@@ -1235,7 +1252,7 @@ main() {
         echo ""
     else
         ask_secure_dns
-        select_dns_providers
+        select_dns_providers || exit 1
     fi
 
     # Fail loudly rather than relying on `set -e` to propagate the status: bats'
@@ -1244,9 +1261,7 @@ main() {
     # successfully" over a box whose DNS setup just failed.
     if ! purify_dns; then
         echo ""
-        error "DNS setup FAILED — the previous resolver configuration is still active,"
-        error "so name resolution on this box keeps working. Resolve the cause above"
-        error "and re-run."
+        error 'DNS setup FAILED. Previous configuration was restored; review the rollback output above.'
         exit 1
     fi
 
@@ -1282,7 +1297,7 @@ main() {
     elif [[ "$use_secure_dns" == true ]]; then
         echo "  • DNSSEC: Yes"
         if [[ "$has_dot_support" == true ]]; then
-            echo "  • DNS-over-TLS: Opportunistic"
+            echo "  • DNS-over-TLS: Required, certificate-validated"
         else
             echo "  • DNS-over-TLS: Disabled (custom DNS without DoT support)"
         fi

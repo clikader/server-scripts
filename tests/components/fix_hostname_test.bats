@@ -8,7 +8,8 @@ setup() {
     # hostname -> "oldhost" (stable)
     cat > "$MOCK_BIN/hostname" <<'MOCK'
 #!/usr/bin/env bash
-printf 'oldhost\n'
+if [[ $# -gt 0 ]]; then printf '%s\n' "$1" > "$HOSTNAME_FILE"; fi
+cat "$HOSTNAME_FILE"
 MOCK
     chmod +x "$MOCK_BIN/hostname"
 
@@ -32,6 +33,15 @@ MOCK
     printf 'oldhost\n' > "$HOSTNAME_FILE"
 
     load_component components/fix_hostname.sh
+}
+
+mock_hostnamectl() {
+    cat > "$MOCK_BIN/hostnamectl" <<'MOCK'
+#!/bin/bash
+printf 'hostnamectl %s\n' "$*" >> "$MOCK_CFG_DIR/calls"
+printf '%s\n' "$2" > "$HOSTNAME_FILE"
+MOCK
+    chmod +x "$MOCK_BIN/hostnamectl"
 }
 
 @test "get_current_hostname returns the mocked hostname" {
@@ -65,7 +75,7 @@ MOCK
     printf '127.0.1.1 oldhost\n' > "$MOCK_CFG_DIR/getent.hosts"
     run fix_hostname_resolution
     [ "$status" -eq 0 ]
-    assert_output_contains "Added new entry"
+    assert_output_contains "Hostname resolution fixed successfully"
     assert_file_contains "$HOSTS_FILE" "127.0.1.1	oldhost"
 }
 
@@ -74,9 +84,9 @@ MOCK
     printf '127.0.1.1 oldhost\n' > "$MOCK_CFG_DIR/getent.hosts"
     run fix_hostname_resolution
     [ "$status" -eq 0 ]
-    assert_output_contains "Updated 127.0.1.1 entry"
+    assert_output_contains "Hostname resolution fixed successfully"
     assert_file_contains "$HOSTS_FILE" "127.0.1.1	oldhost"
-    [[ "$(grep -c otherhost "$HOSTS_FILE")" -eq 0 ]]
+    [[ "$(grep -c otherhost "$HOSTS_FILE")" -eq 1 ]]
 }
 
 @test "fix_hostname_resolution: removes duplicate hostname lines" {
@@ -96,7 +106,7 @@ MOCK
 }
 
 @test "change_hostname via pty: applies a valid hostname" {
-    make_mock hostnamectl
+    mock_hostnamectl
     printf '127.0.1.1 newhost\n' > "$MOCK_CFG_DIR/getent.hosts"
     local inner
     inner="$(make_inner components/fix_hostname.sh 'change_hostname')"
@@ -108,7 +118,7 @@ MOCK
 }
 
 @test "change_hostname via pty: cancelled when confirm is no -> 1" {
-    make_mock hostnamectl
+    mock_hostnamectl
     local inner
     inner="$(make_inner components/fix_hostname.sh 'change_hostname')"
     run_pty "$inner" "newhost" "n"
@@ -117,7 +127,7 @@ MOCK
 }
 
 @test "change_hostname via pty: rejects empty and invalid hostnames" {
-    make_mock hostnamectl
+    mock_hostnamectl
     printf '127.0.1.1 newhost\n' > "$MOCK_CFG_DIR/getent.hosts"
     local inner
     inner="$(make_inner components/fix_hostname.sh 'change_hostname')"
@@ -155,6 +165,9 @@ MOCK
 @test "main: fix mode auto-fixes a bad resolution" {
     printf '203.0.113.9 oldhost\n' > "$MOCK_CFG_DIR/getent.hosts"
     HOSTNAME_MODE="fix"
+    getent() {
+        if grep -qw oldhost "$HOSTS_FILE"; then printf '127.0.1.1 oldhost\n'; else printf '203.0.113.9 oldhost\n'; fi
+    }
     run main
     [ "$status" -eq 0 ]
     assert_output_contains "Auto-fixing"
@@ -188,4 +201,14 @@ MOCK
     run_pty "$inner" "9"
     [ "$PTY_RC" -eq 1 ]
     [[ "$PTY_OUT" == *"Invalid choice"* ]]
+}
+
+@test "fix preserves localhost and unrelated aliases when hostname is the last token" {
+    printf '127.0.0.1 localhost alias oldhost\n127.0.1.1 otherhost\n' > "$HOSTS_FILE"
+    printf '127.0.1.1 oldhost\n' > "$MOCK_CFG_DIR/getent.hosts"
+    run fix_hostname_resolution
+    [ "$status" -eq 0 ]
+    assert_file_contains "$HOSTS_FILE" $'127.0.0.1\tlocalhost\talias'
+    assert_file_contains "$HOSTS_FILE" otherhost
+    assert_file_contains "$HOSTS_FILE" $'127.0.1.1\toldhost'
 }
