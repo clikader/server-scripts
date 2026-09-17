@@ -62,7 +62,7 @@ One-shot setup for a freshly installed Debian server. Runs the full baseline:
 3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables`)
 4. Enable chrony for NTP time sync
 5. SSH hardening — custom port, and either key-only auth (default: `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, your public key) or password login (`--password`: `PermitRootLogin yes`, `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, root password set); neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
-6. Configure nftables (SSH port + custom ports; scaffolding included for future port forwarding)
+6. Configure nftables — **inbound-only**: allow the SSH port + custom ports, drop everything else *addressed to this host*. Forwarded traffic (containers) is never filtered — a `forward` drop policy silently breaks every container, since container traffic never traverses the input chain — and output is never filtered
 7. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
 8. Run `clikader o` for the remaining onboarding (DNS, TCP, APT, IPv6, hostname)
 
@@ -139,7 +139,7 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 **Two resolver modes:**
 
 - **Forward (default)** — systemd-resolved forwards to the selected public resolvers. **Providers:** Cloudflare, Google, Quad9, Custom — globally famous, non-filtering, anycast-everywhere resolvers only (filtering resolvers like AdGuard/OpenDNS and thin-coverage ones like DNS.SB/Control D/CleanBrowsing are deliberately excluded; use Custom DNS for those)
-- **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. If unbound ever dies, `FallbackDNS` (OpenDNS) keeps DNS alive. Onboarding support: `clikader onboard --recursive`; switch an existing box with `clikader dns --yes --recursive`
+- **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. **Requires an unfiltered authoritative DNS path:** many hosting networks filter outbound port 53 to the root, TLD or authoritative servers, which makes recursion impossible. unbound still starts and reports `active` while answering nothing, so the script performs a real iterative lookup (root → TLD → authoritative) first and **refuses to continue** if it cannot complete one, rather than leave the box without DNS. Note that `FallbackDNS` does *not* rescue recursive mode: systemd-resolved consults it only when no DNS server is configured at all, and recursive mode sets `DNS=127.0.0.1`. Onboarding support: `clikader onboard --recursive`; switch an existing box with `clikader dns --yes --recursive`
 
 **Features:**
 - Defaults to plain direct-IP DNS
@@ -148,7 +148,7 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 - **Auto mode (default):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies
 - Manually select specific providers if preferred
 - Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
-- Static last-resort `FallbackDNS` (OpenDNS — operator-independent) for when all primaries are down
+- Static last-resort `FallbackDNS` (OpenDNS — operator-independent) for when all primaries are down. systemd-resolved consults it only when no `DNS=` server is configured at all, so it does **not** cover a dead unbound in recursive mode
 - **Negative caching disabled** (`Cache=no-negative`, or `Cache=no` on systemd < 250): a cached stale NODATA answer pins ACME DNS-01 challenges (1Panel/lego, certbot, acme.sh) for the zone's SOA minimum — 30 minutes on Cloudflare zones — and hangs certificate issuance. The setting is also pinned in a drop-in so hand-edits of `resolved.conf` can't revert it
 - Automatic conflict resolution
 
@@ -224,7 +224,20 @@ without hand-editing the ruleset. Only the two clikader allow rules are touched
 (`tcp dport { ... } accept comment "ssh + extra tcp ports"` and its UDP
 counterpart); forward/nat chains and any user additions are left intact. Every
 change is validated with `nft -c` before reloading, and a timestamped backup of
-`/etc/nftables.conf` is kept.
+`/etc/nftables.conf` is kept. The file is applied with `nft -f` — never
+`systemctl restart nftables`, because Debian's unit declares
+`ExecStop=/usr/sbin/nft flush ruleset`, making a restart a **global** flush that
+also deletes Docker's `ip filter`/`ip nat` rules (killing all container
+networking) and fail2ban's `inet f2b-table` (dropping every active ban).
+
+The firewall itself is **inbound-only** — the same mental model as `ufw allow
+<port>`: the `input` hook drops anything not explicitly allowed, while
+`forward` and `output` are left accepting. Filtering forwarding would break
+Docker containers, whose traffic is routed rather than addressed to the host;
+Docker's own `DOCKER-USER`/`DOCKER-FORWARD` chains handle container isolation.
+Note that this also means a container's *published* ports are reachable
+directly, exactly as `docker run -p` implies — bind a published port to
+`127.0.0.1` if you want to keep it behind the host firewall.
 
 **Sub-commands:**
 - `clikader nft` — interactive numbered menu (add / delete / reset)

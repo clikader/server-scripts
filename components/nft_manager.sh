@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-NFT_MANAGER_REVISION="1.11.0"
+NFT_MANAGER_REVISION="1.11.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -207,16 +207,30 @@ rewrite_allowlist() {
     fi
 
     systemctl enable nftables >/dev/null 2>&1 || true
-    if systemctl is-active nftables &>/dev/null; then
-        systemctl restart nftables
-    else
-        systemctl start nftables
-    fi
-    if ! nft list table inet clikader_filter &>/dev/null; then
-        error "nftables restarted but clikader_filter is not loaded; inspect manually."
+
+    # Apply with `nft -f`, NEVER `systemctl restart nftables`. Debian's
+    # nftables.service declares `ExecStop=/usr/sbin/nft flush ruleset`, so a
+    # restart is a GLOBAL flush: it deletes every table in every family, not
+    # just ours. Verified 2026-09-17 — one restart silently wiped Docker's
+    # ip filter/ip nat rules (all container networking died, including
+    # published ports) and fail2ban's inet f2b-table (every active ban gone).
+    # `nft -f` is scoped to the tables this file declares.
+    if ! nft -f "$NFT_CONF"; then
+        error "Failed to apply ${NFT_CONF}."
         return 1
     fi
-    log "nftables reloaded. TCP allow: ${tcp_rendered:-none}; UDP allow: ${udp_rendered:-none}"
+
+    # Keep the unit enabled and in sync for boot. `start` runs ExecStart
+    # (`nft -f`), which is idempotent and never flushes.
+    if ! systemctl is-active nftables &>/dev/null; then
+        systemctl start nftables
+    fi
+
+    if ! nft list table inet clikader_filter &>/dev/null; then
+        error "clikader_filter is not loaded after applying ${NFT_CONF}; inspect manually."
+        return 1
+    fi
+    log "nftables apply OK. TCP allow: ${tcp_rendered:-none}; UDP allow: ${udp_rendered:-none}"
 }
 
 # --- Actions ---

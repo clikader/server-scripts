@@ -13,7 +13,7 @@ set -euo pipefail
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.11.0"
+SETUP_DNS_REVISION="1.11.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -57,6 +57,18 @@ declare -A dns_names
 PROBE_TIMEOUT=2          # seconds; per-server query timeout for the probe
 PROBE_QUERY="www.google.com"
 PROBE_QTYPE="A"
+
+# --- Recursion capability probe (recursive mode only) ---
+# A recursor must walk root -> TLD -> authoritative servers with plain
+# iterative (non-RD) queries, so the probe performs that same walk. Probing
+# only the root servers is NOT sufficient: on the host that motivated this
+# check (2026-09-17) the roots answered while every gTLD server silently
+# dropped queries, so a root-only probe reported "fine" while unbound still
+# could not resolve a single name.
+RECURSION_PROBE_NAME="example.com"
+RECURSION_PROBE_ATTEMPTS=2   # every attempt must complete; a failure bails early
+RECURSION_TRACE_TIMEOUT=15   # hard per-attempt bound, seconds
+RECURSION_TRACE_EVIDENCE=""  # set on failure: servers that never replied
 LAST_RESORT_DNS="208.67.222.222 208.67.220.220"  # OpenDNS (Cisco): operator-independent FallbackDNS, contacted only when every primary is down
 
 # How many providers "auto" mode keeps after probing the whole pool.
@@ -299,6 +311,9 @@ ask_resolver_mode() {
     echo "              directly: no public DNS cache in the path, DNSSEC"
     echo "              validated, immune to stale-negative cert hangs"
     echo "              (recommended for servers running ACME DNS-01)"
+    echo "              Requires unfiltered outbound port 53 to the root, TLD and"
+    echo "              authoritative servers. Many hosting networks filter it; this"
+    echo "              script refuses to continue rather than leave the box without DNS."
     echo ""
 
     if [[ "$non_interactive" == true ]]; then
@@ -767,10 +782,91 @@ health_check() {
     fi
 }
 
+# Query <server> for <name>/<type> and echo the short answer; echo nothing when
+# the server stays silent. Never fails the caller — a non-answering or
+# unreachable server is an expected result here, not an error.
+dig_query() {
+    local server="$1" name="$2" qtype="$3"
+    if command -v dig &> /dev/null; then
+        dig +short +time=${PROBE_TIMEOUT} +tries=1 "@${server}" "$name" "$qtype" 2> /dev/null || true
+    elif command -v nslookup &> /dev/null; then
+        nslookup -timeout=${PROBE_TIMEOUT} -type="$qtype" "$name" "$server" 2> /dev/null \
+            | awk '/^Address: / {print $2; exit}' || true
+    fi
+}
+
+# One bounded iterative DNS walk, stdout+stderr combined.
+iterative_walk() {
+    timeout "$RECURSION_TRACE_TIMEOUT" dig +trace +short \
+        +time=${PROBE_TIMEOUT} +tries=1 "$RECURSION_PROBE_NAME" "$PROBE_QTYPE" 2>&1 || true
+}
+
+# Can this host complete a real recursive resolution?
+#
+# `dig +trace` performs the exact operation a recursor performs — an iterative
+# root -> TLD -> authoritative walk using non-RD queries — so it finds a
+# filtered port 53 wherever the filter sits, not just at the roots. A completed
+# walk prints the final A record as a bare address; a blocked walk prints only
+# intermediate records plus "communications error ... timed out" lines.
+#
+# Both an unbound-checkconf pass and `systemctl is-active unbound` were true on
+# the box that motivated this check, yet every lookup still timed out, because
+# recursive mode points systemd-resolved at 127.0.0.1 and unbound could not
+# reach the authoritative servers (production outage 2026-09-17). Probe with
+# real queries BEFORE writing any config.
+#
+# EVERY attempt must complete. A partially-working path is worse than an
+# obviously broken one: recursion would appear healthy and then fail later,
+# which is exactly how the box went down.
+recursion_is_possible() {
+    RECURSION_TRACE_EVIDENCE=""
+
+    if ! command -v dig &> /dev/null; then
+        warning "dig not available — cannot verify recursion support before installing"
+        return 0
+    fi
+
+    local attempt out
+    for (( attempt = 1; attempt <= RECURSION_PROBE_ATTEMPTS; attempt++ )); do
+        out="$(iterative_walk)"
+
+        if printf '%s\n' "$out" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            continue
+        fi
+
+        # Failed: record which servers stayed silent so the cause is obvious.
+        RECURSION_TRACE_EVIDENCE="$(printf '%s\n' "$out" \
+            | grep -oE 'communications error to [0-9.]+#53' \
+            | awk '{print $4}' | sed 's/#53$//' | sort -u | head -3 | tr '\n' ' ')"
+        return 1
+    done
+
+    return 0
+}
+
+# Does the freshly started unbound actually answer real queries?
+#
+# This is the belt to recursion_is_possible's braces: an iterative walk can
+# succeed and the resolver still answer nothing (a broken trust anchor, an
+# expired anchor, a mid-flight block that started after the walk). unbound's
+# cache is empty immediately after a restart, so a successful lookup here
+# proves upstream resolution genuinely works rather than being served from
+# cache.
+unbound_resolves() {
+    local name
+    for name in example.com cloudflare.com; do
+        if [[ -n "$(dig_query 127.0.0.1 "$name" A)" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Install and configure a local recursive resolver (unbound). Called by
 # purify_dns BEFORE systemd-resolved is switched to DNS=127.0.0.1, so a
-# failure here (port taken, bad config, package broken) aborts with the old
-# resolver config still active — the box never loses DNS.
+# failure here (DNS port 53 filtered somewhere along the authoritative path,
+# port taken, bad config, package broken) aborts with the old resolver config
+# still active — the box never loses DNS.
 configure_recursive_resolver() {
     echo "--- Configuring local recursive resolver (unbound) ---"
 
@@ -813,6 +909,27 @@ configure_recursive_resolver() {
         warning "DNSSEC trust anchor not available; unbound will run without DNSSEC validation"
         trust_anchor_line="    # DNSSEC validation disabled: no trust anchor available"
     fi
+
+    # Refuse to install a recursive resolver on a network that cannot recurse.
+    # Checked BEFORE the config is written, so a blocked network leaves both the
+    # running resolver and unbound.conf exactly as they were. Without this the
+    # script "succeeded" on a box whose every lookup then timed out.
+    if ! recursion_is_possible; then
+        echo ""
+        error "This network blocks outbound DNS, so a local recursive resolver cannot work."
+        error "A full iterative lookup (root -> TLD -> authoritative) did not complete here."
+        if [[ -n "$RECURSION_TRACE_EVIDENCE" ]]; then
+            error "No reply from: $RECURSION_TRACE_EVIDENCE"
+        fi
+        error "unbound would start, report 'active', and then answer nothing — taking"
+        error "every name lookup on this box down with it, while still exiting successfully."
+        warning "Re-run WITHOUT --recursive to use systemd-resolved with public"
+        warning "resolvers (Cloudflare/Google/Quad9) instead."
+        warning "Leaving the current resolver configuration untouched — DNS still works."
+        echo ""
+        return 1
+    fi
+    log "✅ Iterative lookups complete — recursion is possible on this network"
 
     log "Writing managed $UNBOUND_CONF..."
     cat > "$UNBOUND_CONF" << EOF
@@ -890,6 +1007,18 @@ EOF
         error "unbound is not running after restart — keeping the old resolver config"
         return 1
     fi
+
+    # Up is not the same as working. Prove the resolver answers a real query
+    # before systemd-resolved is pointed at it, so "started cleanly" can never
+    # again mean "blackholes every lookup".
+    if ! unbound_resolves; then
+        error "unbound started but cannot resolve names — not switching systemd-resolved over to it"
+        warning "Outbound port 53 to the root or authoritative servers is likely filtered."
+        warning "Re-run WITHOUT --recursive to use public resolvers instead."
+        echo ""
+        return 1
+    fi
+    log "✅ unbound answers real queries (verified through 127.0.0.1)"
     log "✅ unbound active on 127.0.0.1:53 (recursive, DNSSEC-validating)"
     echo ""
     return 0
@@ -1109,8 +1238,22 @@ main() {
         select_dns_providers
     fi
 
-    purify_dns
-    verify_dns
+    # Fail loudly rather than relying on `set -e` to propagate the status: bats'
+    # `run` disables errexit, and a component sourced by a caller may too. A bare
+    # failing call would otherwise fall straight through and print "completed
+    # successfully" over a box whose DNS setup just failed.
+    if ! purify_dns; then
+        echo ""
+        error "DNS setup FAILED — the previous resolver configuration is still active,"
+        error "so name resolution on this box keeps working. Resolve the cause above"
+        error "and re-run."
+        exit 1
+    fi
+
+    if ! verify_dns; then
+        error "DNS setup verification FAILED — see the checks above."
+        exit 1
+    fi
     
     echo ""
     echo -e "${GREEN}========================================${NC}"

@@ -177,6 +177,69 @@ MOCK
     assert_file_contains "$NFT_CONF" "2222"
 }
 
+@test "step_configure_nftables: applies with nft -f, never restarts the nftables service" {
+    ssh_port=2222
+    extra_ports=""
+    last_step=0
+    cat > "$MOCK_BIN/nft" <<'MOCK'
+#!/usr/bin/env bash
+printf 'nft' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/nft"
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    run step_configure_nftables
+    [ "$status" -eq 0 ]
+
+    # The ruleset is applied with `nft -f` (scoped to our own tables), never
+    # with `systemctl restart nftables`: Debian's unit declares
+    # ExecStop=/usr/sbin/nft flush ruleset, so a restart deletes EVERY table —
+    # Docker's ip filter/ip nat rules (killing all container networking) and
+    # fail2ban's inet f2b-table (dropping every active ban). Verified 2026-09-17.
+    grep -qE '^nft -f ' "$MOCK_CFG_DIR/calls"
+    ! grep -qE '^systemctl (restart|stop) nftables' "$MOCK_CFG_DIR/calls"
+}
+
+@test "step_configure_nftables: firewall is inbound-only, never drops forwarding" {
+    ssh_port=2222
+    extra_ports=""
+    last_step=0
+    cat > "$MOCK_BIN/nft" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/nft"
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    run step_configure_nftables
+    [ "$status" -eq 0 ]
+
+    # The input hook is the entire firewall: drop anything not explicitly allowed.
+    assert_file_contains "$NFT_CONF" "type filter hook input priority filter; policy drop;"
+    # Forwarding must stay accepting. Dropping here is invisible to the host's
+    # own traffic but silently breaks every container, whose packets are
+    # forwarded and never traverse the input chain (watchtower outage
+    # 2026-09-17: its per-bridge counters stayed at zero while host DNS worked).
+    assert_file_contains "$NFT_CONF" "type filter hook forward priority filter; policy accept;"
+    # Exactly one drop policy in the whole file, and it belongs to the input hook.
+    [ "$(grep -c 'policy drop' "$NFT_CONF")" -eq 1 ]
+    grep 'policy drop' "$NFT_CONF" | grep -q 'hook input'
+    # Output is never filtered.
+    assert_file_contains "$NFT_CONF" "type filter hook output priority filter; policy accept;"
+}
+
 @test "step_setup_fail2ban: writes jail.local" {
     ssh_port=2222
     last_step=0

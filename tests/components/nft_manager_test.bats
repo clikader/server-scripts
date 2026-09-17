@@ -248,6 +248,19 @@ MOCK
     [ "$(cat "$NFT_CONF")" = "$original" ]
 }
 
+@test "rewrite_allowlist: applies with nft -f, never restarts the nftables service" {
+    run rewrite_allowlist "22 8080" ""
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" "8080"
+    # Applied directly to the file we own...
+    grep -qE '^nft -f ' "$MOCK_CFG_DIR/calls"
+    # ...and never via `systemctl restart`. Debian's nftables.service has
+    # ExecStop=/usr/sbin/nft flush ruleset, so a restart is a GLOBAL flush that
+    # wipes Docker's tables and fail2ban's inet f2b-table (verified 2026-09-17),
+    # not just the clikader table this script rewrites.
+    ! grep -qE '^systemctl (restart|stop) nftables' "$MOCK_CFG_DIR/calls"
+}
+
 @test "usage / subusage / show_current" {
     run usage
     [ "$status" -eq 0 ]

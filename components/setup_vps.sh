@@ -754,11 +754,15 @@ step_ssh_hardening() {
 }
 
 # --- Step 6: nftables firewall ---
-# Plain nftables (no ufw) so future port forwarding (DNAT + forward to another
-# machine) is just a rule away instead of a firewall-stack migration. Only
-# clikader-owned tables are managed — never 'flush ruleset', which would also
-# wipe fail2ban's f2b-table while the service is running. fail2ban's nftables
-# ban action hooks its own drop chain in ahead of this filter table.
+# INBOUND-ONLY firewall: exactly the ufw mental model — allow the ports you
+# asked for, drop everything else *addressed to this host*, and never interfere
+# with traffic passing through it. Plain nftables (no ufw) so future port
+# forwarding (DNAT + forward to another machine) is just a rule away instead of
+# a firewall-stack migration. Only clikader-owned tables are managed — never
+# 'flush ruleset' (and never `systemctl restart nftables`, whose ExecStop *is*
+# `nft flush ruleset`), which would also wipe fail2ban's f2b-table and Docker's
+# tables while those services are running. fail2ban's nftables ban action hooks
+# its own drop chain in ahead of this filter table.
 step_configure_nftables() {
     step_banner 6 "Configure nftables firewall"
 
@@ -823,11 +827,21 @@ ${udp_rule}
         counter drop
     }
 
+    # Forwarding is deliberately NOT filtered here. A container's outbound
+    # traffic — and inbound traffic to one of its published ports — is
+    # *forwarded*, so it never traverses the input chain. A drop policy on this
+    # hook therefore silently breaks every container on the box while looking
+    # like a hardening win (observed 2026-09-17: a watchtower container could
+    # not reach its registry, and its per-bridge counters stayed at zero while
+    # the host's own DNS kept working). Docker already installs its own
+    # filtering for container traffic in the ip filter table (DOCKER-USER,
+    # DOCKER-FORWARD, per-bridge anti-spoofing), so leaving container isolation
+    # to the layer that understands it is both simpler and safer.
     chain forward {
-        type filter hook forward priority filter; policy drop;
-        ct state { established, related } accept
-        # Future port forwarding: permit DNAT'd traffic here, e.g.
-        #   ip daddr 10.0.0.5 tcp dport 443 accept
+        type filter hook forward priority filter; policy accept;
+        # Add explicit drop rules here if you ever want to filter forwarded
+        # traffic — but note that anything dropped here also stops containers,
+        # including their replies.
     }
 
     chain output {
@@ -860,9 +874,22 @@ EOF
     log "nftables ruleset validated (nft -c)"
 
     systemctl enable nftables >/dev/null 2>&1
-    if systemctl is-active nftables &>/dev/null; then
-        systemctl restart nftables
-    else
+
+    # Apply with `nft -f`, NEVER `systemctl restart nftables`. Debian's
+    # nftables.service declares `ExecStop=/usr/sbin/nft flush ruleset`, so a
+    # restart is a GLOBAL flush: it deletes every table in every family, not
+    # just ours. Verified 2026-09-17 — one restart silently wiped Docker's
+    # ip filter/ip nat rules (all container networking died, including
+    # published ports) and fail2ban's inet f2b-table (every active ban gone).
+    # `nft -f` is scoped to the tables this file declares.
+    if ! nft -f "$nft_conf"; then
+        error "Failed to apply $nft_conf"
+        return 1
+    fi
+
+    # Keep the unit enabled and in sync for boot. `start` runs ExecStart
+    # (`nft -f`), which is idempotent and never flushes.
+    if ! systemctl is-active nftables &>/dev/null; then
         systemctl start nftables
     fi
 

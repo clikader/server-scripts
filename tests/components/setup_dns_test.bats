@@ -457,6 +457,181 @@ MOCK
     [ ! -f "$RESOLVED_CONF" ]
 }
 
+# --------------------------------------------------------------------------
+# Port 53 reachability gate (production outage 2026-09-17)
+#
+# A network that filters outbound port 53 to the root servers cannot recurse.
+# unbound still starts cleanly and reports "active", so recursive mode used to
+# "succeed" and then blackhole every lookup on the box. These tests pin the
+# detection that must stop it.
+# --------------------------------------------------------------------------
+
+@test "dig_query: echoes nothing when the server stays silent" {
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    run dig_query 198.41.0.4 . NS
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "iterative_walk: performs an iterative (+trace) lookup" {
+    run iterative_walk
+    [ "$status" -eq 0 ]
+    grep -q '+trace' "$MOCK_CFG_DIR/calls"
+}
+
+@test "recursion_is_possible: true when the iterative walk completes" {
+    run recursion_is_possible
+    [ "$status" -eq 0 ]
+}
+
+@test "recursion_is_possible: false when the roots answer but the walk cannot finish" {
+    # The real-world trap: the roots reply (so a root-only probe looks healthy)
+    # while every TLD/authoritative server silently drops queries. The gate must
+    # judge the completed walk, not root reachability.
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+printf 'NS a.root-servers.net. from server 127.0.0.53 in 0 ms.\n'
+printf 'NS b.root-servers.net. from server 127.0.0.53 in 0 ms.\n'
+printf ';; communications error to 192.5.6.30#53: timed out\n'
+printf ';; communications error to 192.33.14.30#53: timed out\n'
+exit 9
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    run recursion_is_possible
+    [ "$status" -eq 1 ]
+}
+
+@test "recursion_is_possible: false when the walk never completes at all" {
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+exit 9
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    run recursion_is_possible
+    [ "$status" -eq 1 ]
+}
+
+@test "recursion_is_possible: bails out on the first failed attempt" {
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+printf 'dig' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+exit 9
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    run recursion_is_possible
+    [ "$status" -eq 1 ]
+    # One attempt is enough to conclude the network cannot recurse.
+    assert_mock_called dig 1
+}
+
+@test "recursion_is_possible: records which servers never replied" {
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+printf ';; communications error to 192.5.6.30#53: timed out\n'
+printf ';; communications error to 192.33.14.30#53: timed out\n'
+exit 9
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    # Called directly (not via run) so the global survives for inspection.
+    recursion_is_possible || true
+    [[ "$RECURSION_TRACE_EVIDENCE" == *"192.5.6.30"* ]]
+    [[ "$RECURSION_TRACE_EVIDENCE" == *"192.33.14.30"* ]]
+}
+
+@test "configure_recursive_resolver: refuses to install when the DNS walk is blocked" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    # Every iterative walk dies at the TLD servers: the exact production failure.
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+printf 'NS a.root-servers.net. from server 127.0.0.53 in 0 ms.\n'
+printf ';; communications error to 192.5.6.30#53: timed out\n'
+exit 9
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+
+    use_recursive=true
+    run configure_recursive_resolver
+    [ "$status" -eq 1 ]
+    assert_output_contains "blocks outbound DNS"
+    assert_output_contains "No reply from: 192.5.6.30"
+    assert_output_contains "Re-run WITHOUT --recursive"
+    # Bail out before writing a config or touching the running resolver, so a
+    # blocked network cannot leave the box worse off than it found it.
+    [ ! -f "$UNBOUND_CONF" ]
+    assert_mock_called unbound-checkconf 0
+    assert_mock_called unbound 0
+}
+
+@test "configure_recursive_resolver: aborts when unbound starts but cannot resolve" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    # Roots answer (so the pre-check passes) but anything queried through
+    # unbound itself stays silent — started clean, blackholes every lookup.
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+printf 'dig' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+for a in "$@"; do
+    [[ "$a" == "@127.0.0.1" ]] && exit 1
+done
+printf '93.184.216.34\n'
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+
+    use_recursive=true
+    run configure_recursive_resolver
+    [ "$status" -eq 1 ]
+    assert_output_contains "started but cannot resolve names"
+    assert_output_contains "Re-run WITHOUT --recursive"
+    # Resolution is verified through the resolver itself, not just its socket.
+    grep -q '@127.0.0.1' "$MOCK_CFG_DIR/calls"
+}
+
+@test "main: --yes --recursive on a blocked network fails instead of completing" {
+    non_interactive=true
+    use_recursive=true
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    make_mock apt-get --status 0
+    make_mock unbound
+    make_mock unbound-checkconf --status 0
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+
+    run main
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"DNS setup completed successfully"* ]]
+    # systemd-resolved must never be pointed at a resolver that cannot resolve.
+    [ ! -f "$RESOLVED_CONF" ]
+}
+
 @test "main: --yes recursive end-to-end" {
     non_interactive=true
     use_recursive=true
