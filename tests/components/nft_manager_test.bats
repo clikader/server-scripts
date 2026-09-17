@@ -88,6 +88,88 @@ EOF
     [ -z "$udp_ports" ]
 }
 
+# --------------------------------------------------------------------------
+# Rules are matched by SHAPE, not by their trailing comment (2026-09-17)
+#
+# The marker used to be the exact comment string, so a hand-edited comment
+# ("http + https + ssh + extra tcp ports") made the tool refuse to recognise
+# its own rule — and the failing grep ran under `set -e`, so the refusal was
+# SILENT and surfaced only as "Script encountered an error (exit code: 1)".
+# --------------------------------------------------------------------------
+
+@test "read_allow_sets: parses a rule whose comment was hand-edited" {
+    cat > "$NFT_CONF" <<'EOF'
+#!/usr/sbin/nft -f
+table inet clikader_filter {
+    chain input {
+        tcp dport { 80, 443, 14419 } accept comment "http + https + ssh + extra tcp ports"
+        udp dport { 36158 } accept comment "extra udp ports"
+    }
+}
+EOF
+    read_allow_sets
+    [ "$tcp_ports" = "80 443 14419" ]
+    [ "$udp_ports" = "36158" ]
+}
+
+@test "read_allow_sets: never fails, even with no clikader rule at all" {
+    # Reading must not abort the run under `set -e`: that is what made the
+    # refusal silent instead of actionable.
+    printf 'table inet something_else {\n}\n' > "$NFT_CONF"
+    run read_allow_sets
+    [ "$status" -eq 0 ]
+    [ -z "$tcp_ports" ]
+    [ -z "$udp_ports" ]
+}
+
+@test "read_allow_sets: a DHCP rule without a braced set is not mistaken for the allowlist" {
+    cat > "$NFT_CONF" <<'EOF'
+table inet clikader_filter {
+    chain input {
+        udp sport 67 udp dport 68 accept comment "DHCP client replies"
+        tcp dport { 22 } accept comment "anything"
+    }
+}
+EOF
+    read_allow_sets
+    [ "$tcp_ports" = "22" ]
+    [ -z "$udp_ports" ]
+}
+
+@test "rule_comment / rule_line_number: extract what the rewrite needs" {
+    run rule_comment '        tcp dport { 80 } accept comment "http + https"'
+    [ "$output" = 'comment "http + https"' ]
+    run rule_comment '        tcp dport { 80 } accept'
+    [ -z "$output" ]
+    run rule_line_number 'tcp dport'
+    [ "$output" = "4" ]
+}
+
+@test "rewrite_allowlist: edits a hand-edited rule and PRESERVES its comment" {
+    cat > "$NFT_CONF" <<'EOF'
+#!/usr/sbin/nft -f
+table inet clikader_filter {
+    chain input {
+        tcp dport { 80, 443, 14419 } accept comment "http + https + ssh + extra tcp ports"
+        udp dport { 36158 } accept comment "extra udp ports"
+    }
+}
+EOF
+    run rewrite_allowlist "80 443 14419 8080" "36158"
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" "tcp dport { 80, 443, 14419, 8080 } accept comment \"http + https + ssh + extra tcp ports\""
+    # The user's own wording survives the rewrite rather than being reverted.
+    [ "$(grep -c 'http + https + ssh + extra tcp ports' "$NFT_CONF")" -eq 1 ]
+}
+
+@test "add_ports: reports an actionable error instead of dying silently" {
+    printf 'table inet unrecognized {\n}\n' > "$NFT_CONF"
+    run add_ports 8080 tcp
+    [ "$status" -eq 1 ]
+    assert_output_contains "Cannot find the clikader TCP allow rule"
+    assert_output_contains "Refusing to edit an unrecognized nftables.conf"
+}
+
 @test "set_add / set_remove: add unique, skip dup, remove existing" {
     tcp_ports="22"
     changed=0

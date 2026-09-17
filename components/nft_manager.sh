@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-NFT_MANAGER_REVISION="1.11.2"
+NFT_MANAGER_REVISION="1.11.3"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -29,14 +29,22 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
-# Comment fragments uniquely identifying the clikader allow rules. Patterns are
-# brace-free (no literal { } in -E) so the same regexes work on GNU sed (Debian
-# targets) and BSD sed (macOS dev/test). Pattern variants escape '+' for -E;
-# plain variants are used in sed replacements.
-TCP_RULE_CMT='accept comment "ssh + extra tcp ports"'
-UDP_RULE_CMT='accept comment "extra udp ports"'
-TCP_RULE_PAT='accept comment "ssh \+ extra tcp ports"'
-UDP_RULE_PAT='accept comment "extra udp ports"'
+# The allowlist rules are identified by SHAPE — a braced dport set followed by
+# accept at the start of a line — never by their trailing comment.
+#
+# Matching on the comment text meant that describing your own ports
+# ("http + https + ssh + extra tcp ports") made the tool refuse to recognise
+# its own rule; and because that grep ran under `set -e`, the refusal was
+# SILENT and surfaced only as "Script encountered an error (exit code: 1)"
+# (reported 2026-09-17). The comment is user-facing prose: it is preserved
+# verbatim when present, and the default below is used when it is absent.
+#
+# Braces stay escaped (\{ \}) so the same regex works under GNU sed (Debian
+# targets) and BSD sed (macOS dev/test). Group 1 is the line's indentation.
+TCP_RULE_RE='^([[:space:]]*)tcp dport \{[^}]*\} accept([[:space:]]+comment "[^"]*")?'
+UDP_RULE_RE='^([[:space:]]*)udp dport \{[^}]*\} accept([[:space:]]+comment "[^"]*")?'
+TCP_RULE_CMT='comment "ssh + extra tcp ports"'
+UDP_RULE_CMT='comment "extra udp ports"'
 
 # Current allow sets (space-separated ports), populated by read_allow_sets.
 tcp_ports=""
@@ -106,17 +114,35 @@ get_ssh_port() {
     printf '%s' "$p"
 }
 
+# Trailing `comment "..."` of a rule line, or empty when the line has none.
+rule_comment() {
+    local line="${1:-}"
+    [[ -n "$line" ]] || return 0
+    printf '%s' "$line" | sed -n 's/.*[[:space:]]\(comment "[^"]*"\)[[:space:]]*$/\1/p'
+}
+
+# 1-based line number of the first line matching <re>, or empty.
+rule_line_number() {
+    local re="$1"
+    grep -nE "$re" "$NFT_CONF" 2> /dev/null | head -n1 | cut -d: -f1
+}
+
 # --- Read current allow sets from nftables.conf ---
+# Every command substitution ends with `|| true`, and the function returns 0
+# unconditionally: under `set -e` a failing assignment aborts the whole script,
+# so a non-matching grep here used to kill the run silently before any caller
+# could print an actionable error. Reading never needs to fail.
 read_allow_sets() {
     tcp_ports=""
     udp_ports=""
     if [[ -f "$NFT_CONF" ]]; then
-        local tcp_line udp_line
-        tcp_line="$(grep -E "tcp dport .*${TCP_RULE_PAT}" "$NFT_CONF" | head -n1)"
-        udp_line="$(grep -E "udp dport .*${UDP_RULE_PAT}" "$NFT_CONF" | head -n1)"
-        [[ -n "$tcp_line" ]] && tcp_ports="$(extract_set "$tcp_line")"
-        [[ -n "$udp_line" ]] && udp_ports="$(extract_set "$udp_line")"
+        local tcp_line="" udp_line=""
+        tcp_line="$(grep -E "$TCP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
+        udp_line="$(grep -E "$UDP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
+        if [[ -n "$tcp_line" ]]; then tcp_ports="$(extract_set "$tcp_line")"; fi
+        if [[ -n "$udp_line" ]]; then udp_ports="$(extract_set "$udp_line")"; fi
     fi
+    return 0
 }
 
 # --- Set helpers (operate on a global space-separated var) ---
@@ -169,32 +195,45 @@ rewrite_allowlist() {
     local ts
     ts="$(date +%Y%m%d_%H%M%S)"
 
-    if ! grep -qE "tcp dport .*${TCP_RULE_PAT}" "$NFT_CONF"; then
+    local tcp_line tcp_ln tcp_comment
+    tcp_line="$(grep -E "$TCP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
+    if [[ -z "$tcp_line" ]]; then
         error "Cannot find the clikader TCP allow rule in ${NFT_CONF}."
+        error "Expected a line of the form:  tcp dport { 22, 8080 } accept comment \"...\""
         error "Refusing to edit an unrecognized nftables.conf."
         return 1
     fi
+    tcp_ln="$(rule_line_number "$TCP_RULE_RE")"
+    tcp_comment="$(rule_comment "$tcp_line")"
+    [[ -n "$tcp_comment" ]] || tcp_comment="$TCP_RULE_CMT"
 
     cp "$NFT_CONF" "${NFT_CONF}.backup_${ts}"
     log "Backed up ${NFT_CONF} to ${NFT_CONF}.backup_${ts}"
 
-    local tcp_rendered udp_rendered
+    local tcp_rendered udp_rendered udp_line udp_ln udp_comment
     tcp_rendered="$(render_set "$tcp_s")"
-    # -i '' keeps in-place editing portable (BSD sed otherwise swallows the
-    # next arg as a backup suffix, which also disables -E).
-    sed_inplace -E "s@^([[:space:]]*)tcp dport .*${TCP_RULE_PAT}@\1tcp dport { ${tcp_rendered} } ${TCP_RULE_CMT}@" "$NFT_CONF"
+    # Anchor each substitution to the exact line number found above, so a second
+    # braced `tcp dport` rule elsewhere in the file (a port-forward stanza, say)
+    # is never rewritten by accident. -i '' keeps in-place editing portable
+    # (BSD sed otherwise swallows the next arg as a backup suffix).
+    sed_inplace -E "${tcp_ln}s@${TCP_RULE_RE}@\1tcp dport { ${tcp_rendered} } accept ${tcp_comment}@" "$NFT_CONF"
 
     if [[ -n "$udp_s" ]]; then
         udp_rendered="$(render_set "$udp_s")"
-        if grep -qE "udp dport .*${UDP_RULE_PAT}" "$NFT_CONF"; then
-            sed_inplace -E "s@^([[:space:]]*)udp dport .*${UDP_RULE_PAT}@\1udp dport { ${udp_rendered} } ${UDP_RULE_CMT}@" "$NFT_CONF"
+        udp_line="$(grep -E "$UDP_RULE_RE" "$NFT_CONF" 2> /dev/null | head -n1 || true)"
+        if [[ -n "$udp_line" ]]; then
+            udp_ln="$(rule_line_number "$UDP_RULE_RE")"
+            udp_comment="$(rule_comment "$udp_line")"
+            [[ -n "$udp_comment" ]] || udp_comment="$UDP_RULE_CMT"
+            sed_inplace -E "${udp_ln}s@${UDP_RULE_RE}@\1udp dport { ${udp_rendered} } accept ${udp_comment}@" "$NFT_CONF"
         else
-            # No UDP rule yet — insert one right after the TCP rule.
-            sed_inplace -E "s@^([[:space:]]*)tcp dport .*${TCP_RULE_PAT}@&\n\1udp dport { ${udp_rendered} } ${UDP_RULE_CMT}@" "$NFT_CONF"
+            # No UDP rule yet — insert one right after the TCP rule, reusing its
+            # indentation.
+            sed_inplace -E "${tcp_ln}s@${TCP_RULE_RE}@&\n\1udp dport { ${udp_rendered} } accept ${UDP_RULE_CMT}@" "$NFT_CONF"
         fi
     else
         # No UDP ports left — drop the UDP rule entirely.
-        sed_inplace -E "/^[[:space:]]*udp dport .*${UDP_RULE_PAT}/d" "$NFT_CONF"
+        sed_inplace -E "/${UDP_RULE_RE}/d" "$NFT_CONF"
     fi
 
     # Validate the edited config before touching the running firewall.
