@@ -21,6 +21,22 @@ check_result() {
     [[ "$state" == ok || "$state" == info ]] || overall=1
 }
 
+# Membership in a port list whose tokens are single ports ("443") or
+# hyphenated ranges ("40000-41000"), as hand-edited nftables rules may use.
+port_in_list() {
+    local port="$1" item lo hi
+    for item in $2; do
+        if [[ "$item" == *-* ]]; then
+            lo="${item%-*}"; hi="${item#*-}"
+            [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || continue
+            (( port >= lo && port <= hi )) && return 0
+        elif [[ "$item" == "$port" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 main() {
     local output service record path count available used
     if [[ $EUID -ne 0 ]]; then check_result privileges warning 'Run as root for SSH, firewall, and journal checks'; fi
@@ -37,16 +53,30 @@ main() {
     if [[ -f "$CLIKADER_STATE_DIR/managed/dns.sha256" ]]; then
         if resolvectl query example.com >/dev/null 2>&1; then check_result resolved ok 'Managed resolver answers'
         else check_result resolved fail 'Managed resolver cannot answer'; fi
+        # Per-link DNS servers (re-added by networkd/netplan DHCP on renew or
+        # boot) override the managed global DNS= for that link's traffic.
+        if command -v resolvectl >/dev/null && output="$(resolvectl status 2>/dev/null)"; then
+            output="$(awk '
+                /^Global[[:space:]]*$/ { inlink=0; next }
+                /^Link [0-9]+ \(.+\)[[:space:]]*$/ { inlink=1; next }
+                inlink && /DNS Servers:/ && /[0-9A-Fa-f]/ { print }
+            ' <<< "$output")"
+            [[ -z "$output" ]] || check_result per-link-dns warning "Per-link DNS servers shadow the managed global resolver: $output"
+        fi
     fi
     if [[ -f "$CLIKADER_STATE_DIR/managed/unbound.sha256" ]]; then
         output="$(timeout 10 dig +short +tries=1 +time=3 @127.0.0.1 example.com A 2>/dev/null)"
         if grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<< "$output"; then check_result unbound ok 'Local recursive resolver answers'
         else check_result unbound fail 'Local recursive resolver cannot answer'; fi
     fi
+    # Effective sshd ports feed three checks: a listener per port (below),
+    # firewall coverage and the fail2ban jail scope (both further down).
+    local ssh_ports=""
     if output="$(sshd -T 2>&1)"; then
         local port listeners
         listeners="$(ss -H -ltnp 2>/dev/null)"
         while read -r port; do
+            ssh_ports+="$port "
             if awk -v p="$port" '/sshd|"systemd"/ {n=split($4,a,":"); if(a[n]==p) found=1} END {exit !found}' <<< "$listeners"; then
                 check_result "ssh:$port" ok listening
             else check_result "ssh:$port" fail 'Configured SSH port is not listening'; fi
@@ -57,7 +87,7 @@ main() {
             if jq -e '.nftables[] | .chain? | select(.name=="input" and .policy=="drop")' <<< "$output" >/dev/null; then
                 check_result firewall ok 'Managed input policy is drop'
             else check_result firewall fail 'Managed input drop policy missing'; fi
-            local protocol ports live_port live_ports expected_line
+            local protocol ports live_port live_ports expected_line p
             for protocol in tcp udp; do
                 expected_line="$(awk -f "$(dirname "${BASH_SOURCE[0]}")/../lib/nft_rules.awk" "${NFT_CONF:-/etc/nftables.conf}" 2>/dev/null | awk -F'\t' -v p="$protocol" '$2==p {print $3; exit}')"
                 ports="$(sed -n 's/.*{\([^}]*\)}.*/\1/p' <<< "$expected_line" | tr ',' ' ')"
@@ -65,20 +95,51 @@ main() {
                     .nftables[] | .rule? | select(.chain=="input") |
                     select(any(.expr[]; has("accept"))) | .expr[] | .match? |
                     select(.left.payload.protocol==$p and .left.payload.field=="dport") |
-                    .right | if type=="number" then . elif type=="object" and has("set") then .set[] else empty end
+                    .right | if type=="number" then tostring
+                             elif type=="object" and has("range") then "\(.range[0])-\(.range[1])"
+                             elif type=="object" and has("set") then
+                                 [ .set[] | if type=="number" then tostring
+                                           elif type=="object" and has("range") then "\(.range[0])-\(.range[1])"
+                                           else empty end ] | .[]
+                             else empty end
                 ' <<< "$output" 2>/dev/null)"
                 for live_port in $ports; do
                     [[ "$live_port" =~ ^[0-9]+$ ]] || continue
-                    if ! grep -qxF "$live_port" <<< "$live_ports"; then
+                    if ! port_in_list "$live_port" "$live_ports"; then
                         check_result "firewall:$protocol:$live_port" fail 'Persisted allow port is absent from the running firewall'
                     fi
                 done
+                # Every effective sshd port must be in the persisted TCP set:
+                # a hand-edited sshd port (or a firewall allowlist that never
+                # followed one) is otherwise detected by nothing at all.
+                if [[ "$protocol" == tcp ]]; then
+                    for p in $ssh_ports; do
+                        if ! port_in_list "$p" "$ports"; then
+                            check_result "firewall:ssh:$p" fail "sshd listens on $p but the persisted TCP allowlist does not include it"
+                        fi
+                    done
+                fi
             done
         else check_result firewall fail "$output"; fi
     fi
     if [[ -f "$CLIKADER_STATE_DIR/managed/fail2ban.sha256" ]]; then
         if output="$(fail2ban-client status sshd 2>&1)"; then check_result fail2ban ok "$output"
         else check_result fail2ban fail "$output"; fi
+        # The jail's port was pinned when setup wrote it. If sshd moved since
+        # (hand edit), fail2ban is watching a port nobody listens on and every
+        # real attempt goes unbanned.
+        local jail_conf="${FAIL2BAN_JAIL:-/etc/fail2ban/jail.d/99-clikader.local}" jail_ports p
+        if [[ -f "$jail_conf" && -n "$ssh_ports" ]]; then
+            jail_ports="$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*//p' "$jail_conf" | head -1)"
+            [[ "$jail_ports" == ssh ]] && jail_ports=22   # service token = port 22
+            if [[ -n "$jail_ports" ]]; then
+                for p in $ssh_ports; do
+                    if ! port_in_list "$p" "${jail_ports//,/ }"; then
+                        check_result fail2ban-port warning "sshd jail watches '${jail_ports}' but sshd also listens on $p"
+                    fi
+                done
+            fi
+        fi
     fi
     for record in "$CLIKADER_STATE_DIR/managed/"*.sha256; do
         [[ -f "$record" ]] || continue

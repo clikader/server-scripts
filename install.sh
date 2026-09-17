@@ -42,7 +42,7 @@ switch_bundle() {
 if [[ "$mode" == rollback ]]; then
     [[ -L "$INSTALL_ROOT/previous" ]] || { echo 'No previous bundle available' >&2; exit 1; }
     previous="$(readlink "$INSTALL_ROOT/previous")"
-    [[ -f "$INSTALL_ROOT/$previous/clikader.sh" ]] || exit 1
+    [[ -f "$INSTALL_ROOT/$previous/clikader.sh" ]] || { echo "Previous bundle ($previous) is incomplete; cannot roll back." >&2; exit 1; }
     switch_bundle "$previous"
     echo 'Restored previous CLiKader bundle.'
     exit 0

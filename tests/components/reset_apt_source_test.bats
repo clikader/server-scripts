@@ -113,3 +113,29 @@ setup() {
     assert_file_contains "$APT_SOURCES_LIST_D/ubuntu-esm-infra.sources" 'focal-infra-security'
     [ ! -f "$APT_SOURCES_LIST_D/provider.sources" ]
 }
+
+@test "reset removes third-party APT pins but keeps official and version pins" {
+    os_name=debian; os_version=13
+    export APT_PREFERENCES_D="$BATS_TEST_TMPDIR/preferences.d"
+    mkdir -p "$APT_PREFERENCES_D"
+    printf 'Package: *\nPin: origin packages.microsoft.com\nPin-Priority: 1001\n' > "$APT_PREFERENCES_D/ms.preferences"
+    printf 'Package: *\nPin: release o=Microsoft\nPin-Priority: 1001\n' > "$APT_PREFERENCES_D/ms-release.preferences"
+    printf 'Package: linux-image-amd64\nPin: release n=trixie\nPin-Priority: 1001\n' > "$APT_PREFERENCES_D/kernel-freeze"
+    printf 'Package: somepkg\nPin: version 1.2.3*\nPin-Priority: 1001\n' > "$APT_PREFERENCES_D/version-pin"
+    run main
+    [ "$status" -eq 0 ]
+    [ ! -f "$APT_PREFERENCES_D/ms.preferences" ]
+    [ ! -f "$APT_PREFERENCES_D/ms-release.preferences" ]
+    [ -f "$APT_PREFERENCES_D/kernel-freeze" ]
+    [ -f "$APT_PREFERENCES_D/version-pin" ]
+}
+
+@test "failed reset restores removed pin files via the transaction snapshot" {
+    make_mock apt-get --status 100
+    export APT_PREFERENCES_D="$BATS_TEST_TMPDIR/preferences.d"
+    mkdir -p "$APT_PREFERENCES_D"
+    printf 'Package: *\nPin: origin packages.microsoft.com\nPin-Priority: 1001\n' > "$APT_PREFERENCES_D/ms.preferences"
+    run main
+    [ "$status" -eq 1 ]
+    assert_file_contains "$APT_PREFERENCES_D/ms.preferences" 'packages.microsoft.com'
+}

@@ -43,6 +43,25 @@ setup() {
     ! grep -q ' upgrade ' "$MOCK_CFG_DIR/calls"
 }
 
+@test "maintenance upgrade installs new packages by default so kernels are not held back" {
+    run main upgrade
+    [ "$status" -eq 0 ]
+    grep -q 'upgrade --with-new-pkgs -y' "$MOCK_CFG_DIR/calls"
+}
+
+@test "maintenance upgrade --without-new-pkgs keeps plain upgrade semantics" {
+    run main upgrade --without-new-pkgs
+    [ "$status" -eq 0 ]
+    grep -qE ' upgrade -y' "$MOCK_CFG_DIR/calls"
+    ! grep -q -- '--with-new-pkgs' "$MOCK_CFG_DIR/calls"
+}
+
+@test "maintenance upgrade rejects unknown options" {
+    run main upgrade --verbose
+    [ "$status" -eq 2 ]
+    ! grep -q ' upgrade ' "$MOCK_CFG_DIR/calls"
+}
+
 @test "disable security updates explicitly disables unattended installation" {
     run main disable-security-updates
     [ "$status" -eq 0 ]

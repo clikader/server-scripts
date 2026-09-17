@@ -229,3 +229,14 @@ MOCK
         [ "$status" -eq 0 ]
     done
 }
+
+@test "version strings match across VERSION and every component revision" {
+    # A bump touches four files; two releases have historically shipped with
+    # some of them missed (commits 51e523a, 5b0a119). Fail here instead.
+    local v
+    v="$(cat "$REPO_ROOT/VERSION")"
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    grep -q "CLIKADER_VERSION=\"$v\"" "$REPO_ROOT/clikader.sh"
+    grep -q "SETUP_DNS_REVISION=\"$v\"" "$REPO_ROOT/components/setup_dns.sh"
+    grep -q "NFT_MANAGER_REVISION=\"$v\"" "$REPO_ROOT/components/nft_manager.sh"
+}

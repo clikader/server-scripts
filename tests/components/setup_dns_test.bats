@@ -184,6 +184,42 @@ MOCK
     assert_output_contains "All checks passed"
 }
 
+@test "health_check: passes without dhclient installed (netplan/networkd image)" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "is-active" ]] && exit 0
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    rm -f "$DHCLIENT_CONF" "$IFUPD_RESOLVED"
+    run health_check
+    [ "$status" -eq 0 ]
+    assert_output_contains "All checks passed"
+    assert_output_contains "dhclient not present"
+}
+
+@test "purify_dns: clears per-link DNS that would shadow the managed resolver" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+if [[ "$1" == "--version" ]]; then printf 'systemd 255 (255.4-1)\n'; fi
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    mkdir "$BATS_TEST_TMPDIR/net"
+    : > "$BATS_TEST_TMPDIR/net/eth0"
+    export SYSFS_NET="$BATS_TEST_TMPDIR/net"
+    make_mock resolvectl --status 0 --out $'Link 2 (eth0)\n\tDNS Servers: 8.8.8.8'
+    primary_dns="1.1.1.1"
+    use_secure_dns=false
+    has_dot_support=false
+    run purify_dns
+    [ "$status" -eq 0 ]
+    grep -q 'resolvectl revert eth0' "$MOCK_CFG_DIR/calls"
+}
+
 @test "purify_dns: writes resolved.conf, dhclient override, cloud-init drop-in, cache drop-in" {
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash

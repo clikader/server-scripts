@@ -138,13 +138,11 @@ EOF
     [ -z "$udp_ports" ]
 }
 
-@test "rule_comment / rule_line_number: extract what the rewrite needs" {
+@test "rule_comment: extracts the trailing comment of an allow rule" {
     run rule_comment '        tcp dport { 80 } accept comment "http + https"'
     [ "$output" = 'comment "http + https"' ]
     run rule_comment '        tcp dport { 80 } accept'
     [ -z "$output" ]
-    run rule_line_number 'tcp dport'
-    [ "$output" = "4" ]
 }
 
 @test "rewrite_allowlist: edits a hand-edited rule and PRESERVES its comment" {

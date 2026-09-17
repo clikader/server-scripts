@@ -109,7 +109,11 @@ On Debian 13, setup refreshes package indexes and applies package updates too.
 
 **Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
 will refuse to run again. Use `--force` to re-run the whole flow or `--reset` to wipe
-state and start over.
+state and start over. On a re-run with different parameters, the firewall step adds the
+new SSH/extra ports and **prunes ports the previous setup run opened but this one no
+longer requests** (e.g. the old SSH port after changing `--ssh-port`). Ports you added
+yourself with `clikader nft add` are never pruned; after `--reset` the previous values
+are unknown, so nothing is pruned.
 
 ```bash
 # Interactive (prompts for everything)
@@ -154,6 +158,7 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 - Automatic backup of existing sources
 - Supports both traditional `.list` and modern DEB822 `.sources` formats
 - Replaces active third-party `.list` / `.sources` files; preserves inactive backups, keys and official Ubuntu Pro/ESM feeds
+- Removes third-party APT pins in `/etc/apt/preferences.d` (a pin referencing a removed repo silently holds packages — including security updates — at stale versions); official-origin, current-suite and version pins are kept
 - Rejects unsupported releases/architectures before cleanup
 - Authenticates repository metadata and restores previous sources on update failure
 - `--help` is read-only; unknown arguments are rejected
@@ -162,6 +167,7 @@ Resets APT sources to official repositories for Debian and Ubuntu systems.
 - `/etc/apt/sources.list`
 - `/etc/apt/sources.list.d/ubuntu.sources` (supported Ubuntu LTS releases)
 - `/etc/apt/sources.list.d/*` (replaces active `*.list` and `*.sources`)
+- `/etc/apt/preferences.d/*` (removes third-party pin files)
 - `/var/lib/clikader/transactions/apt/` (configuration snapshots)
 
 ---
@@ -183,6 +189,7 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 - Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
 - Static `FallbackDNS` is used only when no DNS server is configured; it does **not** rescue unreachable configured servers
 - **Negative caching disabled** (`Cache=no-negative`, or `Cache=no` on systemd < 250): a cached stale NODATA answer pins ACME DNS-01 challenges (1Panel/lego, certbot, acme.sh) for the zone's SOA minimum — 30 minutes on Cloudflare zones — and hangs certificate issuance. The setting is also pinned in a drop-in so hand-edits of `resolved.conf` can't revert it
+- Clears per-link DNS servers (installed by systemd-networkd/NetworkManager DHCP), which would otherwise override the managed global `DNS=` for that link's traffic; `clikader doctor` reports them as drift if DHCP re-adds them later. On images without dhclient the health check treats the missing `dhclient.conf` as nothing-to-guard instead of "unhealthy"
 - Automatic conflict resolution
 - Refuses forward-mode cutover if all provider probes fail
 - Restores configuration and service state after failed cutover or resolution verification
@@ -320,8 +327,13 @@ sudo clikader nft reset -y                 # same, without confirmation
 `--status` displays current settings. Unsupported kernel keys are skipped, but a
 supported setting that fails verification makes the operation fail and roll back.
 `--revert` removes owned settings while preserving later unrelated administrator
-edits. `--initcwnd` discovers current routes when applying its persistent hooks.
-`--swap 2G` is optional; a failed `swapoff` preserves the swapfile and fstab entry.
+edits, and continues its cleanup even if one step (e.g. a busy swapoff) fails,
+reporting the incomplete revert in its exit status. `--initcwnd` discovers current
+routes when applying its persistent hooks. `--swap 2G` is optional; a failed
+`swapoff` preserves the swapfile and fstab entry. When conntrack is in use, the
+tuned hash size is applied live **and** persisted to
+`/etc/modprobe.d/clikader-tcp-conntrack.conf` so a reboot does not restore the
+default; `--revert` removes the file.
 
 ### 8. Health and maintenance
 
@@ -331,6 +343,7 @@ sudo clikader doctor --json
 sudo clikader maintenance enable-security-updates
 sudo clikader maintenance disable-security-updates
 sudo clikader maintenance upgrade
+sudo clikader maintenance upgrade --without-new-pkgs
 sudo clikader maintenance backups
 sudo clikader maintenance prune
 ```
@@ -338,12 +351,20 @@ sudo clikader maintenance prune
 Doctor is read-only. It checks failed services, real SSH listeners, DNS, managed
 firewall policy, fail2ban, configuration hashes, live TCP settings, disk/inode and
 memory pressure, pending package upgrades and reboots, and security-update policy.
+It also cross-checks the three port sources against each other: every effective
+sshd port must have a listener, be in the persisted firewall allowlist (ranges
+in hand-edited rules count), and be watched by the fail2ban jail — a hand-edited
+sshd port with a stale firewall or jail entry is exactly the drift it catches.
+Per-link DNS servers shadowing the managed resolver are reported as drift.
 Exit codes: `0` healthy, `1` warnings/failures, `2` usage/dependency error. Package
 availability uses existing APT indexes; doctor does not refresh or install packages.
 
 Security updates are automatic after setup, but reboots are always manual. The
 manual `maintenance upgrade` command refreshes indexes and upgrades packages
-without initiating a distribution upgrade.
+without initiating a distribution upgrade; by default it also installs new
+packages an upgrade requires (`--with-new-pkgs`), because fresh kernels are new
+packages and would otherwise be held back forever while doctor keeps asking for
+a reboot. Pass `--without-new-pkgs` for plain `apt-get upgrade` semantics.
 
 Configuration transactions live in `/var/lib/clikader/transactions/`; ownership
 hashes live in `/var/lib/clikader/managed/`. Failed configuration changes restore

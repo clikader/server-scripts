@@ -5,6 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 APT_SOURCES_LIST="${APT_SOURCES_LIST:-/etc/apt/sources.list}"
 APT_SOURCES_LIST_D="${APT_SOURCES_LIST_D:-/etc/apt/sources.list.d}"
+APT_PREFERENCES_D="${APT_PREFERENCES_D:-/etc/apt/preferences.d}"
 OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 log() { echo "--> $*"; }
 info() { echo "$*"; }
@@ -79,22 +80,6 @@ EOF
 generate_debian_sources_deb822() { generate_sources debian "$1"; }
 generate_ubuntu_sources_deb822() { generate_sources ubuntu "$1"; }
 
-generate_legacy_sources() {
-    apt_target "$1" "$2" || return 1
-    printf 'deb %s %s %s\ndeb %s %s-updates %s\ndeb %s %s-security %s\n' \
-        "$mirror" "$suite" "$components" "$mirror" "$suite" "$components" "$security" "$suite" "$components" > "$APT_SOURCES_LIST"
-}
-generate_debian_sources() { generate_legacy_sources debian "$1"; }
-generate_ubuntu_sources() { generate_legacy_sources ubuntu "$1"; }
-
-backup_sources() {
-    local backup
-    backup="$APT_SOURCES_LIST.backup_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$backup" || return 1
-    [[ ! -f "$APT_SOURCES_LIST" ]] || cp -a "$APT_SOURCES_LIST" "$backup/sources.list" || return 1
-    [[ ! -d "$APT_SOURCES_LIST_D" ]] || cp -a "$APT_SOURCES_LIST_D/." "$backup/" || return 1
-}
-
 clean_sources_list_d() {
     local file
     for file in "$APT_SOURCES_LIST_D/"*.list "$APT_SOURCES_LIST_D/"*.sources; do
@@ -106,6 +91,45 @@ clean_sources_list_d() {
         fi
         [[ ! -e "$file" && ! -L "$file" ]] || rm -f -- "$file" || return 1
     done
+}
+
+# True (exit 0) when every Pin: line in a preferences file scopes to official
+# Debian/Ubuntu repositories. A pin referencing a third-party origin is dead
+# weight the moment this reset removes that repo — worse, it silently holds
+# packages (including security updates) at pinned versions. Version pins
+# ("Pin: version ...") are deliberately treated as official: they usually
+# freeze an official package on purpose (e.g. a known-good kernel) and apt
+# ignores them once their version is no longer candidate.
+# Requires $suite (set by apt_target).
+pin_file_is_official() {
+    awk -v suite="$suite" '
+        /^Pin:[[:space:]]*release/ {
+            if ($0 ~ /o=(Debian|Ubuntu)/) next
+            if ($0 ~ ("n=" suite "(-updates|-security|-backports)?$")) next
+            if ($0 ~ /a=(stable|oldstable|oldoldstable|testing|unstable|experimental)(-(updates|security|backports))?([[:space:]]|$)/) next
+            bad = 1; exit
+        }
+        /^Pin:[[:space:]]*origin/ {
+            if ($0 ~ /^Pin:[[:space:]]*origin[[:space:]]*""[[:space:]]*$/) next
+            if ($0 ~ /^Pin:[[:space:]]*origin[[:space:]]*"?((deb|security)\.debian\.org|ftp\.[A-Za-z0-9.]*debian\.org|(archive|security|ports)\.ubuntu\.com)"?(\/|$)/) next
+            bad = 1; exit
+        }
+        END { exit bad ? 1 : 0 }
+    ' "$1"
+}
+
+clean_preferences_d() {
+    local file removed=""
+    [[ -d "$APT_PREFERENCES_D" ]] || return 0
+    for file in "$APT_PREFERENCES_D"/*; do
+        [[ -f "$file" || -L "$file" ]] || continue
+        if ! pin_file_is_official "$file"; then
+            rm -f -- "$file" || return 1
+            removed+=" ${file##*/}"
+        fi
+    done
+    [[ -z "$removed" ]] || log "Removed third-party APT pin(s):${removed}"
+    return 0
 }
 
 update_apt_cache() { apt_refresh; }
@@ -122,9 +146,10 @@ main() (
     apt_target "$os_name" "$os_version" || exit 1
     clikader_lock apt || exit 1
     tx_begin apt restore_apt_runtime || exit 1
-    tx_save "$APT_SOURCES_LIST" "$APT_SOURCES_LIST_D" || exit 1
+    tx_save "$APT_SOURCES_LIST" "$APT_SOURCES_LIST_D" "$APT_PREFERENCES_D" || exit 1
     clean_sources_list_d || exit 1
     generate_sources "$os_name" "$os_version" || exit 1
+    clean_preferences_d || exit 1
     # APT authenticates Release files and all configured suites. Any failure
     # restores the old files; stale indexes are never treated as a successful reset.
     update_apt_cache || exit 1

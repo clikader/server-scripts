@@ -10,7 +10,7 @@ setup() {
     export BBR_MODULE_FILE="$BATS_TEST_TMPDIR/bbr.conf"
     export LIMITS_FILE="$BATS_TEST_TMPDIR/limits.conf"
     export SYSTEMD_OVERRIDE_DIR="$BATS_TEST_TMPDIR/systemd.conf.d"
-    export LOCK_FILE="$BATS_TEST_TMPDIR/tcp.lock"
+    export CONNTRACK_MODPROBE_CONF="$BATS_TEST_TMPDIR/modprobe.d/clikader-tcp-conntrack.conf"
     export INITCWND_HOOK_DIR="$BATS_TEST_TMPDIR/networkd-dispatcher"
     export INITCWND_SERVICE="$BATS_TEST_TMPDIR/systemd/clikader-tcp-initcwnd.service"
     export SWAPFILE_PATH="$BATS_TEST_TMPDIR/swapfile"
@@ -329,12 +329,40 @@ set_sysctl() {
 
 @test "take_lock: fails when another instance holds the lock" {
     command -v flock >/dev/null 2>&1 || skip "flock not available"
-    exec 9>"$LOCK_FILE"
+    mkdir -p "$CLIKADER_LOCK_DIR"
+    exec 9>"$CLIKADER_LOCK_DIR/clikader-tcp.lock"
     flock -n 9
     run take_lock
     [ "$status" -eq 1 ]
-    assert_output_contains "Another clikader tcp instance"
+    assert_output_contains "Another clikader tcp operation is running"
     exec 9>&-
+}
+
+@test "apply_conntrack_hashsize: resizes live and persists the size for reboot" {
+    set_sysctl net.netfilter.nf_conntrack_max 65536
+    run apply_conntrack_hashsize
+    [ "$status" -eq 0 ]
+    assert_file_contains "$CONNTRACK_MODPROBE_CONF" "hashsize=16384"
+}
+
+@test "do_revert removes the conntrack hash persistence hint" {
+    set_sysctl net.netfilter.nf_conntrack_max 65536
+    apply_conntrack_hashsize
+    [ -f "$CONNTRACK_MODPROBE_CONF" ]
+    run do_revert
+    [ "$status" -eq 0 ]
+    [ ! -f "$CONNTRACK_MODPROBE_CONF" ]
+}
+
+@test "do_revert continues after a failed swapoff and reports the incomplete revert" {
+    set_sysctl net.ipv4.tcp_available_congestion_control "cubic bbr"
+    run apply_swap 2G
+    make_mock swapoff --status 1
+    run do_revert
+    [ "$status" -eq 1 ]
+    [ ! -f "$DROPIN" ]   # steps before the failure still completed
+    assert_output_contains "Revert incomplete"
+    [ -f "$SWAPFILE_PATH" ]
 }
 
 @test "apply_initcwnd: rewrites default route and persists via systemd unit" {

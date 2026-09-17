@@ -250,6 +250,78 @@ MOCK
     assert_file_contains "$NFT_CONF" "type filter hook output priority filter; policy accept;"
 }
 
+# A managed-style nftables.conf for the re-run (early-path) tests: exactly one
+# TCP allow rule, as the port manager requires.
+write_managed_nft_conf() {
+    cat > "$NFT_CONF" <<EOF
+#!/usr/sbin/nft -f
+add table inet clikader_filter
+delete table inet clikader_filter
+table inet clikader_filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept
+        ct state { established, related } accept
+        tcp dport { $1 } accept comment "ssh + extra tcp ports"
+        counter drop
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+}
+
+mock_firewall_tools() {
+    make_mock nft
+    make_mock systemctl
+    make_mock sshd --out "port $1"
+    make_mock ss --out "LISTEN 0 128 0.0.0.0:$1 sshd"
+}
+
+@test "prune_stale_setup_ports: closes the old SSH port and dropped extras, keeps user-added ports" {
+    write_managed_nft_conf "22, 14419, 8080, 9090"
+    mock_firewall_tools 14419
+    ssh_port=14419
+    extra_ports=""
+    previous_setup_ports="22 8080"
+    run prune_stale_setup_ports
+    [ "$status" -eq 0 ]
+    # Only the previous run's own ports (22, 8080) are pruned; 9090 was added
+    # later with `clikader nft add` and must survive the re-run.
+    assert_file_contains "$NFT_CONF" 'tcp dport { 14419, 9090 } accept'
+    ! grep -q '22' "$NFT_CONF"
+    ! grep -q '8080' "$NFT_CONF"
+}
+
+@test "prune_stale_setup_ports: no-op when the same ports are requested again" {
+    write_managed_nft_conf "14419, 443"
+    mock_firewall_tools 14419
+    ssh_port=14419
+    extra_ports="443"
+    previous_setup_ports="14419 443"
+    run prune_stale_setup_ports
+    [ "$status" -eq 0 ]
+    ! grep -q '^nft ' "$MOCK_CFG_DIR/calls"
+    assert_file_contains "$NFT_CONF" 'tcp dport { 14419, 443 } accept'
+}
+
+@test "step_configure_nftables: re-run updates an existing managed conf and prunes the old SSH port" {
+    write_managed_nft_conf "22, 8080"
+    mock_firewall_tools 14419
+    ssh_port=14419
+    extra_ports=""
+    previous_setup_ports="22 8080"
+    run step_configure_nftables
+    [ "$status" -eq 0 ]
+    assert_file_contains "$NFT_CONF" 'tcp dport { 14419 } accept'
+    ! grep -q '22' "$NFT_CONF"
+    ! grep -q '8080' "$NFT_CONF"
+}
+
 @test "step_setup_fail2ban: writes jail.local" {
     ssh_port=2222
     last_step=0

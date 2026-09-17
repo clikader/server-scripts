@@ -114,12 +114,14 @@ NR_OPEN_TARGET=1048576       # fs.nr_open (per-process ceiling) floor
 NOFILE_LIMIT=1048576         # nofile written to limits.conf + systemd override
 
 # Concurrency guard + opt-in feature paths.
-LOCK_FILE="${LOCK_FILE:-/var/lock/clikader-tcp.lock}"
 INITCWND_HOOK_DIR="${INITCWND_HOOK_DIR:-/etc/networkd-dispatcher/routable.d}"
 INITCWND_SERVICE="${INITCWND_SERVICE:-/etc/systemd/system/clikader-tcp-initcwnd.service}"
 INITCWND_VALUE=32
 SWAPFILE_PATH="${SWAPFILE_PATH:-/swapfile}"
 FSTAB="${FSTAB:-/etc/fstab}"
+# conntrack hash size persistence: the live module parameter resets on every
+# reboot (module reload), so the tuned value also has to reach modprobe.d.
+CONNTRACK_MODPROBE_CONF="${CONNTRACK_MODPROBE_CONF:-/etc/modprobe.d/clikader-tcp-conntrack.conf}"
 
 # --------------------------------------------------------------------------
 # Pre-flight
@@ -250,17 +252,11 @@ calc_tcp_mem() {
 }
 
 # Concurrency guard: two concurrent runs would race on the drop-in, snapshots
-# and routes. Non-interactive CLI, so just fail with a clear message.
+# and routes. Non-interactive CLI, so just fail with a clear message. Uses the
+# shared clikader lock helper (lock file: $CLIKADER_LOCK_DIR/clikader-tcp.lock)
+# like every other component, instead of a private one.
 take_lock() {
-    command -v flock >/dev/null 2>&1 || return 0
-    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
-    # NB: no `2>/dev/null` on this exec — it would become a permanent redirect
-    # and swallow the script's stderr (all warnings/errors) for the whole run.
-    exec 9>"$LOCK_FILE" || return 0
-    if ! flock -n 9; then
-        error "Another clikader tcp instance is running (lock: $LOCK_FILE)"
-        exit 1
-    fi
+    clikader_lock tcp || exit 1
 }
 
 # Is nf_conntrack loaded/present? (decides whether conntrack keys are applied)
@@ -602,6 +598,8 @@ EOF
 # Scale the conntrack hash table so it doesn't collide at high max. nf_conntrack
 # hashes best when hashsize ~= nf_conntrack_max / 4. Writing the module param
 # resizes live (kernel supports this since 2.6); safe no-op if unavailable.
+# The same value is persisted to modprobe.d so a reboot (module reload) does
+# not silently restore the default hash size.
 apply_conntrack_hashsize() {
     local param="/sys/module/nf_conntrack/parameters/hashsize"
     local max target
@@ -614,6 +612,11 @@ apply_conntrack_hashsize() {
         echo "$target" > "$param" 2>/dev/null && \
             log "Set nf_conntrack hashsize=${target} (max=${max})"
     fi
+    mkdir -p "$(dirname "$CONNTRACK_MODPROBE_CONF")" || return 1
+    printf '# Managed by clikader tcp -- sizes the conntrack hash at module load.\noptions nf_conntrack hashsize=%s\n' \
+        "$target" > "$CONNTRACK_MODPROBE_CONF" || return 1
+    chmod 644 "$CONNTRACK_MODPROBE_CONF"
+    log "Persisted nf_conntrack hashsize=${target} to ${CONNTRACK_MODPROBE_CONF}"
 }
 
 # --------------------------------------------------------------------------
@@ -845,7 +848,7 @@ do_apply() (
         systemctl daemon-reload
     }
     tx_begin tcp restore_tcp_runtime || exit 1
-    tx_save "$DROPIN" "$SYSCONF" "$LIMITS_FILE" "$SYSTEMD_OVERRIDE" "$BBR_MODULE_FILE" "$FSTAB" || exit 1
+    tx_save "$DROPIN" "$SYSCONF" "$LIMITS_FILE" "$SYSTEMD_OVERRIDE" "$BBR_MODULE_FILE" "$FSTAB" "$CONNTRACK_MODPROBE_CONF" || exit 1
 
     # Swap first: build_desired() includes vm.swappiness only when our swap
     # marker exists, so the drop-in written below picks it up on the same run.
@@ -907,7 +910,9 @@ do_apply() (
     log "Set per-process nofile=${NOFILE_LIMIT} (limits.conf + systemd override)"
     echo -e "${GREEN}Done. Boot-time order is correct: zz- drop-in wins.${NC}"
     info "Proxy daemons (sing-box) must be restarted to pick up the new nofile limit."
-    record_managed tcp "$DROPIN" "$SYSTEMD_OVERRIDE" "$LIMITS_FILE" || exit 1
+    # record_managed only hashes files that exist, so the modprobe.d entry is
+    # included exactly when conntrack tuning applied.
+    record_managed tcp "$DROPIN" "$SYSTEMD_OVERRIDE" "$LIMITS_FILE" "$CONNTRACK_MODPROBE_CONF" || exit 1
     tx_commit
 )
 
@@ -916,7 +921,8 @@ do_revert() {
     take_lock
     if [[ ! -f "$DROPIN" ]] && [[ ! -f "${BACKUP_DIR}/live-values.snapshot" ]] \
         && [[ ! -f "${BACKUP_DIR}/initcwnd.owned" ]] \
-        && [[ ! -f "${BACKUP_DIR}/swapfile.owned" ]]; then
+        && [[ ! -f "${BACKUP_DIR}/swapfile.owned" ]] \
+        && [[ ! -f "$CONNTRACK_MODPROBE_CONF" ]]; then
         warning "Nothing to revert (no drop-in and no snapshot found)."
         exit 0
     fi
@@ -965,20 +971,30 @@ do_revert() {
     fi
 
     # 6. Best-effort cleanup of the BBR module-load hint (leave the module
-    #    loaded; rmmod could disrupt live flows).
-    rm -f "$BBR_MODULE_FILE" 2>/dev/null || true
+    #    loaded; rmmod could disrupt live flows), and the conntrack hash
+    #    persistence hint.
+    rm -f "$BBR_MODULE_FILE" "$CONNTRACK_MODPROBE_CONF" 2>/dev/null || true
 
     # 7. Revert opt-in features (each is a no-op unless its marker exists).
+    # A failure here (e.g. swapoff unable to fit swapped pages into RAM) must
+    # not abort the remaining cleanup steps; it is reported and reflected in
+    # the exit status instead.
+    local revert_rc=0
     revert_initcwnd
-    revert_swap
+    revert_swap || revert_rc=1
     rm -f "$BACKUP_DIR/live-values.snapshot" "$BACKUP_DIR/sysctl.conf.orig" "$BACKUP_DIR/limits.conf.orig" \
         "$CLIKADER_STATE_DIR/managed/tcp.sha256"
 
     echo ""
-    echo -e "${GREEN}Reverted to pre-script state.${NC}"
+    if (( revert_rc )); then
+        error "Revert incomplete (see above); re-run 'clikader tcp --revert' after resolving it."
+    else
+        echo -e "${GREEN}Reverted to pre-script state.${NC}"
+    fi
     info "Backups left in ${BACKUP_DIR}/ for audit (safe to delete manually)."
     info "Keys that were UNSET before this script cannot be unset live; reboot to"
     info "restore their kernel defaults. File state (sysctl.conf + drop-in) is fully restored."
+    return "$revert_rc"
 }
 
 # Dry run: show current -> desired for every key, no writes.

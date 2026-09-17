@@ -11,7 +11,14 @@ usage() {
 Usage: clikader maintenance <command>
   enable-security-updates   Enable unattended security updates; automatic reboot OFF
   disable-security-updates  Disable unattended package installation
-  upgrade                   Refresh indexes and install package upgrades (no release upgrade)
+  upgrade [--without-new-pkgs]
+                            Refresh indexes and install package upgrades (no
+                            release upgrade). By default new packages required
+                            by an upgrade (e.g. each fresh kernel, which apt
+                            treats as a new package) are installed too, so
+                            held-back updates cannot accumulate. Pass
+                            --without-new-pkgs for plain `apt-get upgrade`
+                            semantics (held-back packages stay held back).
   backups                   List configuration snapshots
   prune                     Remove configuration snapshots older than 30 days
   --help                    Show help
@@ -63,17 +70,32 @@ EOF
 
 main() {
     local command="${1:---help}"
-    [[ $# -le 1 ]] || { echo 'Unexpected arguments' >&2; return 2; }
+    # `upgrade` is the only command that takes an option; validate the extra
+    # argument inside its own case arm below.
+    [[ $# -le 1 || "$command" == upgrade ]] || { echo 'Unexpected arguments' >&2; return 2; }
     case "$command" in --help|-h|help) usage; return ;; esac
     [[ $EUID -eq 0 ]] || { echo 'This command must be run as root' >&2; return 1; }
     case "$command" in
         enable-security-updates) configure_security_updates 1 ;;
         disable-security-updates) configure_security_updates 0 ;;
         upgrade)
+            local upgrade_args=(upgrade)
+            if [[ "${2:-}" == "--without-new-pkgs" ]]; then
+                shift
+            elif [[ -n "${2:-}" ]]; then
+                echo "Unexpected argument: $2 (see: clikader maintenance upgrade --without-new-pkgs)" >&2
+                return 2
+            else
+                # Default: also install new packages an upgrade requires.
+                # Without this, kernels (always NEW packages) are held back
+                # forever while doctor keeps asking for a reboot into a kernel
+                # this command can never install.
+                upgrade_args+=(--with-new-pkgs)
+            fi
             clikader_lock apt || return 1
             apt_refresh || return 1
             DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 \
-                -o Dpkg::Options::=--force-confold upgrade -y || return 1
+                -o Dpkg::Options::=--force-confold "${upgrade_args[@]}" -y || return 1
             if [[ -f /var/run/reboot-required ]]; then echo 'Reboot required; schedule it manually.'; fi
             ;;
         backups)

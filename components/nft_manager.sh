@@ -13,7 +13,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-NFT_MANAGER_REVISION="1.12.0"
+NFT_MANAGER_REVISION="1.13.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -122,15 +122,6 @@ rule_comment() {
     local line="${1:-}"
     [[ -n "$line" ]] || return 0
     printf '%s' "$line" | sed -n 's/.*[[:space:]]\(comment "[^"]*"\)[[:space:]]*$/\1/p'
-}
-
-# 1-based line number of the first line matching <re>, or empty.
-rule_line_number() {
-    local re="$1"
-    awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | cut -f3- | grep -nE "$re" >/dev/null || return 1
-    awk -f "$NFT_RULE_PARSER" "$NFT_CONF" | while IFS=$'\t' read -r number _protocol line; do
-        if [[ "$line" =~ $re ]]; then echo "$number"; break; fi
-    done
 }
 
 # --- Read current allow sets from nftables.conf ---

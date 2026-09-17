@@ -14,7 +14,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.12.0"
+SETUP_DNS_REVISION="1.13.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -34,6 +34,7 @@ non_interactive=false   # set by --yes: accept all defaults with no prompts
 # System file paths (env-overridable so tests can target temp files; defaults unchanged)
 RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
 DHCLIENT_CONF="${DHCLIENT_CONF:-/etc/dhcp/dhclient.conf}"
+SYSFS_NET="${SYSFS_NET:-/sys/class/net}"
 IFUPD_RESOLVED="${IFUPD_RESOLVED:-/etc/network/if-up.d/resolved}"
 CLOUD_CFG_DIR="${CLOUD_CFG_DIR:-/etc/cloud/cloud.cfg.d}"
 RESOLVED_CONF="${RESOLVED_CONF:-/etc/systemd/resolved.conf}"
@@ -714,6 +715,27 @@ ReadEtcHosts=yes
 ResolveUnicastSingleLabel=no"
 }
 
+# Per-link DNS servers (installed by systemd-networkd or NetworkManager DHCP)
+# take precedence over the global DNS= line for traffic on that link — leaving
+# them in place means the provider's resolver keeps serving that link's queries
+# after cutover. Clear them so the managed global resolver really serves every
+# query. Live-only: a provider's DHCP re-adds per-link servers on renew and at
+# boot, which `clikader doctor` reports as per-link-dns drift.
+clear_per_link_dns() {
+    local link servers
+    [[ -d "$SYSFS_NET" ]] || return 0
+    while IFS= read -r link; do
+        [[ "$link" == lo ]] && continue
+        servers="$(resolvectl dns "$link" 2>/dev/null || true)"
+        if grep -qE 'DNS Servers:.*[0-9A-Fa-f.]' <<< "$servers"; then
+            log "Clearing per-link DNS on ${link} (resolvectl revert)"
+            resolvectl revert "$link" 2>/dev/null \
+                || warning "resolvectl revert ${link} failed; its per-link servers remain"
+        fi
+    done < <(ls "$SYSFS_NET" 2>/dev/null)
+    return 0
+}
+
 # Health check function
 health_check() {
     local all_passed=true
@@ -732,12 +754,14 @@ health_check() {
     
     # Check 2: dhclient.conf configuration
     echo -n "2. Checking dhclient.conf configuration... "
-    if [[ -f $DHCLIENT_CONF ]] && \
-       grep -q "^supersede domain-name-servers" $DHCLIENT_CONF && \
+    if [[ ! -f $DHCLIENT_CONF ]]; then
+        # dhclient absent (netplan/systemd-networkd images): nothing to guard.
+        echo -e "${GREEN}✓ dhclient not present; nothing to guard${NC}"
+    elif grep -q "^supersede domain-name-servers" $DHCLIENT_CONF && \
        grep -q "^prepend domain-name-servers" $DHCLIENT_CONF; then
         echo -e "${GREEN}✓ Properly configured${NC}"
     else
-        echo -e "${YELLOW}'ignore' parameters not found${NC}"
+        echo -e "${YELLOW}DNS override markers not found${NC}"
         all_passed=false
     fi
     
@@ -1153,6 +1177,7 @@ EOF
         return 1
     }
     sleep 2
+    clear_per_link_dns
     resolvectl flush-caches >/dev/null || exit 1
     verify_dns || exit 1
     record_managed dns "$RESOLVED_CONF" "$RESOLVED_CONF_D/10-setup-dns-cache.conf" "$RESOLVED_CONF_D/zz-clikader-dns.conf" || exit 1
