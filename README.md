@@ -306,6 +306,7 @@ directly, exactly as `docker run -p` implies — bind a published port to
 
 **Sub-commands:**
 - `clikader nft` — interactive numbered menu (add / delete / reset)
+- `clikader nft list` / `clikader nft ls` — show the currently allowed inbound ports (tcp/udp), without the full ruleset detail of `nft list ruleset`
 - `clikader nft add <ports> [type]` — allow inbound `<ports>` (comma/space separated, spaces around commas are trimmed); `[type]` is `tcp`, `udp` or `both` (default: both)
 - `clikader nft delete <ports>` — remove `<ports>` from the allowlist (both tcp and udp); the SSH port is protected and skipped (if mixed with other ports, the others are still deleted and a warning is shown)
 - `clikader nft reset [-y]` — clear the allowlist except the SSH port (grabbed from the effective sshd config); `-y` skips the confirmation prompt
@@ -317,6 +318,7 @@ firewall or security-group rules.
 
 ```bash
 sudo clikader nft                          # interactive menu
+sudo clikader nft list                     # show currently allowed inbound ports
 sudo clikader nft add 8080                 # allow TCP+UDP inbound on 8080
 sudo clikader nft add 8080, 8443 tcp       # allow TCP inbound on 8080 and 8443
 sudo clikader nft delete 8080,8443         # remove 8080 and 8443

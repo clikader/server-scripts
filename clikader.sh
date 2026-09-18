@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.14.1"
+CLIKADER_VERSION="1.15.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -110,6 +110,7 @@ echo "  sudo clikader dns --recursive       (switch an existing box to unbound)"
     echo "  sudo clikader tcp --dry-run"
     echo "  sudo clikader tcp --initcwnd --swap 2G"
     echo "  sudo clikader tcp --revert"
+    echo "  sudo clikader nft list"
     echo "  sudo clikader nft add 8080, 8443 tcp"
     echo "  sudo clikader apt-reset"
     echo "  sudo clikader aptreset"

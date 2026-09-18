@@ -355,6 +355,7 @@ MOCK
     run usage
     [ "$status" -eq 0 ]
     assert_output_contains "clikader nft"
+    assert_output_contains "list, ls"
     run subusage add
     assert_output_contains "clikader nft add"
     run subusage delete
@@ -362,6 +363,20 @@ MOCK
     run show_current
     [ "$status" -eq 0 ]
     assert_output_contains "Current allowlist"
+}
+
+@test "main: list and ls show the allowed ports without the full ruleset" {
+    run main list
+    [ "$status" -eq 0 ]
+    assert_output_contains "Current allowlist"
+    assert_output_contains "TCP: 22"
+    assert_output_contains "UDP: 53"
+    run main ls
+    [ "$status" -eq 0 ]
+    assert_output_contains "TCP: 22"
+    assert_output_contains "UDP: 53"
+    # list is read-only: it must never call nft
+    [ ! -s "$MOCK_CFG_DIR/calls" ] || ! grep -q '^nft ' "$MOCK_CFG_DIR/calls"
 }
 
 @test "main: help / unknown / add / delete / reset dispatch" {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# nft manager - add/delete/reset inbound ports in the clikader nftables allowlist
+# nft manager - list/add/delete/reset inbound ports in the clikader nftables allowlist
 #
 # Manages the clikader-managed inbound allow rules in /etc/nftables.conf:
 #   tcp dport { ... } accept comment "ssh + extra tcp ports"
@@ -13,7 +13,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-NFT_MANAGER_REVISION="1.14.1"
+NFT_MANAGER_REVISION="1.15.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -421,6 +421,7 @@ Manage inbound ports in the clikader nftables allowlist (${NFT_CONF}).
 
 Sub-commands:
   (none)              Interactive menu (add / delete / reset)
+  list, ls            Show the currently allowed inbound ports (tcp/udp).
   add <ports> [type]  Allow inbound <ports> (comma/space separated).
                       [type] is tcp, udp or both (default: both).
   delete <ports>      Remove <ports> from the allowlist (tcp and udp).
@@ -429,6 +430,7 @@ Sub-commands:
 
 Examples:
   clikader nft                        Interactive menu
+  clikader nft list                   Show currently allowed inbound ports
   clikader nft add 8080               Allow TCP+UDP inbound on 8080
   clikader nft add 8080, 8443 tcp     Allow TCP inbound on 8080 and 8443
   clikader nft delete 8080,8443       Remove 8080 and 8443 from allowlist
@@ -476,6 +478,9 @@ main() {
                 case "$token" in tcp|udp|both) type="$token" ;; *) raw+=" $token" ;; esac
             done
             add_ports "$raw" "$type"
+            ;;
+        list|ls)
+            show_current
             ;;
         delete)
             shift
