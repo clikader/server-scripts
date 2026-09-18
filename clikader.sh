@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.13.1"
+CLIKADER_VERSION="1.14.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -272,7 +272,7 @@ onboard_clikader() {
     if [[ -n "$dns_extra_args" ]]; then
         info "  1. DNS   (local recursive unbound, no public DNS cache in path)"
     else
-        info "  1. DNS   (direct-IP, default providers, latency-ordered)"
+        info "  1. DNS   (direct-IP; Azure DNS on Azure VMs, else latency-ordered public pick)"
     fi
     info "  2. TCP   (network-stack optimization)"
     info "  3. APT   (reset to official sources)"

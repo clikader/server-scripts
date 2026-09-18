@@ -20,6 +20,15 @@ setup() {
     printf 'nameserver 127.0.0.53\n' > "$STUB_RESOLV_CONF"
     printf '. IN DNSKEY 257 3 8 test-anchor\n' > "$UNBOUND_TRUST_ANCHOR"
 
+    # Hermetic Azure detection: a dead IMDS endpoint (instant refusal, and the
+    # test image has no real curl anyway) plus temp DMI files — the defaults
+    # point at 169.254.169.254 and the host's real DMI tables.
+    export AZURE_IMDS_URL="http://127.0.0.1:9/metadata/instance?api-version=2021-02-01"
+    export DMI_SYS_VENDOR_FILE="$BATS_TEST_TMPDIR/dmi-vendor"
+    export DMI_PRODUCT_FILE="$BATS_TEST_TMPDIR/dmi-product"
+    printf 'QEMU\n' > "$DMI_SYS_VENDOR_FILE"
+    printf 'Standard PC (Q35 + ICH9, ICH9-LPC)\n' > "$DMI_PRODUCT_FILE"
+
     make_mock systemctl
     make_mock resolvectl --out "DNS Servers: 1.1.1.1"
     make_mock apt-get
@@ -129,14 +138,21 @@ MOCK
     [[ "$SECURE_RESOLVED_CONFIG" != *"Cache=yes"* ]]
 }
 
-@test "catalogue: only the three global non-filtering providers remain" {
-    [ "${#DNS_PROVIDERS[@]}" -eq 3 ]
+@test "catalogue: five non-filtering providers, Custom last" {
+    [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
     [ "$(provider_name 1)" = "Cloudflare" ]
     [ "$(provider_name 2)" = "Google" ]
     [ "$(provider_name 3)" = "Quad9" ]
-    [ "$CUSTOM_DNS_INDEX" -eq 4 ]
-    # Filtering / thin-coverage providers must not come back via the fallback
-    # default either.
+    [ "$(provider_name 4)" = "Alibaba" ]
+    [ "$(provider_name 5)" = "DNSPod" ]
+    [ "$CUSTOM_DNS_INDEX" -eq 6 ]
+    # China-optimized anycast pair (added 2026-09-18): both IPs present.
+    [[ "$(provider_ipv4 4)" == *"223.5.5.5"* && "$(provider_ipv4 4)" == *"223.6.6.6"* ]]
+    [[ "$(provider_ipv4 5)" == *"119.29.29.29"* && "$(provider_ipv4 5)" == *"119.28.28.28"* ]]
+    # DoT hostnames ride along as #suffixes for secure mode.
+    [[ "$(provider_ipv4 4)" == *"#dns.alidns.com"* ]]
+    [[ "$(provider_ipv4 5)" == *"#dot.pub"* ]]
+    # Filtering / thin-coverage providers must not come back via the catalogue.
     local joined="${DNS_PROVIDERS[*]}"
     [[ "$joined" != *"AdGuard"* && "$joined" != *"DNS.SB"* && "$joined" != *"OpenDNS"* ]]
 }
@@ -320,6 +336,8 @@ MOCK
     assert_output_contains "Cloudflare (1.1.1.1, 1.0.0.1)"
     assert_output_contains "Google (8.8.8.8, 8.8.4.4)"
     assert_output_contains "Quad9 (9.9.9.10, 149.112.112.10)"
+    assert_output_contains "Alibaba (223.5.5.5, 223.6.6.6)"
+    assert_output_contains "DNSPod (119.29.29.29, 119.28.28.28)"
 }
 
 @test "get_custom_dns via pty: ipv4 only" {
@@ -795,4 +813,165 @@ MOCK
     make_mock dig --out ';; communications error: timed out' --status 9
     run unbound_resolves
     [ "$status" -eq 1 ]
+}
+
+# --------------------------------------------------------------------------
+# Azure VM detection and the Azure DNS default (168.63.129.16)
+#
+# Only Azure DNS (the fabric VIP) can resolve VNET-internal names — private
+# endpoints, internal load balancers, peered-VNET names — so on an Azure VM
+# it must become the default (especially the --yes path used by setup/onboard)
+# while public resolvers stay an explicit, warned choice.
+# --------------------------------------------------------------------------
+
+@test "detect_azure_vm: true when IMDS answers Azure metadata" {
+    make_mock curl --out '{"azEnvironment":"AzurePublicCloud","location":"eastasia"}'
+    detect_azure_vm
+    [ "$is_azure_vm" = true ]
+    [ "$azure_detection_source" = "instance metadata service" ]
+}
+
+@test "detect_azure_vm: DMI fallback when IMDS is unreachable" {
+    make_mock curl --status 1
+    printf 'Microsoft Corporation\n' > "$DMI_SYS_VENDOR_FILE"
+    printf 'Virtual Machine\n' > "$DMI_PRODUCT_FILE"
+    detect_azure_vm
+    [ "$is_azure_vm" = true ]
+    [ "$azure_detection_source" = "DMI fingerprints" ]
+}
+
+@test "detect_azure_vm: false on a non-Azure box" {
+    # No curl mock: the test image ships no curl, so the IMDS probe is skipped
+    # entirely and only the (QEMU) DMI files are consulted.
+    if detect_azure_vm; then
+        echo "expected no Azure detection on QEMU DMI" >&2
+        false
+    fi
+    [ "$is_azure_vm" = false ]
+    [ -z "$azure_detection_source" ]
+}
+
+@test "register_azure_provider: prepends Azure entry, keeps Custom last, idempotent" {
+    is_azure_vm=true
+    register_azure_provider
+    [ "${#DNS_PROVIDERS[@]}" -eq 6 ]
+    [ "$azure_dns_index" -eq 1 ]
+    [ "$(provider_name 1)" = "Azure" ]
+    [ "$(provider_ipv4 1)" = "168.63.129.16" ]
+    [ -z "$(provider_ipv6 1)" ]
+    [ "$CUSTOM_DNS_INDEX" -eq 7 ]
+    # A second registration must not duplicate the entry.
+    register_azure_provider
+    [ "${#DNS_PROVIDERS[@]}" -eq 6 ]
+}
+
+@test "register_azure_provider: no-op on non-Azure boxes" {
+    is_azure_vm=false
+    register_azure_provider
+    [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
+    [ "$azure_dns_index" -eq 0 ]
+    [ "$CUSTOM_DNS_INDEX" -eq 6 ]
+}
+
+@test "select_dns_providers: --yes on an Azure VM defaults to Azure DNS only" {
+    is_azure_vm=true
+    register_azure_provider
+    non_interactive=true
+    use_secure_dns=false
+    ipv6_support=false
+    select_dns_providers
+    [ "$primary_dns" = "168.63.129.16" ]
+    [ "${selected_names[0]}" = "Azure" ]
+}
+
+@test "select_dns_providers: --yes on Azure falls back to public auto when the VIP is silent" {
+    is_azure_vm=true
+    register_azure_provider
+    non_interactive=true
+    use_secure_dns=false
+    ipv6_support=false
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+for a in "$@"; do
+    [[ "$a" == "@168.63.129.16" ]] && exit 1
+done
+printf '93.184.216.34\n'
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    run select_dns_providers
+    [ "$status" -eq 0 ]
+    assert_output_contains "did not answer the probe"
+    assert_output_contains "Falling back to auto-pick public resolvers"
+    assert_output_contains "will NOT resolve"
+}
+
+@test "select_dns_providers via pty: empty input on an Azure VM takes the Azure default" {
+    local inner
+    inner="$(make_inner components/setup_dns.sh 'is_azure_vm=true; register_azure_provider; non_interactive=false; use_secure_dns=false; ipv6_support=false; select_dns_providers; printf "PRIMARY=%s\n" "$primary_dns"')"
+    run_pty "$inner" ""
+    [ "$PTY_RC" -eq 0 ]
+    [[ "$PTY_OUT" == *"PRIMARY=168.63.129.16"* ]]
+}
+
+@test "select_dns_providers via pty: a public choice on Azure warns about VNET names" {
+    local inner
+    inner="$(make_inner components/setup_dns.sh 'is_azure_vm=true; register_azure_provider; non_interactive=false; use_secure_dns=false; ipv6_support=false; select_dns_providers')"
+    run_pty "$inner" "2"
+    [ "$PTY_RC" -eq 0 ]
+    [[ "$PTY_OUT" == *"will NOT resolve"* ]]
+    [[ "$PTY_OUT" == *"Select 1 (Azure DNS 168.63.129.16)"* ]]
+}
+
+@test "secure DNS selection including Azure downgrades DoT (no DoT on the fabric VIP)" {
+    is_azure_vm=true
+    register_azure_provider
+    non_interactive=true
+    use_secure_dns=true
+    has_dot_support=true
+    ipv6_support=false
+    select_dns_providers
+    [ "$has_dot_support" = false ]
+    generate_resolved_config
+    [[ "$SECURE_RESOLVED_CONFIG" == *"DNS=168.63.129.16"* ]]
+    [[ "$SECURE_RESOLVED_CONFIG" == *"DNSOverTLS=no"* ]]
+    [[ "$SECURE_RESOLVED_CONFIG" == *"DNSSEC=yes"* ]]
+}
+
+@test "ask_resolver_mode: --yes on an Azure VM announces the Azure DNS default" {
+    is_azure_vm=true
+    non_interactive=true
+    use_recursive=false
+    run ask_resolver_mode
+    [ "$status" -eq 0 ]
+    assert_output_contains "forward to Azure DNS 168.63.129.16"
+}
+
+@test "ask_resolver_mode: recursive on an Azure VM warns about VNET-internal names" {
+    is_azure_vm=true
+    non_interactive=true
+    use_recursive=true
+    run ask_resolver_mode
+    [ "$status" -eq 0 ]
+    assert_output_contains "cannot resolve VNET-internal names"
+}
+
+@test "main: --yes on an Azure VM configures Azure DNS end-to-end" {
+    printf 'Microsoft Corporation\n' > "$DMI_SYS_VENDOR_FILE"
+    printf 'Virtual Machine\n' > "$DMI_PRODUCT_FILE"
+    non_interactive=true
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
+printf ' %s' "$@" >> "$MOCK_CFG_DIR/calls"
+printf '\n' >> "$MOCK_CFG_DIR/calls"
+if [[ "$1" == "--version" ]]; then printf 'systemd 255 (255.4-1)\n'; fi
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    run main
+    [ "$status" -eq 0 ]
+    assert_output_contains "Azure VM detected (via DMI fingerprints)"
+    assert_output_contains "DNS setup completed successfully"
+    assert_file_contains "$RESOLVED_CONF" "DNS=168.63.129.16"
 }

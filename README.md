@@ -177,14 +177,21 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 
 **Two resolver modes:**
 
-- **Forward (default)** — systemd-resolved forwards to the selected public resolvers. **Providers:** Cloudflare, Google, Quad9, Custom — globally famous, non-filtering, anycast-everywhere resolvers only (filtering resolvers like AdGuard/OpenDNS and thin-coverage ones like DNS.SB/Control D/CleanBrowsing are deliberately excluded; use Custom DNS for those)
+- **Forward (default)** — systemd-resolved forwards to the selected resolvers. **Providers:** Cloudflare, Google, Quad9, Alibaba (223.5.5.5/223.6.6.6, DoT `dns.alidns.com`), DNSPod (119.29.29.29/119.28.28.28, DoT `dot.pub`), Custom — famous, non-filtering resolvers only (filtering resolvers like AdGuard/OpenDNS are deliberately excluded; the two China-optimized anycast providers were added 2026-09-18 for CN-adjacent boxes where their POPs win the latency race; use Custom DNS for anything else)
 - **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. **Requires an unfiltered authoritative DNS path:** many hosting networks filter outbound port 53 to the root, TLD or authoritative servers, which makes recursion impossible. unbound still starts and reports `active` while answering nothing, so the script performs a real iterative lookup (root → TLD → authoritative) first and **refuses to continue** if it cannot complete one, rather than leave the box without DNS. Note that `FallbackDNS` does *not* rescue recursive mode: systemd-resolved consults it only when no DNS server is configured at all, and recursive mode sets `DNS=127.0.0.1`. Onboarding support: `clikader onboard --recursive`; switch an existing box with `clikader dns --yes --recursive`
+
+**Azure VMs — Azure DNS is the default (168.63.129.16):**
+- Azure VMs are auto-detected via the Azure Instance Metadata Service (`169.254.169.254`, requires the `Metadata: true` request only Azure's fabric serves), with an offline DMI fallback (vendor `Microsoft Corporation` + product `Virtual Machine`) for networks that filter link-local
+- The Azure DNS virtual IP is the **only** resolver that answers VNET-internal names — private endpoints / Private Link zones, internal load balancers, peered-VNET names. Every public resolver (and a local unbound recursor) returns NXDOMAIN for them, which is why the VIP becomes the default on Azure
+- Applies to `clikader setup` / `clikader onboard` (`--yes`) and to the interactive default; the entry appears as menu slot 1, marked *recommended*. To use public resolvers instead, re-run `clikader dns` and pick them — the script warns that VNET-internal names will stop resolving. `--recursive` on an Azure VM warns for the same reason
+- If the VIP does not answer its probe (mis-detected Azure VM — on-prem Hyper-V shares the DMI fingerprints — or a blocked fabric resolver), a `--yes` run falls back to the public auto-pick with a loud warning instead of aborting
+- The fabric VIP offers no DoT and no IPv6; a secure-DNS selection that includes it downgrades that run to plain DNS
 
 **Features:**
 - Defaults to plain direct-IP DNS
 - Optional strict, certificate-validated DNS-over-TLS (DoT) and DNSSEC validation (forward mode)
 - IPv6 support (optional)
-- **Auto mode (default):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies
+- **Auto mode (default off Azure):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies. On Azure VMs the default is Azure DNS instead (see above); explicit `auto` still probes everything, including the Azure entry
 - Manually select specific providers if preferred
 - Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
 - Static `FallbackDNS` is used only when no DNS server is configured; it does **not** rescue unreachable configured servers

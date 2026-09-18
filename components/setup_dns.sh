@@ -6,6 +6,8 @@
 # authoritative nameservers directly, removing every public resolver cache
 # (and its stale negative answers) from the path — the real fix for ACME
 # DNS-01 propagation hangs. See resolve_cache_setting for the background.
+# On Azure VMs (auto-detected) the default resolver is Azure DNS 168.63.129.16:
+# the only resolver that can answer VNET-internal names. See detect_azure_vm.
 # Officially supported: Debian 12/13, Ubuntu 22.04/24.04/26
 # Other OS versions may work but are user-tested, not officially supported.
 
@@ -14,7 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.13.1"
+SETUP_DNS_REVISION="1.14.0"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -82,23 +84,94 @@ AUTO_PICK_TOP=3
 # reordering a provider only changes one place. The index in the array + 1 is
 # the menu number shown to the user (1-based, matching the original script).
 #
-# Curation policy (decided 2026-09): only globally famous, non-filtering,
-# anycast-everywhere resolvers. Servers run unattended ACME DNS-01 challenges
-# and background jobs, so resolvers that filter/redirect (AdGuard, OpenDNS)
-# or have thin regional coverage (DNS.SB, Control D, CleanBrowsing) are
-# deliberately excluded — "Custom DNS" covers anything not listed here.
+# Curation policy (decided 2026-09): famous, non-filtering resolvers only.
+# Servers run unattended ACME DNS-01 challenges and background jobs, so
+# resolvers that filter/redirect (AdGuard, OpenDNS) are deliberately excluded
+# — "Custom DNS" covers anything not listed here. Alibaba and DNSPod
+# (added 2026-09-18) are China-optimized anycast rather than anycast-
+# everywhere, kept because on CN-adjacent boxes their POPs win the latency
+# race; thin-coverage regional resolvers otherwise stay out (use Custom DNS).
 #
 # DoT hostname is embedded as "<ip>#<hostname>" per systemd-resolved syntax.
 # Direct-IP mode strips the "#hostname" suffix before applying (see select_dns_providers).
 #
-# Verified 2026-07: each provider offers public DoT on port 853.
+# Verified 2026-07: the global three offer public DoT on port 853.
+# Verified 2026-09 against provider docs: dns.alidns.com and dot.pub (port 853).
 DNS_PROVIDERS=(
     "Cloudflare|1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com|2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
     "Google|8.8.8.8#dns.google 8.8.4.4#dns.google|2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
     "Quad9|9.9.9.10#dns10.quad9.net 149.112.112.10#dns10.quad9.net|2620:fe::10#dns10.quad9.net 2620:fe::fe:10#dns10.quad9.net"
+    "Alibaba|223.5.5.5#dns.alidns.com 223.6.6.6#dns.alidns.com|2400:3200::1#dns.alidns.com 2400:3200:baba::1#dns.alidns.com"
+    "DNSPod|119.29.29.29#dot.pub 119.28.28.28#dot.pub|2402:4e00::#dot.pub"
 )
 # Index of the "Custom DNS" menu entry (always last, after the catalogue).
 CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
+
+# --- Azure VM detection and fabric DNS ---
+# Azure VMs must send their queries to the Azure DNS virtual IP 168.63.129.16
+# (an address answered by the host fabric, not a real server) to resolve
+# VNET-internal names: private endpoints / Private Link zones, internal load
+# balancers and peered-VNET names exist only inside Azure's resolver, so every
+# public resolver — and a local unbound recursor — answers NXDOMAIN for them.
+# On an Azure VM the VIP is therefore the default (including --yes, i.e. the
+# setup/onboard path); public resolvers stay a menu choice with a warning.
+AZURE_DNS_VIP="168.63.129.16"
+# Env-overridable probes so tests can point them at temp files (defaults unchanged).
+AZURE_IMDS_URL="${AZURE_IMDS_URL:-http://169.254.169.254/metadata/instance?api-version=2021-02-01}"
+AZURE_IMDS_TIMEOUT=3
+DMI_SYS_VENDOR_FILE="${DMI_SYS_VENDOR_FILE:-/sys/class/dmi/id/sys_vendor}"
+DMI_PRODUCT_FILE="${DMI_PRODUCT_FILE:-/sys/class/dmi/id/product_name}"
+is_azure_vm=false
+azure_detection_source=""
+azure_dns_index=0   # menu index of the Azure entry once registered (1); 0 = absent
+
+# True when this box is an Azure VM (sets is_azure_vm / azure_detection_source).
+#
+# Primary probe: the Azure Instance Metadata Service. The /metadata/instance
+# path with a Metadata:true header is served only by Azure's fabric — AWS/GCP
+# metadata endpoints reject this exact request — so a reply containing
+# "azEnvironment" is conclusive. Bounded by a short timeout; --noproxy keeps
+# link-local traffic off any configured HTTP proxy.
+#
+# Offline fallback (for networks that filter 169.254.169.254): Azure VMs report
+# DMI vendor "Microsoft Corporation" with product name "Virtual Machine".
+detect_azure_vm() {
+    is_azure_vm=false
+    azure_detection_source=""
+    local out=""
+    if command -v curl &> /dev/null; then
+        out="$(curl -s -m "$AZURE_IMDS_TIMEOUT" --noproxy '*' \
+            -H 'Metadata: true' "$AZURE_IMDS_URL" 2>/dev/null || true)"
+    fi
+    if grep -q '"azEnvironment"' <<< "$out" 2>/dev/null; then
+        is_azure_vm=true
+        azure_detection_source="instance metadata service"
+        return 0
+    fi
+    local vendor product
+    vendor="$(cat "$DMI_SYS_VENDOR_FILE" 2>/dev/null || true)"
+    product="$(cat "$DMI_PRODUCT_FILE" 2>/dev/null || true)"
+    if [[ "$vendor" == "Microsoft Corporation" && "$product" == "Virtual Machine" ]]; then
+        is_azure_vm=true
+        azure_detection_source="DMI fingerprints"
+        return 0
+    fi
+    return 1
+}
+
+# Prepend the Azure DNS entry to the catalogue as menu slot 1 (and the --yes /
+# empty-input default) once an Azure VM is detected. Non-Azure boxes never see
+# it: the VIP is unreachable outside Azure, so probing it would only cost every
+# user a timeout. The entry carries no DoT hostname and no IPv6 — the fabric
+# VIP speaks plain IPv4 DNS only.
+register_azure_provider() {
+    [[ "$is_azure_vm" == true ]] || return 0
+    (( azure_dns_index == 0 )) || return 0
+    DNS_PROVIDERS=("Azure|${AZURE_DNS_VIP}|" "${DNS_PROVIDERS[@]}")
+    azure_dns_index=1
+    # The Custom entry is always last: recompute for the grown catalogue.
+    CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
+}
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -308,8 +381,9 @@ ask_resolver_mode() {
     echo "  Resolver Mode"
     echo "=========================================="
     echo ""
-    echo "  forward   - systemd-resolved forwards to Cloudflare/Google/Quad9"
-    echo "              (default, current behavior)"
+    echo "  forward   - systemd-resolved forwards to the selected resolver"
+    echo "              (Azure DNS on Azure VMs, else a public provider:"
+    echo "              Cloudflare/Google/Quad9/Alibaba/DNSPod; default behavior)"
     echo "  recursive - local unbound resolves via the authoritative nameservers"
     echo "              directly: no public DNS cache in the path, DNSSEC"
     echo "              validated, immune to stale-negative cert hangs"
@@ -319,27 +393,43 @@ ask_resolver_mode() {
     echo "              script refuses to continue rather than leave the box without DNS."
     echo ""
 
+    if [[ "$is_azure_vm" == true ]]; then
+        echo "  NOTE (Azure VM): only Azure DNS ${AZURE_DNS_VIP} resolves VNET-internal"
+        echo "  names (private endpoints, internal load balancers, peered VNETs)."
+        echo "  Recursive mode, like public resolvers, cannot see them — the default"
+        echo "  on this box (forward + Azure DNS) is the recommended choice."
+        echo ""
+    fi
+
     if [[ "$non_interactive" == true ]]; then
         if [[ "$use_recursive" == true ]]; then
             log "Resolver: local recursive (unbound) [--recursive]"
+        elif [[ "$is_azure_vm" == true ]]; then
+            log "Resolver: forward to Azure DNS ${AZURE_DNS_VIP} (default; pass --recursive for unbound)"
         else
             log "Resolver: forward to public DNS (default; pass --recursive for unbound)"
         fi
         echo ""
-        return
-    fi
-
-    echo -n "Use the local recursive resolver (unbound)? (y/N): "
-    read -r recursive_answer < /dev/tty
-
-    if [[ "$recursive_answer" =~ ^[Yy]$ ]]; then
-        use_recursive=true
-        log "Resolver: local recursive (unbound)"
     else
-        use_recursive=false
-        log "Resolver: forward to public DNS"
+        echo -n "Use the local recursive resolver (unbound)? (y/N): "
+        read -r recursive_answer < /dev/tty
+
+        if [[ "$recursive_answer" =~ ^[Yy]$ ]]; then
+            use_recursive=true
+            log "Resolver: local recursive (unbound)"
+        else
+            use_recursive=false
+            log "Resolver: forward to public DNS"
+        fi
+        echo ""
     fi
-    echo ""
+
+    if [[ "$is_azure_vm" == true && "$use_recursive" == true ]]; then
+        warning "Recursive mode on an Azure VM cannot resolve VNET-internal names"
+        warning "(private endpoints, internal load balancers, peered-VNET names -> NXDOMAIN)."
+        warning "Re-run without --recursive to use Azure DNS ${AZURE_DNS_VIP} instead."
+        echo ""
+    fi
 }
 
 ask_secure_dns() {
@@ -510,21 +600,33 @@ select_dns_providers() {
     echo "=========================================="
     echo ""
     echo "Available DNS providers:"
-    echo "  auto) Automatically test ALL providers and pick the ${AUTO_PICK_TOP} fastest (recommended)"
+    if (( azure_dns_index )); then
+        echo "  auto) Test ALL providers (including Azure DNS) and keep the ${AUTO_PICK_TOP} fastest"
+    else
+        echo "  auto) Automatically test ALL providers and pick the ${AUTO_PICK_TOP} fastest (recommended)"
+    fi
 
     # Generate the numbered list from the catalogue so the menu and the data
     # can never drift apart. Show every IPv4 (both anycast IPs of a provider
     # are always written to DNS=; the DoT hostname only in secure-DNS mode).
-    local i name ipv4_display dot
+    local i name ipv4_display first_ip recommended
     for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
         name="$(provider_name "$i")"
         ipv4_display="$(provider_ipv4 "$i" | sed 's/#[^ ]*//g')"
         ipv4_display="${ipv4_display// /, }"
+        recommended=""
+        if [[ "$i" -eq "$azure_dns_index" ]]; then
+            recommended=" [recommended: required for VNET-internal names]"
+        fi
         if [[ "$use_secure_dns" == true ]]; then
-            dot="$(provider_ipv4 "$i" | awk '{print $1}' | sed 's/.*#//')"
-            printf '  %2d) %s (%s) - DoT: %s\n' "$i" "$name" "$ipv4_display" "$dot"
+            first_ip="$(provider_ipv4 "$i" | awk '{print $1}')"
+            if [[ "$first_ip" == *'#'* ]]; then
+                printf '  %2d) %s (%s) - DoT: %s%s\n' "$i" "$name" "$ipv4_display" "${first_ip#*#}" "$recommended"
+            else
+                printf '  %2d) %s (%s) - DoT: none (plain DNS only)%s\n' "$i" "$name" "$ipv4_display" "$recommended"
+            fi
         else
-            printf '  %2d) %s (%s)\n' "$i" "$name" "$ipv4_display"
+            printf '  %2d) %s (%s)%s\n' "$i" "$name" "$ipv4_display" "$recommended"
         fi
     done
     echo "  ${CUSTOM_DNS_INDEX}) Custom DNS (define your own)"
@@ -537,16 +639,36 @@ select_dns_providers() {
     load_provider_table
 
     local selections=""
+    local azure_default=false
     if [[ "$non_interactive" == true ]]; then
-        selections="auto"
-        echo "Selection (default: auto): auto  [--yes]"
-        log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
+        if (( azure_dns_index )); then
+            # Azure VM + --yes (setup/onboard path): Azure DNS only. Public
+            # resolvers remain available by re-running interactively.
+            selections="$azure_dns_index"
+            azure_default=true
+            echo "Selection (default: Azure DNS): ${AZURE_DNS_VIP}  [--yes]"
+            log "Azure VM default: Azure DNS ${AZURE_DNS_VIP} (rerun 'clikader dns' interactively for public resolvers)"
+        else
+            selections="auto"
+            echo "Selection (default: auto): auto  [--yes]"
+            log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
+        fi
     else
-        echo -n "Selection (default: auto): "
+        if (( azure_dns_index )); then
+            echo -n "Selection (default: ${azure_dns_index} = Azure DNS, 'auto' probes all): "
+        else
+            echo -n "Selection (default: auto): "
+        fi
         read -r selections < /dev/tty
         if [[ -z "$selections" ]]; then
-            selections="auto"
-            log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
+            if (( azure_dns_index )); then
+                selections="$azure_dns_index"
+                azure_default=true
+                log "Using default selection: Azure DNS ${AZURE_DNS_VIP}"
+            else
+                selections="auto"
+                log "Using default selection: auto-pick fastest ${AUTO_PICK_TOP}"
+            fi
         fi
     fi
 
@@ -585,7 +707,30 @@ select_dns_providers() {
     done
 
     if [[ ${#probeable_selections[@]} -gt 0 ]]; then
-        order_by_latency "${probeable_selections[@]}" || return 1
+        if ! order_by_latency "${probeable_selections[@]}"; then
+            if [[ "$azure_default" != true ]]; then
+                return 1
+            fi
+            # The Azure VIP did not answer: a mis-detected "Azure" VM (DMI
+            # fingerprints also match on-prem Hyper-V) or a network blocking
+            # the fabric resolver. Do not abort a --yes run over it — fall
+            # back to the public auto-pick so the box keeps working DNS, with
+            # a loud warning that VNET-internal names will not resolve.
+            warning "Azure DNS ${AZURE_DNS_VIP} did not answer the probe."
+            warning "Falling back to auto-pick public resolvers; Azure VNET-internal"
+            warning "names will NOT resolve on this box."
+            is_auto=true
+            probeable_selections=()
+            for (( i = 1; i <= ${#DNS_PROVIDERS[@]}; i++ )); do
+                if [[ "$i" -eq "$azure_dns_index" ]]; then
+                    continue
+                fi
+                probeable_selections+=("$i")
+            done
+            if [[ ${#probeable_selections[@]} -eq 0 ]] || ! order_by_latency "${probeable_selections[@]}"; then
+                return 1
+            fi
+        fi
     else
         SORTED_SELECTIONS=""
     fi
@@ -614,6 +759,26 @@ select_dns_providers() {
     local final_order="$SORTED_SELECTIONS"
     if [[ "$has_custom" == true ]]; then
         final_order+=" $CUSTOM_DNS_INDEX"
+    fi
+
+    # On an Azure VM, warn when the selection contains no Azure DNS: the box
+    # loses VNET-internal name resolution. Not fatal — the operator may know
+    # the box never talks to VNET-internal names.
+    if [[ "$is_azure_vm" == true ]] \
+       && ! grep -qw "$azure_dns_index" <<< "$final_order"; then
+        echo ""
+        warning "No Azure DNS in this selection: Azure VNET-internal names (private"
+        warning "endpoints, internal load balancers, peered-VNET names) will NOT resolve."
+        warning "Select ${azure_dns_index} (Azure DNS ${AZURE_DNS_VIP}) to keep VNET resolution."
+    fi
+
+    # The Azure fabric VIP does not offer DoT; a secure-mode selection that
+    # includes it downgrades this run to plain DNS (mirrors the
+    # custom-DNS-without-DoT handling in get_custom_dns).
+    if [[ "$use_secure_dns" == true ]] \
+       && grep -qw "$azure_dns_index" <<< "$final_order"; then
+        has_dot_support=false
+        warning "Azure DNS does not offer DNS-over-TLS; DoT disabled for this selection."
     fi
 
     primary_dns=""
@@ -1271,7 +1436,15 @@ main() {
         echo ""
         log "Starting DNS reconfiguration..."
     fi
-    
+
+    # Detect Azure before any prompt: it changes the recommended resolver mode
+    # and the provider default (Azure DNS — required for VNET-internal names).
+    if detect_azure_vm; then
+        register_azure_provider
+        log "Azure VM detected (via ${azure_detection_source})"
+        log "Azure DNS ${AZURE_DNS_VIP} is the default resolver here (required for VNET-internal names)"
+    fi
+
     ask_resolver_mode
 
     if [[ "$use_recursive" == true ]]; then
@@ -1335,7 +1508,7 @@ main() {
         if [[ "$has_dot_support" == true ]]; then
             echo "  • DNS-over-TLS: Required, certificate-validated"
         else
-            echo "  • DNS-over-TLS: Disabled (custom DNS without DoT support)"
+            echo "  • DNS-over-TLS: Disabled (selection contains a plain-DNS-only server)"
         fi
     else
         echo "  • DNSSEC: No"
