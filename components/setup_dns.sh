@@ -16,7 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.14.0"
+SETUP_DNS_REVISION="1.14.1"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -125,6 +125,15 @@ is_azure_vm=false
 azure_detection_source=""
 azure_dns_index=0   # menu index of the Azure entry once registered (1); 0 = absent
 
+# Does the Azure fabric DNS VIP actually answer a query from this box?
+# Outside Azure the address leads nowhere, so silence means "not Azure".
+# Used to reject DMI false positives: Hyper-V guests from OTHER providers
+# report the identical vendor/product strings but have no Azure fabric
+# behind them, and the Azure DNS option must never appear on those boxes.
+dns_vip_answers() {
+    [[ -n "$(dig_query "$AZURE_DNS_VIP" "$PROBE_QUERY" "$PROBE_QTYPE")" ]]
+}
+
 # True when this box is an Azure VM (sets is_azure_vm / azure_detection_source).
 #
 # Primary probe: the Azure Instance Metadata Service. The /metadata/instance
@@ -133,8 +142,12 @@ azure_dns_index=0   # menu index of the Azure entry once registered (1); 0 = abs
 # "azEnvironment" is conclusive. Bounded by a short timeout; --noproxy keeps
 # link-local traffic off any configured HTTP proxy.
 #
-# Offline fallback (for networks that filter 169.254.169.254): Azure VMs report
-# DMI vendor "Microsoft Corporation" with product name "Virtual Machine".
+# Fallback for networks that filter link-local 169.254.169.254: DMI vendor
+# "Microsoft Corporation" + product "Virtual Machine". Those fingerprints
+# alone are NOT trusted — Hyper-V VMs at other providers match them too —
+# so the fallback additionally requires the fabric DNS VIP to answer one
+# real query (it only answers on Azure). A non-Azure machine therefore
+# never sees the Azure entry, as menu option or default, in any code path.
 detect_azure_vm() {
     is_azure_vm=false
     azure_detection_source=""
@@ -151,9 +164,10 @@ detect_azure_vm() {
     local vendor product
     vendor="$(cat "$DMI_SYS_VENDOR_FILE" 2>/dev/null || true)"
     product="$(cat "$DMI_PRODUCT_FILE" 2>/dev/null || true)"
-    if [[ "$vendor" == "Microsoft Corporation" && "$product" == "Virtual Machine" ]]; then
+    if [[ "$vendor" == "Microsoft Corporation" && "$product" == "Virtual Machine" ]] \
+       && dns_vip_answers; then
         is_azure_vm=true
-        azure_detection_source="DMI fingerprints"
+        azure_detection_source="DMI fingerprints + fabric DNS answer"
         return 0
     fi
     return 1
@@ -711,11 +725,12 @@ select_dns_providers() {
             if [[ "$azure_default" != true ]]; then
                 return 1
             fi
-            # The Azure VIP did not answer: a mis-detected "Azure" VM (DMI
-            # fingerprints also match on-prem Hyper-V) or a network blocking
-            # the fabric resolver. Do not abort a --yes run over it — fall
-            # back to the public auto-pick so the box keeps working DNS, with
-            # a loud warning that VNET-internal names will not resolve.
+            # The Azure VIP did not answer — the fabric resolver is blocked
+            # or transiently down (DMI false positives can no longer reach
+            # here: detect_azure_vm rejects them before registration). Do
+            # not abort a --yes run over it — fall back to the public
+            # auto-pick so the box keeps working DNS, with a loud warning
+            # that VNET-internal names will not resolve.
             warning "Azure DNS ${AZURE_DNS_VIP} did not answer the probe."
             warning "Falling back to auto-pick public resolvers; Azure VNET-internal"
             warning "names will NOT resolve on this box."

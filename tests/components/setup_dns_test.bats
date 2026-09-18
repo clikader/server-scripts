@@ -829,15 +829,42 @@ MOCK
     detect_azure_vm
     [ "$is_azure_vm" = true ]
     [ "$azure_detection_source" = "instance metadata service" ]
+    # IMDS is conclusive: the fabric VIP is not probed on this path.
+    assert_mock_called dig 0
 }
 
-@test "detect_azure_vm: DMI fallback when IMDS is unreachable" {
+@test "detect_azure_vm: DMI match counts only with a fabric DNS answer" {
     make_mock curl --status 1
     printf 'Microsoft Corporation\n' > "$DMI_SYS_VENDOR_FILE"
     printf 'Virtual Machine\n' > "$DMI_PRODUCT_FILE"
     detect_azure_vm
     [ "$is_azure_vm" = true ]
-    [ "$azure_detection_source" = "DMI fingerprints" ]
+    [ "$azure_detection_source" = "DMI fingerprints + fabric DNS answer" ]
+    assert_mock_called dig 1
+}
+
+@test "detect_azure_vm: DMI match with a silent VIP is rejected (Hyper-V elsewhere)" {
+    # Hyper-V guests from other providers report the identical DMI strings but
+    # have no Azure fabric: 168.63.129.16 stays silent, so the Azure entry
+    # must not be shown or defaulted anywhere on such boxes.
+    make_mock curl --status 1
+    printf 'Microsoft Corporation\n' > "$DMI_SYS_VENDOR_FILE"
+    printf 'Virtual Machine\n' > "$DMI_PRODUCT_FILE"
+    cat > "$MOCK_BIN/dig" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+    chmod +x "$MOCK_BIN/dig"
+    if detect_azure_vm; then
+        echo "expected Hyper-V DMI match without fabric answer to be rejected" >&2
+        false
+    fi
+    [ "$is_azure_vm" = false ]
+    [ -z "$azure_detection_source" ]
+    # Nothing was registered, so the catalogue is unchanged.
+    register_azure_provider
+    [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
+    [ "$azure_dns_index" -eq 0 ]
 }
 
 @test "detect_azure_vm: false on a non-Azure box" {
@@ -971,7 +998,7 @@ MOCK
     chmod +x "$MOCK_BIN/systemctl"
     run main
     [ "$status" -eq 0 ]
-    assert_output_contains "Azure VM detected (via DMI fingerprints)"
+    assert_output_contains "Azure VM detected (via DMI fingerprints + fabric DNS answer)"
     assert_output_contains "DNS setup completed successfully"
     assert_file_contains "$RESOLVED_CONF" "DNS=168.63.129.16"
 }

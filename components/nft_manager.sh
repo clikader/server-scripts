@@ -13,7 +13,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-NFT_MANAGER_REVISION="1.14.0"
+NFT_MANAGER_REVISION="1.14.1"
 
 # Color codes for output
 RED='\033[0;31m'
