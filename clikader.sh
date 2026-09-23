@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.15.1"
+CLIKADER_VERSION="1.15.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -102,6 +102,7 @@ echo "  sudo clikader update"
 echo "  sudo clikader setup"
 echo "  sudo clikader vpssetup --force"
     echo "  sudo clikader dns --recursive       (switch an existing box to unbound)"
+    echo "  sudo clikader dns list              (show the current DNS servers)"
     echo "  sudo clikader dns"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
@@ -237,7 +238,11 @@ dispatch_command() {
             run_script "setup_vps.sh" "VPS Setup" "$@"
             ;;
         "dns")
-            has_help_flag "$@" || require_root "$command"
+            # `dns list` is read-only; keep it usable without root so any user
+            # can inspect the current resolvers.
+            if ! has_help_flag "$@" && [[ "${1:-}" != list && "${1:-}" != ls ]]; then
+                require_root "$command"
+            fi
             run_script "setup_dns.sh" "Setup DNS" "$@"
             ;;
         "tcp")

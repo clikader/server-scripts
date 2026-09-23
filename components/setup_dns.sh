@@ -16,7 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.15.1"
+SETUP_DNS_REVISION="1.15.2"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -32,6 +32,7 @@ has_dot_support=false
 use_secure_dns=false
 use_recursive=false     # set by --recursive: local unbound resolver instead of forwarding
 non_interactive=false   # set by --yes: accept all defaults with no prompts
+show_dns_config=false   # set by list/ls: print the current resolvers and exit
 
 # System file paths (env-overridable so tests can target temp files; defaults unchanged)
 RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
@@ -247,8 +248,15 @@ while [[ $# -gt 0 ]]; do
             non_interactive=true
             shift
             ;;
+        list|ls)
+            show_dns_config=true
+            shift
+            ;;
         -h|--help)
-            echo 'Usage: clikader dns [--yes] [--recursive] [--ipv6]'
+            cat <<'EOF'
+Usage: clikader dns [list|ls] [--yes] [--recursive] [--ipv6]
+  list, ls    Show the current DNS servers (read-only, no changes)
+EOF
             exit 0
             ;;
         *)
@@ -534,6 +542,84 @@ unlock_resolv_conf() {
         fi
     fi
 }
+
+# --- List mode (read-only) ---
+# Prints the configured resolvers plus what systemd-resolved is actually using
+# right now, so nobody has to remember which file to cat. Read-only: no lock,
+# no writes, safe to run as a normal user (`clikader dns list`).
+show_dns_overview() {
+    local candidate managed_file="" dns_line="" fallback_line="" dnssec="" dot="" mode unbound_state
+    # The clikader drop-in overrides the main file for the settings it sets, so
+    # prefer it; fall back to the main resolved.conf, then to "unmanaged".
+    for candidate in "$RESOLVED_CONF_D/zz-clikader-dns.conf" "$RESOLVED_CONF"; do
+        [[ -f "$candidate" ]] || continue
+        managed_file="$candidate"
+        dns_line="$(sed -n 's/^DNS=[[:space:]]*//p' "$candidate" | tail -1)"
+        fallback_line="$(sed -n 's/^FallbackDNS=[[:space:]]*//p' "$candidate" | tail -1)"
+        dnssec="$(sed -n 's/^DNSSEC=[[:space:]]*//p' "$candidate" | tail -1)"
+        dot="$(sed -n 's/^DNSOverTLS=[[:space:]]*//p' "$candidate" | tail -1)"
+        break
+    done
+    if [[ "$dns_line" == *127.0.0.1* ]] && systemctl is-active --quiet unbound 2>/dev/null; then
+        mode="recursive (systemd-resolved -> unbound on 127.0.0.1:53)"
+    elif [[ -n "$managed_file" ]]; then
+        mode="forward (systemd-resolved -> upstream resolvers)"
+    else
+        mode="unmanaged (provider/systemd default)"
+    fi
+
+    echo ""
+    echo "Current DNS configuration"
+    echo "========================="
+    printf 'Mode:            %s\n' "$mode"
+    printf 'Managed file:    %s\n' "${managed_file:-none}"
+    if [[ -n "$dns_line" ]]; then
+        printf 'DNS servers:     %s\n' "$dns_line"
+    elif [[ -n "$managed_file" ]]; then
+        printf 'DNS servers:     (none set in %s)\n' "$managed_file"
+    else
+        printf 'DNS servers:     (provider/systemd default)\n'
+    fi
+    printf 'Fallback DNS:    %s\n' "${fallback_line:-none}"
+    printf 'DNSSEC:          %s\n' "${dnssec:-no}"
+    printf 'DNS-over-TLS:    %s\n' "${dot:-no}"
+    if [[ "$mode" == recursive* ]]; then
+        if systemctl is-active --quiet unbound 2>/dev/null; then unbound_state=active; else unbound_state=inactive; fi
+        printf 'unbound service: %s\n' "$unbound_state"
+    fi
+
+    echo ""
+    echo "Live state:"
+    if command -v resolvectl >/dev/null 2>&1; then
+        local live
+        live="$(resolvectl dns 2>/dev/null || true)"
+        if [[ -n "$live" ]]; then
+            printf '%s\n' "$live" | sed 's/^/  /'
+        else
+            echo "  no live DNS data from resolvectl"
+        fi
+    else
+        echo "  resolvectl not available"
+    fi
+
+    if [[ -e "$RESOLV_CONF" ]]; then
+        echo ""
+        if [[ -L "$RESOLV_CONF" ]]; then
+            printf '%s -> %s\n' "$RESOLV_CONF" "$(readlink -f "$RESOLV_CONF" 2>/dev/null || echo '?')"
+        else
+            printf '%s (regular file)\n' "$RESOLV_CONF"
+        fi
+        grep '^nameserver' "$RESOLV_CONF" 2>/dev/null | sed 's/^/  /' || true
+    fi
+    echo ""
+}
+
+# `dns list` is deliberately handled before the root check so any user can
+# inspect the current resolvers without sudo.
+if [[ "$show_dns_config" == true ]]; then
+    show_dns_overview
+    exit 0
+fi
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then

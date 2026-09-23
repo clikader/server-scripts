@@ -123,6 +123,22 @@ MOCK
     [ "$status" -eq 0 ]
 }
 
+@test "dispatch_command: dns list skips the root requirement" {
+    require_root() { echo 'require_root-called'; return 1; }
+    run dispatch_command dns list
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"require_root-called"* ]]
+    assert_output_contains "dummy-ok"
+}
+
+@test "dns list end-to-end as a normal user" {
+    # The read-only list sub-command must run without sudo, through the real
+    # dispatcher and the real component.
+    run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/clikader.sh" dns list
+    [ "$status" -eq 0 ]
+    assert_output_contains "Current DNS configuration"
+}
+
 @test "dispatch_command: nft/setup help without extra work" {
     run dispatch_command nft --help
     [ "$status" -eq 0 ]

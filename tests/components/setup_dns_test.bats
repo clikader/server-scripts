@@ -208,6 +208,58 @@ MOCK
     [ "$status" -eq 0 ]
 }
 
+@test "list: shows managed config, live state and resolv.conf" {
+    mkdir -p "$RESOLVED_CONF_D"
+    printf '[Resolve]\nDNS=9.9.9.9 149.112.112.112\nFallbackDNS=208.67.222.2\nDNSSEC=yes\nDNSOverTLS=yes\n' \
+        > "$RESOLVED_CONF_D/zz-clikader-dns.conf"
+    printf 'nameserver 127.0.0.53\n' > "$STUB_RESOLV_CONF"
+    ln -sf "$STUB_RESOLV_CONF" "$RESOLV_CONF"
+    cat > "$MOCK_BIN/resolvectl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'Global: 9.9.9.9 149.112.112.112\nLink 2 (eth0): 10.0.0.1\n'
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/resolvectl"
+    run show_dns_overview
+    [ "$status" -eq 0 ]
+    assert_output_contains "Current DNS configuration"
+    assert_output_contains "forward (systemd-resolved"
+    assert_output_contains "Managed file:    $RESOLVED_CONF_D/zz-clikader-dns.conf"
+    assert_output_contains "DNS servers:     9.9.9.9 149.112.112.112"
+    assert_output_contains "Fallback DNS:    208.67.222.2"
+    assert_output_contains "DNSSEC:          yes"
+    assert_output_contains "DNS-over-TLS:    yes"
+    assert_output_contains "Global: 9.9.9.9 149.112.112.112"
+    assert_output_contains "Link 2 (eth0): 10.0.0.1"
+    assert_output_contains "$RESOLV_CONF -> $STUB_RESOLV_CONF"
+    assert_output_contains "nameserver 127.0.0.53"
+}
+
+@test "list: recursive mode when DNS=127.0.0.1 and unbound is active" {
+    mkdir -p "$RESOLVED_CONF_D"
+    printf '[Resolve]\nDNS=127.0.0.1\nFallbackDNS=\nDNSSEC=no\nDNSOverTLS=no\n' > "$RESOLVED_CONF_D/zz-clikader-dns.conf"
+    run show_dns_overview
+    [ "$status" -eq 0 ]
+    assert_output_contains "recursive (systemd-resolved -> unbound on 127.0.0.1:53)"
+    assert_output_contains "DNS servers:     127.0.0.1"
+    assert_output_contains "unbound service: active"
+}
+
+@test "list: unmanaged when no clikader DNS config exists" {
+    rm -f "$RESOLVED_CONF"
+    run show_dns_overview
+    [ "$status" -eq 0 ]
+    assert_output_contains "unmanaged (provider/systemd default)"
+    assert_output_contains "Managed file:    none"
+    assert_output_contains "DNS servers:     (provider/systemd default)"
+}
+
+@test "list: the script lists resolvers as a normal user (no root check)" {
+    run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/components/setup_dns.sh" list
+    [ "$status" -eq 0 ]
+    assert_output_contains "Current DNS configuration"
+}
+
 @test "ask_secure_dns: --yes disables secure DNS" {
     non_interactive=true
     run ask_secure_dns
