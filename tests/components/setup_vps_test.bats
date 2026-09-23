@@ -32,10 +32,18 @@ setup() {
     make_mock chpasswd
     make_mock ssh-keygen
     make_mock ss --out "LISTEN 0 128 0.0.0.0:2222 sshd"
-    make_mock clikader
     make_mock maintenance
-    export CLIKADER_ENTRYPOINT="$MOCK_BIN/clikader"
+    make_mock apt-reset
+    make_mock setup_dns
+    make_mock configure_ipv6
+    make_mock optimize_tcp
+    make_mock fix_hostname
     export MAINTENANCE_SCRIPT="$MOCK_BIN/maintenance"
+    export APT_RESET_SCRIPT="$MOCK_BIN/apt-reset"
+    export DNS_SCRIPT="$MOCK_BIN/setup_dns"
+    export IPV6_SCRIPT="$MOCK_BIN/configure_ipv6"
+    export TCP_SCRIPT="$MOCK_BIN/optimize_tcp"
+    export HOSTNAME_SCRIPT="$MOCK_BIN/fix_hostname"
     make_mock sleep
     load_component components/setup_vps.sh
     verify_ssh_journal() { return 0; }
@@ -88,6 +96,43 @@ setup() {
     rm -f "$STATE_FILE"
     run load_state
     [ "$status" -eq 1 ]
+}
+
+@test "load_state: older step layout restarts progress but keeps saved answers" {
+    mkdir -p "$STATE_DIR"
+    cat > "$STATE_FILE" <<'EOF'
+ssh_port='2222'
+ssh_auth_method='key'
+ssh_public_key='ssh-ed25519 AAAA me@h'
+ssh_password=''
+extra_ports='8080'
+last_step=8
+clikader_setup_completed=0
+completed_at=''
+upgrade_pending='bookworm'
+upgrade_boot_id='boot-x'
+upgrade_finished=1
+ipv6_policy='disable'
+profile='proxy'
+EOF
+    load_state
+    [ "$last_step" = "0" ]
+    [ "$ssh_port" = "2222" ]
+    [ "$extra_ports" = "8080" ]
+    [ "$upgrade_pending" = "bookworm" ]
+    [ "$upgrade_finished" = "1" ]
+}
+
+@test "load_state: current layout keeps progress" {
+    ssh_port=2222
+    ssh_auth_method=key
+    ssh_public_key="ssh-ed25519 AAAA me@h"
+    extra_ports=""
+    last_step=9
+    save_state
+    last_step=0
+    load_state
+    [ "$last_step" = "9" ]
 }
 
 @test "apply_cli_inputs: ssh-port + key" {
@@ -145,6 +190,70 @@ setup() {
     run step_prefer_ipv4
     [ "$status" -eq 0 ]
     [ "$(grep -c 'precedence' "$GAI_CONF")" -eq 1 ]
+}
+
+@test "step_configure_ipv6: disable policy runs the component, keep leaves it alone" {
+    ipv6_policy=disable
+    last_step=0
+    run step_configure_ipv6
+    [ "$status" -eq 0 ]
+    [ "$(mock_last_args configure_ipv6)" = "--disable --yes" ]
+    [ "$(mock_calls configure_ipv6)" -eq 1 ]
+
+    ipv6_policy=keep
+    run step_configure_ipv6
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls configure_ipv6)" -eq 1 ]
+}
+
+@test "step_reset_apt_sources: proxy runs the component, general preserves provider sources" {
+    profile=proxy
+    last_step=0
+    run step_reset_apt_sources
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls apt-reset)" -eq 1 ]
+
+    profile=general
+    run step_reset_apt_sources
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls apt-reset)" -eq 1 ]
+}
+
+@test "step_reset_apt_sources: component failure fails the step" {
+    profile=proxy
+    last_step=0
+    make_mock apt-reset --status 1
+    run step_reset_apt_sources
+    [ "$status" -eq 1 ]
+}
+
+@test "step_setup_dns: proxy runs the component with --yes, general preserves provider DNS" {
+    profile=proxy
+    last_step=0
+    run step_setup_dns
+    [ "$status" -eq 0 ]
+    [ "$(mock_last_args setup_dns)" = "--yes" ]
+    [ "$(mock_calls setup_dns)" -eq 1 ]
+
+    profile=general
+    run step_setup_dns
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls setup_dns)" -eq 1 ]
+}
+
+@test "step_tcp_and_hostname: proxy tunes TCP, general keeps tuning, hostname always fixed" {
+    profile=proxy
+    last_step=0
+    run step_tcp_and_hostname
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls optimize_tcp)" -eq 1 ]
+    [ "$(mock_last_args fix_hostname)" = "--fix" ]
+
+    profile=general
+    run step_tcp_and_hostname
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls optimize_tcp)" -eq 1 ]
+    [ "$(mock_calls fix_hostname)" -eq 2 ]
 }
 
 @test "step_install_packages: apt-get install" {
@@ -349,11 +458,21 @@ MOCK
     [ "$(stat -c %a "$FAIL2BAN_JAIL")" = 644 ]
 }
 
-@test "step_run_onboard: calls clikader o when present" {
+@test "run_step_if_needed: maps the network baseline steps to their components" {
+    ipv6_policy=disable
     last_step=0
-    run step_run_onboard
+    debian_codename=trixie
+    run run_step_if_needed 1
     [ "$status" -eq 0 ]
-    assert_mock_called clikader
+    run run_step_if_needed 2
+    [ "$status" -eq 0 ]
+    run run_step_if_needed 3
+    [ "$status" -eq 0 ]
+    run run_step_if_needed 4
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls apt-reset)" -eq 1 ]
+    [ "$(mock_calls setup_dns)" -eq 1 ]
+    [ "$(mock_calls configure_ipv6)" -eq 1 ]
 }
 
 @test "run_step_if_needed: skips completed steps" {
@@ -409,7 +528,19 @@ MOCK
     run main
     [ "$status" -eq 0 ]
     assert_file_contains "$STATE_FILE" 'clikader_setup_completed=1'
-    assert_file_contains "$STATE_FILE" 'last_step=9'
+    assert_file_contains "$STATE_FILE" 'last_step=12'
+
+    # The network baseline (APT reset + DNS) runs before the first apt-get,
+    # which is the whole point of the ordering fix.
+    local reset_line dns_line apt_line
+    reset_line="$(grep -n '^apt-reset' "$MOCK_CFG_DIR/calls" | head -1 | cut -d: -f1)"
+    dns_line="$(grep -n '^setup_dns' "$MOCK_CFG_DIR/calls" | head -1 | cut -d: -f1)"
+    apt_line="$(grep -n '^apt-get' "$MOCK_CFG_DIR/calls" | head -1 | cut -d: -f1)"
+    [ -n "$reset_line" ] && [ -n "$dns_line" ] && [ -n "$apt_line" ]
+    [ "$reset_line" -lt "$apt_line" ]
+    [ "$dns_line" -lt "$apt_line" ]
+    # On an already-trixie box the same-run normalization is not repeated.
+    [ "$(mock_calls apt-reset)" -eq 1 ]
 }
 
 @test "step_ssh_hardening: key-only writes managed block and authorized_keys" {
@@ -520,6 +651,26 @@ MOCK
     assert_output_contains "Already on Debian"
 }
 
+@test "step_upgrade_debian: re-normalizes sources when the reset targeted another release" {
+    debian_codename=trixie
+    apt_sources_reset_for=bookworm
+    profile=proxy
+    last_step=0
+    run step_upgrade_debian
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls apt-reset)" -eq 1 ]
+}
+
+@test "step_upgrade_debian: skips the duplicate reset when step 3 already normalized this release" {
+    debian_codename=trixie
+    apt_sources_reset_for=trixie
+    profile=proxy
+    last_step=0
+    run step_upgrade_debian
+    [ "$status" -eq 0 ]
+    [ "$(mock_calls apt-reset)" -eq 0 ]
+}
+
 @test "public key validation rejects malformed key material using real OpenSSH" {
     rm "$MOCK_BIN/ssh-keygen"
     run valid_ssh_pubkey 'ssh-ed25519 '
@@ -533,20 +684,30 @@ MOCK
 
 @test "bookworm resume after the bullseye hop schedules the second upgrade" {
     debian_codename=bookworm
-    last_step=1
+    last_step=4
     step_upgrade_debian() { echo second-hop; }
-    run run_step_if_needed 1
+    run run_step_if_needed 5
     [ "$status" -eq 0 ]
     assert_output_contains second-hop
 }
 
 @test "changing a resumed SSH port invalidates SSH and firewall steps" {
-    last_step=6
+    last_step=9
     ssh_port=2222
     cli_ssh_port=4444
     apply_cli_inputs
-    [ "$last_step" -eq 4 ]
+    [ "$last_step" -eq 7 ]
     [ "$ssh_port" = 4444 ]
+}
+
+@test "changing extra ports invalidates the firewall step" {
+    last_step=12
+    ssh_port=2222
+    extra_ports=""
+    cli_extra_ports="8080"
+    apply_cli_inputs
+    [ "$last_step" -eq 8 ]
+    [ "$extra_ports" = "8080" ]
 }
 
 @test "release upgrade refuses to resume in the same boot" {
@@ -588,7 +749,7 @@ MOCK
     load_state
     [ "$upgrade_pending" = bookworm ]
     [ "$upgrade_finished" = 1 ]
-    [ "$last_step" = 0 ]
+    [ "$last_step" = 4 ]
     assert_file_contains "$UPGRADE_APT_LIST" bookworm
     printf 'boot-two\n' > "$BOOT_ID_FILE"
     debian_codename=bookworm
@@ -596,6 +757,7 @@ MOCK
     [ "$status" -eq 0 ]
     load_state
     [ "$upgrade_pending" = trixie ]
+    [ "$last_step" = 4 ]
     assert_file_contains "$UPGRADE_APT_LIST" trixie
     printf 'boot-three\n' > "$BOOT_ID_FILE"
     debian_codename=trixie
@@ -603,7 +765,9 @@ MOCK
     [ "$status" -eq 0 ]
     load_state
     [ -z "$upgrade_pending" ]
-    [ "$last_step" = 1 ]
+    [ "$last_step" = 5 ]
+    # Resuming onto trixie re-normalizes the sources for the new release.
+    assert_mock_called apt-reset
 }
 
 @test "release preflight rejects vendor and floating repositories before package changes" {

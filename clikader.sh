@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Version
-CLIKADER_VERSION="1.15.0"
+CLIKADER_VERSION="1.15.1"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -79,8 +79,7 @@ show_usage() {
 echo "Commands:"
 echo "  --help, -h, help            Show this help message"
 echo "  update, upgrade             Update CLiKader"
-echo "  setup, vpssetup             Full fresh-server setup (upgrade, ssh, nftables, fail2ban, onboard)"
-echo "  onboard, o                  One-shot setup: dns + tcp + apt + ipv6-off + hostname"
+echo "  setup, vpssetup             Full fresh-server setup (network baseline, upgrade, ssh, nftables, fail2ban)"
 echo "  dns                         Run DNS setup tool"
 echo "  tcp                         Run TCP/network optimization tool"
 echo "  nft, nftables               Manage inbound ports in the nftables allowlist"
@@ -102,9 +101,7 @@ echo "  clikader help"
 echo "  sudo clikader update"
 echo "  sudo clikader setup"
 echo "  sudo clikader vpssetup --force"
-echo "  sudo clikader onboard"
-echo "  sudo clikader onboard --recursive   (DNS via local unbound recursive resolver)"
-echo "  sudo clikader dns --recursive       (switch an existing box to unbound)"
+    echo "  sudo clikader dns --recursive       (switch an existing box to unbound)"
     echo "  sudo clikader dns"
     echo "  sudo clikader tcp"
     echo "  sudo clikader tcp --dry-run"
@@ -217,110 +214,6 @@ uninstall_clikader() {
     echo "Or simply start a new shell session."
 }
 
-# Run a single onboarding step. Wraps run_script with a pass/fail banner so the
-# sequence continues even if one step fails (we just report it at the end).
-# Args: step_number script title [extra args...]
-onboard_step() {
-    local num="$1"; shift
-    local script="$1"; shift
-    local title="$1"; shift
-
-    echo ""
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║ Step ${num}/5: ${title}                 ${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
-    echo ""
-
-    if run_script "$script" "$title" "$@"; then
-        ONBOARD_RESULTS+=("Step $num ($title): ${GREEN}OK${NC}")
-        return 0
-    else
-        ONBOARD_RESULTS+=("Step $num ($title): ${RED}FAILED${NC}")
-        warning "Step $num ($title) failed; continuing with remaining steps."
-        return 1
-    fi
-}
-
-onboard_clikader() {
-    # Recognized options:
-    #   --recursive / -r   run the DNS step with a local unbound recursive
-    #                      resolver instead of forwarding to public DNS
-    local dns_extra_args="" profile=proxy ipv6_policy=ask failed=0
-    local arg
-    for arg in "$@"; do
-        case $arg in
-            -r|--recursive) dns_extra_args="--recursive" ;;
-            --profile=proxy) profile=proxy ;;
-            --profile=general) profile=general ;;
-            --keep-ipv6) ipv6_policy=keep ;;
-            --disable-ipv6) ipv6_policy=disable ;;
-            -h|--help) echo 'Usage: clikader onboard [--profile=proxy|general] [--recursive] [--keep-ipv6|--disable-ipv6]'; return 0 ;;
-            *) error "Unknown onboard option: $arg"; return 2 ;;
-        esac
-    done
-    if [[ "$profile" == general && -n "$dns_extra_args" ]]; then
-        error '--recursive changes DNS; use the proxy profile or clikader dns --recursive explicitly.'
-        return 2
-    fi
-    ipv6_policy="$(choose_ipv6 "$ipv6_policy")" || return 1
-    clikader_lock onboard || return 1
-
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║       CLiKader Onboarding (5 steps)     ${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Runs all setup steps non-interactively with production defaults:"
-    if [[ -n "$dns_extra_args" ]]; then
-        info "  1. DNS   (local recursive unbound, no public DNS cache in path)"
-    else
-        info "  1. DNS   (direct-IP; Azure DNS on Azure VMs, else latency-ordered public pick)"
-    fi
-    info "  2. TCP   (network-stack optimization)"
-    info "  3. APT   (reset to official sources)"
-    info "  Profile: $profile; IPv6: $ipv6_policy"
-    info "  5. Hostname (fix to 127.0.0.1 if not already)"
-    echo ""
-
-    ONBOARD_RESULTS=()
-
-    # 1. DNS — --yes uses direct-IP mode + default providers + proceeds past rerun
-    if [[ "$profile" == proxy ]]; then
-        onboard_step 1 "setup_dns.sh" "Setup DNS" --yes $dns_extra_args || failed=1
-
-    # 2. TCP — non-interactive, apply tuning
-        onboard_step 2 "optimize_tcp.sh" "TCP/Network Optimization" || failed=1
-
-    # 3. APT — already non-interactive
-        onboard_step 3 "reset_apt_source.sh" "Reset APT Sources" || failed=1
-    else
-        ONBOARD_RESULTS+=("Provider DNS, APT repositories and network tuning preserved (general profile)")
-    fi
-
-    # 4. IPv6 — disable, skip confirm
-    if [[ "$ipv6_policy" == disable ]]; then
-        onboard_step 4 "configure_ipv6.sh" "Disable IPv6" --disable --yes || failed=1
-    else
-        ONBOARD_RESULTS+=("IPv6 kept enabled")
-    fi
-
-    # 5. Hostname — auto-fix if not pointing to localhost
-    onboard_step 5 "fix_hostname.sh" "Fix Hostname" --fix || failed=1
-
-    echo ""
-    echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║       Onboarding Summary                ${NC}"
-    echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
-    for r in "${ONBOARD_RESULTS[@]}"; do
-        echo -e "  • $r"
-    done
-    echo ""
-    if (( failed == 0 )); then
-        mkdir -p "$CLIKADER_STATE_DIR"
-        printf 'profile=%s\nipv6=%s\n' "$profile" "$ipv6_policy" > "$CLIKADER_STATE_DIR/onboard.conf"
-    fi
-    return "$failed"
-}
-
 dispatch_command() {
     local command="${1:-}"
     shift || true
@@ -371,8 +264,14 @@ dispatch_command() {
             run_script "configure_ipv6.sh" "Configure IPv6" "$@"
             ;;
         "onboard" | "o")
-            has_help_flag "$@" || require_root "$command"
-            onboard_clikader "$@"
+            # Removed: `clikader setup` absorbed the DNS/TCP/APT/IPv6/hostname
+            # steps (and runs them in the right order). Keep a pointer instead
+            # of a bare "Unknown command" for anyone with the old habit.
+            error "'clikader onboard' has been removed and no longer performs any steps."
+            echo "Use 'clikader setup' on a fresh server; on an existing one, run the"
+            echo "individual steps: clikader dns, clikader tcp, clikader apt-reset,"
+            echo "clikader ipv6, clikader hostname."
+            return 1
             ;;
         "doctor" | "status")
             bash "$SCRIPT_DIR/components/doctor.sh" "$@"

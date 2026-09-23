@@ -115,7 +115,7 @@ valid_global_ipv6() {
         END { exit !found }'
 }
 
-# Called before onboarding mutations. An explicit flag also makes remote
+# Called before setup's network mutations. An explicit flag also makes remote
 # automation deterministic. No global address means no question is needed.
 choose_ipv6() {
     local choice="${1:-ask}" answer

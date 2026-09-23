@@ -3,9 +3,14 @@
 # VPS Setup Script - One-shot setup for a fresh Debian server
 #
 # Brings a freshly installed Debian 11/12/13 box to the clikader baseline:
-# upgrade to Debian 13, prefer IPv4, install base packages, chrony, SSH
-# hardening (key-only or password login), nftables, fail2ban, then run `clikader o`
-# for the remaining onboarding.
+# fix the network first (prefer IPv4, IPv6 policy, official APT sources, fast
+# DNS), then upgrade to Debian 13, install base packages, chrony, SSH hardening
+# (key-only or password login), nftables, fail2ban, TCP tuning/hostname and
+# unattended security updates.
+#
+# Order matters: provider images ship slow custom registries, IPv6-preferring
+# apt and slow DNS servers, so the network baseline runs BEFORE any heavy apt
+# work. Otherwise the release upgrade and package installs can stall for hours.
 #
 # Survives the reboot a major-version upgrade requires: answers and progress
 # are persisted to /etc/clikader/setup.state, so re-running `clikader setup`
@@ -47,6 +52,9 @@ info() {
 # --- Paths and constants ---
 STATE_DIR="${STATE_DIR:-/etc/clikader}"
 STATE_FILE="${STATE_DIR}/setup.state"
+# Bumped whenever the step layout changes: a state file from an older layout
+# keeps its saved answers but restarts step progress (see load_state).
+SETUP_STATE_SCHEMA=2
 # System file paths (env-overridable so tests can target temp files; defaults unchanged)
 GAI_CONF="${GAI_CONF:-/etc/gai.conf}"
 SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
@@ -56,13 +64,18 @@ AUTHORIZED_KEYS="${AUTHORIZED_KEYS:-${SSH_DIR}/authorized_keys}"
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
 FAIL2BAN_JAIL="${FAIL2BAN_JAIL:-/etc/fail2ban/jail.d/99-clikader.local}"
 BOOT_ID_FILE="${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
-CLIKADER_ENTRYPOINT="${CLIKADER_ENTRYPOINT:-$(dirname "${BASH_SOURCE[0]}")/../clikader.sh}"
 MAINTENANCE_SCRIPT="${MAINTENANCE_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/maintenance.sh}"
 UPGRADE_APT_LIST="${UPGRADE_APT_LIST:-/etc/apt/sources.list}"
 UPGRADE_APT_DIR="${UPGRADE_APT_DIR:-/etc/apt/sources.list.d}"
+# Component scripts the step runner invokes (env-overridable for tests).
+APT_RESET_SCRIPT="${APT_RESET_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/reset_apt_source.sh}"
+DNS_SCRIPT="${DNS_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/setup_dns.sh}"
+IPV6_SCRIPT="${IPV6_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/configure_ipv6.sh}"
+TCP_SCRIPT="${TCP_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/optimize_tcp.sh}"
+HOSTNAME_SCRIPT="${HOSTNAME_SCRIPT:-$(dirname "${BASH_SOURCE[0]}")/fix_hostname.sh}"
 TARGET_DEBIAN_VERSION=13
 TARGET_CODENAME="trixie"
-TOTAL_STEPS=9
+TOTAL_STEPS=12
 
 # Runtime state (defaults; overwritten by load_state when resuming)
 ssh_port=""
@@ -94,6 +107,10 @@ cli_ssh_port=""
 cli_ssh_key=""
 cli_password=""
 cli_extra_ports=""
+# Codename the APT sources were last normalized for in this process (runtime
+# only, not persisted). Lets step 5 skip a redundant re-reset right after step
+# 3 on a box that is already on the target release.
+apt_sources_reset_for=""
 
 # --- Argument parsing ---
 while [[ $# -gt 0 ]]; do
@@ -127,8 +144,9 @@ while [[ $# -gt 0 ]]; do
 Usage: clikader setup [options]
 
 Full fresh-server setup for Debian 11/12/13:
-  upgrade to Debian 13, prefer IPv4, base packages, chrony, SSH hardening,
-  nftables, fail2ban, then \`clikader o\`.
+  network baseline (IPv4 preference, IPv6 policy, official APT sources, DNS),
+  then upgrade to Debian 13, base packages, chrony, SSH hardening, nftables,
+  fail2ban, TCP tuning/hostname and unattended security updates.
 
 Setup parameters (omit any to be prompted for it interactively):
   --ssh-port <port>            SSH port to configure (1-65535)
@@ -140,7 +158,8 @@ Setup parameters (omit any to be prompted for it interactively):
 Run modes:
   --force   Re-run the entire flow even if already completed.
   --reset   Wipe saved state and start over from scratch.
-  --profile=proxy|general   Proxy defaults, or preserve DNS/APT/TCP settings.
+  --profile=proxy|general   Proxy defaults, or preserve the provider's
+                            APT/DNS/TCP configuration (general).
   --keep-ipv6 / --disable-ipv6   Skip the IPv6 question with an explicit choice.
   --finish-upgrade   Acknowledge a manually repaired interrupted release upgrade.
 
@@ -211,6 +230,7 @@ save_state() {
     chmod 600 "$temporary"
     cat > "$temporary" <<EOF
 # Managed by clikader setup. Do not edit by hand; use 'clikader setup --reset'.
+setup_schema=${SETUP_STATE_SCHEMA}
 ssh_port='${ssh_port}'
 ssh_auth_method='${ssh_auth_method}'
 ssh_public_key='${escaped_key}'
@@ -232,6 +252,11 @@ load_state() {
     if [[ ! -f "$STATE_FILE" ]]; then
         return 1
     fi
+    # Read the layout version before sourcing: an older state file keeps its
+    # saved answers (ports/key/password, upgrade bookkeeping) but restarts step
+    # progress, because the same last_step numbers mean different steps now.
+    local saved_schema
+    saved_schema="$(sed -n 's/^setup_schema=//p' "$STATE_FILE" | tail -1)"
     # shellcheck disable=SC1090
     . "$STATE_FILE"
     # last_step / completed flags become shell vars here; copy into our globals.
@@ -243,6 +268,11 @@ load_state() {
     : "${last_step:=0}"
     : "${clikader_setup_completed:=0}"
     : "${completed_at:=}"
+    if [[ "${saved_schema:-1}" != "$SETUP_STATE_SCHEMA" ]]; then
+        warning "Saved setup state uses an older step layout; restarting from the network baseline (answers kept)."
+        last_step=0
+    fi
+    return 0
 }
 
 # --- Validation helpers ---
@@ -337,9 +367,9 @@ apply_cli_inputs() {
         extra_ports="$(normalize_port_list "$cli_extra_ports")" || exit 1
     fi
     if [[ "$previous_port" != "$ssh_port" || "$previous_auth" != "$ssh_auth_method" || "$previous_key" != "$ssh_public_key" || -n "$cli_password" ]]; then
-        (( last_step < 5 )) || last_step=4
+        (( last_step < 8 )) || last_step=7
     elif [[ "$previous_extra" != "$extra_ports" ]]; then
-        (( last_step < 6 )) || last_step=5
+        (( last_step < 9 )) || last_step=8
     fi
     return 0
 }
@@ -469,10 +499,87 @@ step_banner() {
     echo ""
 }
 
-# --- Step 1: Upgrade to Debian 13 (trixie) ---
+# --- Step 1: Prefer IPv4 ---
+# Runs before the first apt operation. Provider images often reach the mirror
+# over IPv6 first and stay there (a blackholed v6 path makes apt stall for
+# hours), and apt follows glibc's getaddrinfo ordering, which is what this
+# preference changes. IPv6 remains available as a fallback; the IPv6 policy
+# step below disables it outright when requested.
+step_prefer_ipv4() {
+    step_banner 1 "Prefer IPv4"
+    if grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF" 2>/dev/null; then
+        log "IPv4 preference already set in $GAI_CONF"
+    else
+        echo 'precedence ::ffff:0:0/96  100' >> "$GAI_CONF"
+        log "Added IPv4 preference to $GAI_CONF"
+    fi
+    last_step=1
+    save_state
+}
+
+# --- Step 2: Configure IPv6 policy ---
+# The keep/disable answer is resolved in main() before any step runs (it
+# survives resumes in the state file). Disabling removes "apt tries IPv6 first
+# and never falls back" for every tool, not only those honoring gai.conf.
+step_configure_ipv6() {
+    step_banner 2 "Configure IPv6"
+    if [[ "$ipv6_policy" == keep ]]; then
+        log "IPv6 kept enabled (IPv4 remains preferred for name resolution)"
+    else
+        bash "$IPV6_SCRIPT" --disable --yes || return 1
+    fi
+    last_step=2
+    save_state
+}
+
+# --- Step 3: Reset APT sources ---
+# Provider images ship their own registry, usually slow and sometimes stale;
+# official sources are also what the release-upgrade preflight requires. Runs
+# before any package install so the rest of setup is not stuck on that mirror.
+# The component validates the new sources with its own `apt update` and rolls
+# back on failure. Proxy profile only: general preserves provider repositories.
+step_reset_apt_sources() {
+    step_banner 3 "Reset APT sources"
+    if [[ "$profile" == general ]]; then
+        log "Profile 'general': keeping the provider's APT configuration"
+        last_step=3
+        save_state
+        return 0
+    fi
+    bash "$APT_RESET_SCRIPT" || return 1
+    apt_sources_reset_for="${debian_codename:-}"
+    log "APT sources reset to official mirrors"
+    last_step=3
+    save_state
+}
+
+# --- Step 4: Setup DNS ---
+# Slow provider resolvers make every later apt index/download crawl, so the
+# resolver is switched to latency-probed public DNS before the release
+# upgrade. The component installs its own dnsutils/systemd-resolved if missing
+# (official sources are in place by now) and verifies resolution before
+# committing. Proxy profile only: general preserves provider DNS (internal
+# name resolution).
+step_setup_dns() {
+    step_banner 4 "Setup DNS"
+    if [[ "$profile" == general ]]; then
+        log "Profile 'general': keeping the provider's DNS configuration"
+        last_step=4
+        save_state
+        return 0
+    fi
+    bash "$DNS_SCRIPT" --yes || return 1
+    last_step=4
+    save_state
+}
+
+# --- Step 5: Upgrade to Debian 13 (trixie) ---
 # Advances one codename hop per invocation, then asks the user to reboot and
 # re-run. Progress is tracked by the OS codename itself, so on the next run the
-# advanced codename means the hop is already done.
+# advanced codename means the hop is already done. Deliberately runs AFTER the
+# network baseline (steps 1-4): a release upgrade is the heaviest apt work in
+# the whole flow, and provider mirrors, IPv6-preferring apt and slow DNS used
+# to stretch it into hours.
 upgrade_preflight() {
     local audit source_file free
     audit="$(dpkg --audit)" || return 1
@@ -492,7 +599,7 @@ upgrade_preflight() {
 }
 
 step_upgrade_debian() {
-    step_banner 1 "Upgrade to Debian 13 (Trixie)"
+    step_banner 5 "Upgrade to Debian 13 (Trixie)"
 
     if [[ -n "$upgrade_pending" ]]; then
         if [[ "$upgrade_finished" != 1 ]]; then
@@ -509,11 +616,25 @@ step_upgrade_debian() {
     fi
     if [[ "$debian_codename" == "$TARGET_CODENAME" ]]; then
         log "Already on Debian ${TARGET_DEBIAN_VERSION} (${TARGET_CODENAME}); refreshing and applying updates."
+        if [[ "$profile" == proxy ]]; then
+            # Re-normalize sources for the current release: a box that arrived
+            # via bullseye still carries bullseye's component set (no
+            # non-free-firmware). Skipped when step 3 already reset for this
+            # exact release in this run. The component takes its own apt lock.
+            if [[ "$apt_sources_reset_for" == "$debian_codename" ]]; then
+                log "APT sources already normalized for ${debian_codename} (step 3)"
+            else
+                bash "$APT_RESET_SCRIPT" || return 1
+            fi
+        else
+            clikader_lock apt || return 1
+            apt_refresh || return 1
+            clikader_unlock apt || return 1
+        fi
         clikader_lock apt || return 1
-        apt_refresh || return 1
         DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confold upgrade -y || return 1
         clikader_unlock apt || return 1
-        last_step=1
+        last_step=5
         save_state
         return 0
     fi
@@ -578,43 +699,35 @@ step_upgrade_debian() {
     apt-get -o Dpkg::Options::=--force-confold full-upgrade -y || return 1
     apt-get --purge autoremove -y || return 1
 
-    # Record that step 1 ran, so a re-run after reboot continues from step 2.
-    last_step=0
+    # The hop's heavy apt work is done, so the baseline steps count as
+    # complete; last_step=4 makes a re-run after the reboot skip steps 1-4 and
+    # resume the upgrade through run_step_if_needed. The step itself stays
+    # incomplete until the box reports the target codename.
+    last_step=4
     upgrade_finished=1
     save_state
 
     echo ""
     if [[ "$to" == "$TARGET_CODENAME" ]]; then
         echo -e "${GREEN}Release upgrade to Debian ${TARGET_DEBIAN_VERSION} (${TARGET_CODENAME}) complete.${NC}"
+        echo "After the reboot, setup re-normalizes the APT sources for ${TARGET_CODENAME}"
+        echo "(bullseye's component set has no non-free-firmware)."
     else
         warning "Reached ${to}. Another hop to ${TARGET_CODENAME} is still needed."
     fi
     echo ""
     echo -e "${BOLD}A reboot is required before continuing.${NC}"
     echo "Reboot now, then re-run:  sudo clikader setup"
-    echo "It will pick up automatically from step 2 (no re-prompting)."
+    echo "It will pick up automatically from step 5 (no re-prompting)."
     echo ""
     info "Aborting here so you can reboot cleanly. Re-run after reboot to resume."
     # Intentionally exit the whole script: a reboot is unavoidable.
     exit 0
 }
 
-# --- Step 2: Prefer IPv4 ---
-step_prefer_ipv4() {
-    step_banner 2 "Prefer IPv4"
-    if grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF" 2>/dev/null; then
-        log "IPv4 preference already set in $GAI_CONF"
-    else
-        echo 'precedence ::ffff:0:0/96  100' >> "$GAI_CONF"
-        log "Added IPv4 preference to $GAI_CONF"
-    fi
-    last_step=2
-    save_state
-}
-
-# --- Step 3: Install base packages ---
+# --- Step 6: Install base packages ---
 step_install_packages() {
-    step_banner 3 "Install base packages"
+    step_banner 6 "Install base packages"
     local pkgs=(nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables fping)
     log "Installing: ${pkgs[*]}"
     export DEBIAN_FRONTEND=noninteractive
@@ -623,20 +736,20 @@ step_install_packages() {
     # unattended-upgrades run cannot make this step fail instantly.
     apt-get -o DPkg::Lock::Timeout=120 install -y "${pkgs[@]}"
     log "Base packages installed"
-    last_step=3
+    last_step=6
     save_state
 }
 
-# --- Step 4: Enable chrony for time sync ---
+# --- Step 7: Enable chrony for time sync ---
 step_enable_chrony() {
-    step_banner 4 "Enable chrony (NTP time sync)"
+    step_banner 7 "Enable chrony (NTP time sync)"
     systemctl enable --now chrony
     log "chrony enabled and started"
-    last_step=4
+    last_step=7
     save_state
 }
 
-# --- Step 5: SSH hardening + authorized_keys ---
+# --- Step 8: SSH hardening + authorized_keys ---
 #
 # Provider images routinely defeat a plain "change Port in /etc/ssh/sshd_config":
 #   * /etc/ssh/sshd_config.d/*.conf drop-ins: Debian's Include sits at the TOP
@@ -651,7 +764,7 @@ step_enable_chrony() {
 # the main config, disables socket activation, then VERIFIES the effective
 # config and the actual listener instead of trusting the sshd -t syntax check.
 step_ssh_hardening() (
-    step_banner 5 "SSH hardening + authorized key"
+    step_banner 8 "SSH hardening + authorized key"
 
     local sshd_config="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
     local sshd_conf_dir="${SSHD_CONF_DIR:-/etc/ssh/sshd_config.d}"
@@ -890,7 +1003,7 @@ step_ssh_hardening() (
         log "sshd verified: port ${ssh_port}, key-only root (password auth disabled)"
     fi
 
-    last_step=5
+    last_step=8
     save_state
     record_managed ssh "$sshd_config" "$AUTHORIZED_KEYS" || exit 1
     tx_commit
@@ -920,7 +1033,7 @@ prune_stale_setup_ports() {
     return 0
 }
 
-# --- Step 6: nftables firewall ---
+# --- Step 9: nftables firewall ---
 # INBOUND-ONLY firewall: exactly the ufw mental model — allow the ports you
 # asked for, drop everything else *addressed to this host*, and never interfere
 # with traffic passing through it. Plain nftables (no ufw) so future port
@@ -931,7 +1044,7 @@ prune_stale_setup_ports() {
 # tables while those services are running. fail2ban's nftables ban action hooks
 # its own drop chain in ahead of this filter table.
 step_configure_nftables() (
-    step_banner 6 "Configure nftables firewall"
+    step_banner 9 "Configure nftables firewall"
     if grep -qE 'table inet clikader_filter' "$NFT_CONF" 2>/dev/null; then
         bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$ssh_port" tcp || exit 1
         if [[ -n "$extra_ports" ]]; then
@@ -942,7 +1055,7 @@ step_configure_nftables() (
         # Without this, --force with a new SSH port left the old port allowed
         # forever (nothing else ever removes it).
         prune_stale_setup_ports || exit 1
-        last_step=6
+        last_step=9
         save_state
         return 0
     fi
@@ -1101,24 +1214,24 @@ EOF
     fi
     log "nftables enabled and clikader_filter loaded"
     nft list table inet clikader_filter
-    last_step=6
+    last_step=9
     save_state
     record_managed nft "$NFT_CONF" || exit 1
     tx_commit
 )
 
-# --- Step 7: fail2ban (SSH protection) ---
+# --- Step 10: fail2ban (SSH protection) ---
 # Pinned explicitly so the jail cannot silently fail:
 #   * backend = systemd reads auth failures straight from the journal (no
 #     logpath); journalmatch covers both unit names (Debian runs ssh.service,
 #     not sshd.service — a mismatch is the classic "never bans" failure).
-#   * banaction = nftables-native actions, matching the step-6 firewall;
+#   * banaction = nftables-native actions, matching the step-9 firewall;
 #     fail2ban manages its own f2b-table independent of clikader_filter.
 #   * port must match the custom sshd port; the default `port = ssh` token
 #     resolves to 22 and would watch the wrong port.
 # A test ban at the end proves the journal->jail->nftables path really works.
 step_setup_fail2ban() (
-    step_banner 7 "Configure fail2ban for SSH"
+    step_banner 10 "Configure fail2ban for SSH"
     tx_begin fail2ban restore_fail2ban || exit 1
     restore_fail2ban() { systemctl restart fail2ban; }
     tx_save "$FAIL2BAN_JAIL" || exit 1
@@ -1186,7 +1299,7 @@ EOF
     fi
     verify_ssh_journal || exit 1
     info "Bans are logged to /var/log/fail2ban.log; live view: fail2ban-client get sshd banned"
-    last_step=7
+    last_step=10
     save_state
     record_managed fail2ban "$FAIL2BAN_JAIL" || exit 1
     tx_commit
@@ -1213,25 +1326,37 @@ verify_ssh_journal() {
     grep -qE '[1-9][0-9]* matched' <<< "$report" || { error 'SSH journal messages did not match the fail2ban filter'; printf '%s\n' "$report" >&2; return 1; }
 }
 
-# --- Step 8: Run `clikader o` for the rest of onboarding ---
-step_run_onboard() {
-    step_banner 8 "Run clikader onboarding (clikader o)"
-    bash "$CLIKADER_ENTRYPOINT" o "--profile=$profile" "--${ipv6_policy}-ipv6" || return 1
-    last_step=8
+# --- Step 11: TCP tuning + hostname ---
+# These were the remaining pieces of the removed `clikader onboard`: the proxy
+# profile applies the relay-oriented TCP profile, then the hostname is fixed
+# for every profile so sudo never trips over an unresolvable name.
+step_tcp_and_hostname() {
+    step_banner 11 "TCP tuning + hostname"
+    if [[ "$profile" == general ]]; then
+        log "Profile 'general': keeping existing TCP/routing settings"
+    else
+        bash "$TCP_SCRIPT" || return 1
+    fi
+    bash "$HOSTNAME_SCRIPT" --fix || return 1
+    last_step=11
     save_state
 }
 
+# --- Step 12: Unattended security updates ---
 step_security_updates() {
-    step_banner 9 'Enable unattended security updates (manual reboot)'
+    step_banner 12 'Enable unattended security updates (manual reboot)'
     bash "$MAINTENANCE_SCRIPT" enable-security-updates || return 1
-    last_step=9
+    last_step=12
     save_state
 }
 
 # --- Run a step by number, if not already completed ---
 run_step_if_needed() {
     local num="$1"
-    if [[ "$num" == 1 && ( "$debian_codename" != "$TARGET_CODENAME" || -n "$upgrade_pending" ) ]]; then
+    # The upgrade step is driven by the OS codename, not last_step: run it
+    # whenever the box is not on the target yet (or mid-hop), even when the
+    # baseline steps have already been recorded as complete.
+    if [[ "$num" == 5 && ( "$debian_codename" != "$TARGET_CODENAME" || -n "$upgrade_pending" ) ]]; then
         step_upgrade_debian
         return $?
     fi
@@ -1240,15 +1365,18 @@ run_step_if_needed() {
         return 0
     fi
     case "$num" in
-        1) step_upgrade_debian ;;
-        2) step_prefer_ipv4 ;;
-        3) step_install_packages ;;
-        4) step_enable_chrony ;;
-        5) step_ssh_hardening ;;
-        6) step_configure_nftables ;;
-        7) step_setup_fail2ban ;;
-        8) step_run_onboard ;;
-        9) step_security_updates ;;
+        1) step_prefer_ipv4 ;;
+        2) step_configure_ipv6 ;;
+        3) step_reset_apt_sources ;;
+        4) step_setup_dns ;;
+        5) step_upgrade_debian ;;
+        6) step_install_packages ;;
+        7) step_enable_chrony ;;
+        8) step_ssh_hardening ;;
+        9) step_configure_nftables ;;
+        10) step_setup_fail2ban ;;
+        11) step_tcp_and_hostname ;;
+        12) step_security_updates ;;
         *) error "Unknown step ${num}"; return 1 ;;
     esac
 }
@@ -1348,7 +1476,7 @@ main() {
         (( had_cli )) && save_state
     fi
 
-    # Run steps 1..8, skipping any already completed. Step 1 may exit for a reboot.
+    # Run steps 1..12, skipping any already completed. Step 5 may exit for a reboot.
     local step
     for step in $(seq 1 $TOTAL_STEPS); do
         run_step_if_needed "$step"
@@ -1357,7 +1485,7 @@ main() {
 
     # All done: mark complete.
     clikader_setup_completed=1
-    last_step=9
+    last_step=12
     ssh_password=""
     completed_at="$(date -Iseconds 2>/dev/null || date)"
     save_state
@@ -1375,6 +1503,11 @@ main() {
         echo "  • SSH port:     ${ssh_port} (key-only root, password auth disabled)"
     fi
     echo "  • Extra ports:  ${extra_ports:-none}"
+    if [[ "$profile" == general ]]; then
+        echo "  • DNS/APT:      provider configuration preserved (general profile)"
+    else
+        echo "  • DNS/APT:      managed resolver + official sources (IPv4-first)"
+    fi
     echo "  • fail2ban:     protecting sshd on port ${ssh_port} (nftables bans)"
     echo "  • Firewall:     nftables (input policy drop)"
     echo "  • chrony:       time sync active"

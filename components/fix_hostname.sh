@@ -49,7 +49,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# --- Argument parsing (enables non-interactive use, e.g. from `clikader onboard`) ---
+# --- Argument parsing (enables non-interactive use, e.g. from `clikader setup`) ---
 # Flags: --fix checks hostname resolution and auto-fixes it if it does NOT point
 # to 127.0.0.1/127.0.1.1; --check only reports; --change is interactive only.
 HOSTNAME_MODE=""

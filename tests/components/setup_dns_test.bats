@@ -138,23 +138,74 @@ MOCK
     [[ "$SECURE_RESOLVED_CONFIG" != *"Cache=yes"* ]]
 }
 
-@test "catalogue: five non-filtering providers, Custom last" {
+@test "catalogue: five universal providers (non-filtering flavours), Custom last" {
     [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
     [ "$(provider_name 1)" = "Cloudflare" ]
     [ "$(provider_name 2)" = "Google" ]
     [ "$(provider_name 3)" = "Quad9" ]
-    [ "$(provider_name 4)" = "Alibaba" ]
-    [ "$(provider_name 5)" = "DNSPod" ]
+    [ "$(provider_name 4)" = "OpenDNS" ]
+    [ "$(provider_name 5)" = "AdGuard" ]
     [ "$CUSTOM_DNS_INDEX" -eq 6 ]
-    # China-optimized anycast pair (added 2026-09-18): both IPs present.
-    [[ "$(provider_ipv4 4)" == *"223.5.5.5"* && "$(provider_ipv4 4)" == *"223.6.6.6"* ]]
-    [[ "$(provider_ipv4 5)" == *"119.29.29.29"* && "$(provider_ipv4 5)" == *"119.28.28.28"* ]]
-    # DoT hostnames ride along as #suffixes for secure mode.
-    [[ "$(provider_ipv4 4)" == *"#dns.alidns.com"* ]]
-    [[ "$(provider_ipv4 5)" == *"#dot.pub"* ]]
-    # Filtering / thin-coverage providers must not come back via the catalogue.
+    # OpenDNS is the non-filtering Sandbox pair, not the standard pair that
+    # rewrites NXDOMAIN answers (ACME DNS-01 polling must see real NXDOMAIN).
+    [ "$(provider_ipv4 4)" = "208.67.222.2#sandbox.opendns.com 208.67.220.2#sandbox.opendns.com" ]
+    [ "$(provider_ipv6 4)" = "2620:0:ccc::2#sandbox.opendns.com 2620:0:ccd::2#sandbox.opendns.com" ]
+    # AdGuard is the Unfiltered pair, not the ad/tracker-blocking Default pair.
+    [ "$(provider_ipv4 5)" = "94.140.14.140#unfiltered.adguard-dns.com 94.140.14.141#unfiltered.adguard-dns.com" ]
+    [ "$(provider_ipv6 5)" = "2a10:50c0::1:ff#unfiltered.adguard-dns.com 2a10:50c0::2:ff#unfiltered.adguard-dns.com" ]
+    # China-optimized resolvers live in their own array, appended only on a
+    # mainland-China network (add_region_providers).
+    [ "${#CHINA_DNS_PROVIDERS[@]}" -eq 2 ]
     local joined="${DNS_PROVIDERS[*]}"
-    [[ "$joined" != *"AdGuard"* && "$joined" != *"DNS.SB"* && "$joined" != *"OpenDNS"* ]]
+    [[ "$joined" != *"Alibaba"* && "$joined" != *"DNSPod"* ]]
+    [[ "$joined" != *"208.67.222.222"* && "$joined" != *"94.140.14.14#"* ]]
+    [[ "$joined" != *"dns.adguard-dns.com"* ]]
+}
+
+@test "add_region_providers: skips Alibaba/DNSPod outside mainland China" {
+    is_mainland_china() { return 1; }
+    add_region_providers > "$BATS_TEST_TMPDIR/out"
+    [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
+    [ "$CUSTOM_DNS_INDEX" -eq 6 ]
+    grep -q "outside mainland China" "$BATS_TEST_TMPDIR/out"
+    # Idempotent: a second call does not duplicate entries.
+    add_region_providers
+    [ "${#DNS_PROVIDERS[@]}" -eq 5 ]
+    [ "$(provider_name 5)" = "AdGuard" ]
+}
+
+@test "add_region_providers: appends Alibaba/DNSPod on a mainland-China network" {
+    is_mainland_china() { return 0; }
+    add_region_providers > "$BATS_TEST_TMPDIR/out"
+    [ "${#DNS_PROVIDERS[@]}" -eq 7 ]
+    [ "$(provider_name 6)" = "Alibaba" ]
+    [ "$(provider_name 7)" = "DNSPod" ]
+    [ "$CUSTOM_DNS_INDEX" -eq 8 ]
+    grep -q "mainland-China network detected" "$BATS_TEST_TMPDIR/out"
+    [[ "$(provider_ipv4 6)" == *"223.5.5.5"* && "$(provider_ipv4 6)" == *"223.6.6.6"* ]]
+    [[ "$(provider_ipv4 7)" == *"119.29.29.29"* && "$(provider_ipv4 7)" == *"119.28.28.28"* ]]
+    [[ "$(provider_ipv4 6)" == *"#dns.alidns.com"* ]]
+    [[ "$(provider_ipv4 7)" == *"#dot.pub"* ]]
+    add_region_providers
+    [ "${#DNS_PROVIDERS[@]}" -eq 7 ]
+}
+
+@test "is_mainland_china: false when google.com connects within the timeout" {
+    make_mock timeout --status 0
+    run is_mainland_china
+    [ "$status" -eq 1 ]
+    # The probe is a plain 2-second TCP connect, not a long timeout.
+    [[ "$(mock_last_args timeout)" == "2 bash -c "* ]]
+    [[ "$(mock_last_args timeout)" == *"/dev/tcp/google.com/443"* ]]
+}
+
+@test "is_mainland_china: true when the probe times out or is refused" {
+    make_mock timeout --status 124
+    run is_mainland_china
+    [ "$status" -eq 0 ]
+    make_mock timeout --status 1
+    run is_mainland_china
+    [ "$status" -eq 0 ]
 }
 
 @test "ask_secure_dns: --yes disables secure DNS" {
@@ -327,7 +378,7 @@ MOCK
     [ -n "$primary_dns" ]
 }
 
-@test "provider menu shows both anycast IPs per provider" {
+@test "provider menu shows both anycast IPs for the universal providers" {
     non_interactive=true
     use_secure_dns=false
     ipv6_support=false
@@ -336,6 +387,20 @@ MOCK
     assert_output_contains "Cloudflare (1.1.1.1, 1.0.0.1)"
     assert_output_contains "Google (8.8.8.8, 8.8.4.4)"
     assert_output_contains "Quad9 (9.9.9.10, 149.112.112.10)"
+    assert_output_contains "OpenDNS (208.67.222.2, 208.67.220.2)"
+    assert_output_contains "AdGuard (94.140.14.140, 94.140.14.141)"
+    # China-optimized entries only appear after mainland-China detection.
+    [[ "$output" != *"Alibaba"* && "$output" != *"DNSPod"* ]]
+}
+
+@test "provider menu includes Alibaba/DNSPod after mainland-China detection" {
+    non_interactive=true
+    use_secure_dns=false
+    ipv6_support=false
+    is_mainland_china() { return 0; }
+    add_region_providers
+    run select_dns_providers
+    [ "$status" -eq 0 ]
     assert_output_contains "Alibaba (223.5.5.5, 223.6.6.6)"
     assert_output_contains "DNSPod (119.29.29.29, 119.28.28.28)"
 }
@@ -758,6 +823,8 @@ MOCK
 
 @test "main: --yes path reconfigures when health_check fails" {
     non_interactive=true
+    # Hermetic region detection: outside mainland China, no network probe.
+    is_mainland_china() { return 1; }
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'systemctl' >> "$MOCK_CFG_DIR/calls"
@@ -820,7 +887,7 @@ MOCK
 #
 # Only Azure DNS (the fabric VIP) can resolve VNET-internal names — private
 # endpoints, internal load balancers, peered-VNET names — so on an Azure VM
-# it must become the default (especially the --yes path used by setup/onboard)
+# it must become the default (especially the --yes path used by clikader setup)
 # while public resolvers stay an explicit, warned choice.
 # --------------------------------------------------------------------------
 
@@ -987,6 +1054,8 @@ MOCK
     printf 'Microsoft Corporation\n' > "$DMI_SYS_VENDOR_FILE"
     printf 'Virtual Machine\n' > "$DMI_PRODUCT_FILE"
     non_interactive=true
+    # Hermetic region detection: outside mainland China, no network probe.
+    is_mainland_china() { return 1; }
     cat > "$MOCK_BIN/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 printf 'systemctl' >> "$MOCK_CFG_DIR/calls"

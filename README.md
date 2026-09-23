@@ -46,7 +46,6 @@ Master entrypoint with direct sub-commands for all server management tasks.
 - `clikader --help` / `clikader help` / `clikader`
 - `clikader update` / `clikader upgrade`
 - `clikader setup` / `clikader vpssetup`
-- `clikader onboard` / `clikader o`
 - `clikader dns`
 - `clikader tcp`
 - `clikader nft` / `clikader nftables`
@@ -55,6 +54,11 @@ Master entrypoint with direct sub-commands for all server management tasks.
 - `clikader ipv6` / `clikader 6`
 - `clikader doctor` / `clikader status` (also `--json`)
 - `clikader maintenance --help`
+
+`clikader onboard` / `clikader o` has been removed. Its steps now live inside
+`clikader setup`: the network baseline (IPv4 preference, IPv6 policy, APT source
+reset, DNS) runs before any heavy apt work, and TCP tuning/hostname run near the
+end. On an existing server, run the individual commands instead.
 
 ---
 
@@ -65,25 +69,36 @@ All component scripts are in the `components/` folder and accessed through `clik
 ### 1. VPS Setup (`setup` / `vpssetup`)
 One-shot setup for a freshly installed Debian server. Runs the full baseline:
 
-1. Upgrade to Debian 13 (Trixie) — one release hop at a time, with a reboot in between
-2. Prefer IPv4 (`/etc/gai.conf`)
-3. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables`)
-4. Enable chrony for NTP time sync
-5. SSH hardening — custom port, and either key-only auth (default: `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, your public key) or password login (`--password`: `PermitRootLogin yes`, `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, root password set); neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
-6. Configure nftables — **inbound-only**: allow the SSH port + custom ports, drop everything else *addressed to this host*. Forwarded traffic (containers) is never filtered — a `forward` drop policy silently breaks every container, since container traffic never traverses the input chain — and output is never filtered
-7. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
-8. Run onboarding (profile-dependent DNS, TCP and APT; IPv6 policy; hostname)
-9. Enable unattended **security-only** updates, with automatic reboots disabled
+1. Prefer IPv4 (`/etc/gai.conf`) — applied before the first apt call, so provider images whose IPv6 path blackholes no longer stall apt for hours
+2. Configure the IPv6 policy — disabled by default (see below)
+3. Reset APT sources to official mirrors (`--profile=proxy`) — provider registries are usually slow and are also rejected by the release-upgrade preflight; the reset validates the new sources with an `apt update` before committing and rolls back on failure
+4. Configure DNS (`--profile=proxy`) — latency-probed public resolvers replace slow provider DNS before any package work
+5. Upgrade to Debian 13 (Trixie) — one release hop at a time, with a reboot in between
+6. Install base packages (`nano curl wget unzip fail2ban sudo python3-systemd cron chrony dnsutils jq nftables fping`)
+7. Enable chrony for NTP time sync
+8. SSH hardening — custom port, and either key-only auth (default: `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, your public key) or password login (`--password`: `PermitRootLogin yes`, `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, root password set); neutralizes provider overrides in `sshd_config.d/*.conf` and `ssh.socket`, then verifies the effective config and the real listener
+9. Configure nftables — **inbound-only**: allow the SSH port + custom ports, drop everything else *addressed to this host*. Forwarded traffic (containers) is never filtered — a `forward` drop policy silently breaks every container, since container traffic never traverses the input chain — and output is never filtered
+10. Configure fail2ban to protect sshd (systemd journal backend, nftables bans, verified with a test ban)
+11. TCP tuning + hostname — the proxy profile applies the relay-oriented TCP profile; the hostname is fixed to `127.0.0.1` for every profile
+12. Enable unattended **security-only** updates, with automatic reboots disabled
+
+Steps 1-4 are the network baseline and deliberately run before the release
+upgrade: provider images routinely ship slow custom registries, apt prefers a
+half-working IPv6 path that never falls back, and provider DNS servers that
+make every index update take hours. Fixing those first means the heavy apt
+work (steps 5-6) runs against official mirrors, IPv4-first, with fast DNS.
 
 The default `--profile=proxy` retains public DNS, relay-oriented TCP tuning and
 official APT sources. `--profile=general` preserves provider DNS, repository
-configuration and existing TCP/routing settings. Both profiles configure SSH,
-the host firewall, fail2ban, time synchronization and security updates.
+configuration and existing TCP/routing settings — it skips steps 3, 4 and the
+TCP half of step 11. Both profiles configure SSH, the host firewall, fail2ban,
+time synchronization and security updates.
 
-Before networking changes, setup asks whether to **keep IPv6** only when a usable
-global IPv6 address is present. The default answer is **no**. Without a global
-address it disables IPv6 without asking. Use `--keep-ipv6` or `--disable-ipv6` for
-automation; the choice is saved across upgrade reboots. Link-local, tentative,
+Before any apt or networking change (step 1 sets the IPv4 preference first),
+setup asks whether to **keep IPv6** only when a usable global IPv6 address is
+present. The default answer is **no**. Without a global address it disables IPv6
+without asking. Use `--keep-ipv6` or `--disable-ipv6` for automation; the choice
+is saved across upgrade reboots and applied at step 2. Link-local, tentative,
 deprecated and duplicate-address-failed addresses do not trigger the question.
 
 Prompts for the SSH port, the login method (SSH key or password), and any extra ports
@@ -96,16 +111,21 @@ so re-running `clikader setup` after the reboot resumes from where it stopped.
 - `--ssh-key <key>` — public key line for root (e.g. `"ssh-ed25519 AAAA... me@host"`) — key-only login
 - `--password <password>` — root SSH password; enables password login instead of a key (mutually exclusive with `--ssh-key`)
 - `--additional-ports <ports>` — extra ports to open in nftables, comma/space separated (e.g. `36158,443`)
-- `--profile=proxy|general` — select the onboarding policy (default: proxy)
+- `--profile=proxy|general` — select the setup policy (default: proxy); general preserves provider APT sources, DNS and TCP tuning
 - `--keep-ipv6` / `--disable-ipv6` — explicitly choose the IPv6 policy
 - `--finish-upgrade` — acknowledge an interrupted release upgrade after repairing
   packages with `dpkg --configure -a` and `apt-get full-upgrade`
 
 Release upgrades use one codename hop per reboot. The saved boot ID prevents
 continuing in the same boot; interrupted upgrades require explicit repair.
-Third-party or floating-suite APT sources must be resolved before a major upgrade.
+Third-party or floating-suite APT sources must be resolved before a major upgrade
+(the proxy profile's step 3 does exactly that). After the final hop, setup
+re-normalizes the sources for the new release, so a box that started on bullseye
+gets the trixie component set (including `non-free-firmware`).
 Changing SSH parameters during resume invalidates the dependent SSH/firewall steps.
 On Debian 13, setup refreshes package indexes and applies package updates too.
+A state file written by an older clikader version keeps its saved answers but
+restarts step progress, because the step numbers changed with the network baseline.
 
 **Idempotency:** once finished, the server is marked set up and a plain `clikader setup`
 will refuse to run again. Use `--force` to re-run the whole flow or `--reset` to wipe
@@ -177,13 +197,13 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 
 **Two resolver modes:**
 
-- **Forward (default)** — systemd-resolved forwards to the selected resolvers. **Providers:** Cloudflare, Google, Quad9, Alibaba (223.5.5.5/223.6.6.6, DoT `dns.alidns.com`), DNSPod (119.29.29.29/119.28.28.28, DoT `dot.pub`), Custom — famous, non-filtering resolvers only (filtering resolvers like AdGuard/OpenDNS are deliberately excluded; the two China-optimized anycast providers were added 2026-09-18 for CN-adjacent boxes where their POPs win the latency race; use Custom DNS for anything else)
-- **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. **Requires an unfiltered authoritative DNS path:** many hosting networks filter outbound port 53 to the root, TLD or authoritative servers, which makes recursion impossible. unbound still starts and reports `active` while answering nothing, so the script performs a real iterative lookup (root → TLD → authoritative) first and **refuses to continue** if it cannot complete one, rather than leave the box without DNS. Note that `FallbackDNS` does *not* rescue recursive mode: systemd-resolved consults it only when no DNS server is configured at all, and recursive mode sets `DNS=127.0.0.1`. Onboarding support: `clikader onboard --recursive`; switch an existing box with `clikader dns --yes --recursive`
+- **Forward (default)** — systemd-resolved forwards to the selected resolvers. **Providers:** Cloudflare, Google, Quad9, OpenDNS (the non-filtering Sandbox pair `208.67.222.2`/`208.67.220.2`, DoT `sandbox.opendns.com`), AdGuard (the non-filtering pair `94.140.14.140`/`94.140.14.141`, DoT `unfiltered.adguard-dns.com`), Custom. Alibaba (223.5.5.5/223.6.6.6, DoT `dns.alidns.com`) and DNSPod (119.29.29.29/119.28.28.28, DoT `dot.pub`) are China-optimized anycast and are offered only on mainland-China networks: setup checks whether `google.com` accepts a TCP connection within 2 seconds and drops both when it does, because their POPs lose the latency race everywhere else. Filtering resolver flavours (AdGuard Default, OpenDNS Standard) are deliberately not used — servers run unattended ACME DNS-01 and background jobs — and `Custom DNS` covers anything else
+- **Recursive (`--recursive`)** — a local **unbound** resolver queries the authoritative nameservers directly (root → TLD → zone). No public resolver cache exists in the path, so a stale negative answer at one public resolver cannot block anything — this is the structural fix for ACME DNS-01 (1Panel/lego, certbot, acme.sh) propagation hangs. unbound also performs full DNSSEC validation and runs with `cache-max-negative-ttl: 0`. **Requires an unfiltered authoritative DNS path:** many hosting networks filter outbound port 53 to the root, TLD or authoritative servers, which makes recursion impossible. unbound still starts and reports `active` while answering nothing, so the script performs a real iterative lookup (root → TLD → authoritative) first and **refuses to continue** if it cannot complete one, rather than leave the box without DNS. Note that `FallbackDNS` does *not* rescue recursive mode: systemd-resolved consults it only when no DNS server is configured at all, and recursive mode sets `DNS=127.0.0.1`. Setup support: `clikader setup` uses forward mode; switch an existing box to recursive with `clikader dns --yes --recursive`
 
 **Azure VMs — Azure DNS is the default (168.63.129.16):**
 - Azure VMs are auto-detected via the Azure Instance Metadata Service (`169.254.169.254`, requires the `Metadata: true` request only Azure's fabric serves), with a DMI fallback (vendor `Microsoft Corporation` + product `Virtual Machine`) for networks that filter link-local; because Hyper-V guests at *other* providers report identical DMI strings, a DMI-only match additionally requires the fabric VIP to answer one real DNS query — so the Azure option is never shown, recommended, or defaulted on a non-Azure machine, in any code path
 - The Azure DNS virtual IP is the **only** resolver that answers VNET-internal names — private endpoints / Private Link zones, internal load balancers, peered-VNET names. Every public resolver (and a local unbound recursor) returns NXDOMAIN for them, which is why the VIP becomes the default on Azure
-- Applies to `clikader setup` / `clikader onboard` (`--yes`) and to the interactive default; the entry appears as menu slot 1, marked *recommended*. To use public resolvers instead, re-run `clikader dns` and pick them — the script warns that VNET-internal names will stop resolving. `--recursive` on an Azure VM warns for the same reason
+- Applies to `clikader setup` (`--yes`) and to the interactive default; the entry appears as menu slot 1, marked *recommended*. To use public resolvers instead, re-run `clikader dns` and pick them — the script warns that VNET-internal names will stop resolving. `--recursive` on an Azure VM warns for the same reason
 - If the VIP does not answer its probe on a confirmed Azure VM (blocked or transiently down fabric resolver), a `--yes` run falls back to the public auto-pick with a loud warning instead of aborting
 - The fabric VIP offers no DoT and no IPv6; a secure-DNS selection that includes it downgrades that run to plain DNS
 
@@ -191,7 +211,7 @@ Configures DNS using systemd-resolved. Officially supports Debian 12/13, Ubuntu 
 - Defaults to plain direct-IP DNS
 - Optional strict, certificate-validated DNS-over-TLS (DoT) and DNSSEC validation (forward mode)
 - IPv6 support (optional)
-- **Auto mode (default off Azure):** probes all providers in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies. On Azure VMs the default is Azure DNS instead (see above); explicit `auto` still probes everything, including the Azure entry
+- **Auto mode (default off Azure):** probes every offered provider in parallel, orders by latency, and drops unresponsive ones — ideal when regional latency varies. On Azure VMs the default is Azure DNS instead (see above); explicit `auto` still probes everything, including the Azure entry
 - Manually select specific providers if preferred
 - Both anycast IPs of each selected provider are configured (e.g. `1.1.1.1` + `1.0.0.1`), queried in order as primary servers; servers that time out are rotated away from automatically (note: a server that *answers* wrongly — stale empty answer — is trusted by systemd-resolved; no negative cross-checking exists upstream of a local recursive resolver)
 - Static `FallbackDNS` is used only when no DNS server is configured; it does **not** rescue unreachable configured servers

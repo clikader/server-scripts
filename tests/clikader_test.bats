@@ -130,28 +130,17 @@ MOCK
     [ "$status" -eq 0 ]
 }
 
-@test "onboard_step: records OK and FAILED" {
-    ONBOARD_RESULTS=()
-    onboard_step 1 "setup_dns.sh" "Setup DNS" "--yes"
-    [[ "${ONBOARD_RESULTS[0]}" == *"OK"* ]]
-
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$SCRIPT_DIR/components/setup_dns.sh"
-    ONBOARD_RESULTS=()
-    onboard_step 1 "setup_dns.sh" "Setup DNS" || true
-    [[ "${ONBOARD_RESULTS[0]}" == *"FAILED"* ]]
-}
-
-@test "onboard_clikader: runs 5 steps" {
-    run onboard_clikader
-    [ "$status" -eq 0 ]
-    assert_output_contains "Onboarding Summary"
-}
-
-@test "dispatch_command: onboard / o" {
+@test "onboard_step is gone: dispatch points at setup instead" {
     run dispatch_command onboard
+    [ "$status" -eq 1 ]
+    assert_output_contains "removed"
+    assert_output_contains "clikader setup"
+}
+
+@test "show_usage: no longer advertises the removed onboard command" {
+    run show_usage
     [ "$status" -eq 0 ]
-    run dispatch_command o
-    [ "$status" -eq 0 ]
+    [[ "$output" != *"onboard"* ]]
 }
 
 @test "update_clikader: invokes the bundled installer" {
@@ -205,29 +194,18 @@ MOCK
     [ "$output" = "$CLIKADER_VERSION" ]
 }
 
-@test "real Bash onboarding continues after failure and returns an aggregate failure" {
-    inner="$(make_inner clikader.sh 'run_script() { echo "called $1"; [[ "$1" != setup_dns.sh ]]; }; onboard_clikader --disable-ipv6')"
-    run bash "$inner"
-    [ "$status" -eq 1 ]
-    assert_output_contains 'called fix_hostname.sh'
-    assert_output_contains 'Onboarding Summary'
-    assert_output_contains 'FAILED'
-}
-
-@test "general profile preserves DNS repositories and relay tuning" {
-    run onboard_clikader --profile=general --keep-ipv6
-    [ "$status" -eq 0 ]
-    [[ "$output" != *'Selected:'*'Setup DNS'* ]]
-    assert_output_contains 'general profile'
-    assert_output_contains 'IPv6 kept enabled'
-}
-
 @test "every command exposes read-only help without root" {
     local command
-    for command in dns tcp nft apt-reset hostname ipv6 setup onboard update uninstall doctor maintenance; do
+    for command in dns tcp nft apt-reset hostname ipv6 setup update uninstall doctor maintenance; do
         run setpriv --reuid=65534 --regid=65534 --clear-groups bash "$REPO_ROOT/clikader.sh" "$command" --help
         [ "$status" -eq 0 ]
     done
+}
+
+@test "removed onboard command never touches a component" {
+    run dispatch_command o
+    [ "$status" -eq 1 ]
+    [ ! -s "$MOCK_CFG_DIR/calls" ]
 }
 
 @test "version strings match across VERSION and every component revision" {

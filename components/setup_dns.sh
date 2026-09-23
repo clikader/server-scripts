@@ -16,7 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.15.0"
+SETUP_DNS_REVISION="1.15.1"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -73,7 +73,7 @@ RECURSION_PROBE_NAME="example.com"
 RECURSION_PROBE_ATTEMPTS=2   # every attempt must complete; a failure bails early
 RECURSION_TRACE_TIMEOUT=15   # hard per-attempt bound, seconds
 RECURSION_TRACE_EVIDENCE=""  # set on failure: servers that never replied
-LAST_RESORT_DNS="208.67.222.222 208.67.220.220"  # OpenDNS (Cisco): operator-independent FallbackDNS, contacted only when every primary is down
+LAST_RESORT_DNS="208.67.222.2 208.67.220.2"  # OpenDNS Sandbox (Cisco): operator-independent, non-filtering FallbackDNS, contacted only when every primary is down
 
 # How many providers "auto" mode keeps after probing the whole pool.
 AUTO_PICK_TOP=3
@@ -84,28 +84,73 @@ AUTO_PICK_TOP=3
 # reordering a provider only changes one place. The index in the array + 1 is
 # the menu number shown to the user (1-based, matching the original script).
 #
-# Curation policy (decided 2026-09): famous, non-filtering resolvers only.
-# Servers run unattended ACME DNS-01 challenges and background jobs, so
-# resolvers that filter/redirect (AdGuard, OpenDNS) are deliberately excluded
-# — "Custom DNS" covers anything not listed here. Alibaba and DNSPod
-# (added 2026-09-18) are China-optimized anycast rather than anycast-
-# everywhere, kept because on CN-adjacent boxes their POPs win the latency
-# race; thin-coverage regional resolvers otherwise stay out (use Custom DNS).
+# Curation policy (decided 2026-09): famous resolvers only, and always their
+# non-filtering flavour. Servers run unattended ACME DNS-01 challenges and
+# background jobs, so endpoints that filter or redirect answers are
+# deliberately picked in the unfiltered form: OpenDNS is the Sandbox pair
+# (208.67.222.2/.220.2, not the standard pair that rewrites NXDOMAIN) and
+# AdGuard is the Unfiltered pair (94.140.14.140/.141, not the default pair
+# that blocks ads/trackers). Alibaba and DNSPod (Tencent) are China-optimized
+# anycast rather than anycast-everywhere, so they live in
+# CHINA_DNS_PROVIDERS and are only offered when the host looks like it is in
+# mainland China (see is_mainland_china); thin-coverage regional resolvers
+# otherwise stay out (use Custom DNS).
 #
 # DoT hostname is embedded as "<ip>#<hostname>" per systemd-resolved syntax.
 # Direct-IP mode strips the "#hostname" suffix before applying (see select_dns_providers).
 #
-# Verified 2026-07: the global three offer public DoT on port 853.
-# Verified 2026-09 against provider docs: dns.alidns.com and dot.pub (port 853).
+# Verified 2026-07: Cloudflare/Google/Quad9 offer public DoT on port 853.
+# Verified 2026-09 against provider docs: dns.alidns.com, dot.pub,
+# sandbox.opendns.com and unfiltered.adguard-dns.com (port 853).
 DNS_PROVIDERS=(
     "Cloudflare|1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com|2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com"
     "Google|8.8.8.8#dns.google 8.8.4.4#dns.google|2001:4860:4860::8888#dns.google 2001:4860:4860::8844#dns.google"
     "Quad9|9.9.9.10#dns10.quad9.net 149.112.112.10#dns10.quad9.net|2620:fe::10#dns10.quad9.net 2620:fe::fe:10#dns10.quad9.net"
+    "OpenDNS|208.67.222.2#sandbox.opendns.com 208.67.220.2#sandbox.opendns.com|2620:0:ccc::2#sandbox.opendns.com 2620:0:ccd::2#sandbox.opendns.com"
+    "AdGuard|94.140.14.140#unfiltered.adguard-dns.com 94.140.14.141#unfiltered.adguard-dns.com|2a10:50c0::1:ff#unfiltered.adguard-dns.com 2a10:50c0::2:ff#unfiltered.adguard-dns.com"
+)
+# China-optimized anycast resolvers, appended at runtime on mainland-China
+# networks only — see add_region_providers. Keeping them out of the universal
+# catalogue everywhere else keeps the menu, latency probe and auto-pick free
+# of resolvers whose POPs lose the latency race outside China.
+CHINA_DNS_PROVIDERS=(
     "Alibaba|223.5.5.5#dns.alidns.com 223.6.6.6#dns.alidns.com|2400:3200::1#dns.alidns.com 2400:3200:baba::1#dns.alidns.com"
     "DNSPod|119.29.29.29#dot.pub 119.28.28.28#dot.pub|2402:4e00::#dot.pub"
 )
 # Index of the "Custom DNS" menu entry (always last, after the catalogue).
 CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
+
+# --- Mainland-China detection ---
+# Alibaba and DNSPod are China-optimized anycast: outside mainland China their
+# POPs lose the latency race to the global resolvers, so they are only offered
+# when this host looks like it is inside mainland China.
+#
+# The check is deliberately blunt and fast: google.com is blocked on mainland
+# networks, so a TCP connection that succeeds within CHINA_PROBE_TIMEOUT means
+# the host is NOT there. Bash's /dev/tcp needs no packages (curl/wget are not
+# installed yet when setup reaches this step) and `timeout` bounds the whole
+# probe — DNS resolution included — so a slow resolver cannot stall it.
+CHINA_PROBE_TIMEOUT="${CHINA_PROBE_TIMEOUT:-2}"
+region_providers_added=0
+
+is_mainland_china() {
+    ! timeout "$CHINA_PROBE_TIMEOUT" bash -c 'exec 3<>/dev/tcp/google.com/443' 2>/dev/null
+}
+
+# Append the China-optimized resolvers on mainland networks; idempotent, so a
+# second call (or a re-run in the same process) never duplicates entries.
+add_region_providers() {
+    if (( region_providers_added )); then return 0; fi
+    region_providers_added=1
+    if is_mainland_china; then
+        log "google.com unreachable within ${CHINA_PROBE_TIMEOUT}s: mainland-China network detected"
+        log "Adding China-optimized resolvers (Alibaba, DNSPod)"
+        DNS_PROVIDERS+=("${CHINA_DNS_PROVIDERS[@]}")
+    else
+        log "google.com reachable: outside mainland China, skipping Alibaba and DNSPod"
+    fi
+    CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
+}
 
 # --- Azure VM detection and fabric DNS ---
 # Azure VMs must send their queries to the Azure DNS virtual IP 168.63.129.16
@@ -114,7 +159,7 @@ CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
 # balancers and peered-VNET names exist only inside Azure's resolver, so every
 # public resolver — and a local unbound recursor — answers NXDOMAIN for them.
 # On an Azure VM the VIP is therefore the default (including --yes, i.e. the
-# setup/onboard path); public resolvers stay a menu choice with a warning.
+# setup path); public resolvers stay a menu choice with a warning.
 AZURE_DNS_VIP="168.63.129.16"
 # Env-overridable probes so tests can point them at temp files (defaults unchanged).
 AZURE_IMDS_URL="${AZURE_IMDS_URL:-http://169.254.169.254/metadata/instance?api-version=2021-02-01}"
@@ -397,7 +442,8 @@ ask_resolver_mode() {
     echo ""
     echo "  forward   - systemd-resolved forwards to the selected resolver"
     echo "              (Azure DNS on Azure VMs, else a public provider:"
-    echo "              Cloudflare/Google/Quad9/Alibaba/DNSPod; default behavior)"
+    echo "              Cloudflare/Google/Quad9/OpenDNS/AdGuard, plus Alibaba/DNSPod"
+    echo "              on mainland-China networks; default behavior)"
     echo "  recursive - local unbound resolves via the authoritative nameservers"
     echo "              directly: no public DNS cache in the path, DNSSEC"
     echo "              validated, immune to stale-negative cert hangs"
@@ -656,7 +702,7 @@ select_dns_providers() {
     local azure_default=false
     if [[ "$non_interactive" == true ]]; then
         if (( azure_dns_index )); then
-            # Azure VM + --yes (setup/onboard path): Azure DNS only. Public
+            # Azure VM + --yes (setup path): Azure DNS only. Public
             # resolvers remain available by re-running interactively.
             selections="$azure_dns_index"
             azure_default=true
@@ -1109,7 +1155,7 @@ configure_recursive_resolver() {
         error "unbound would start, report 'active', and then answer nothing — taking"
         error "every name lookup on this box down with it, while still exiting successfully."
         warning "Re-run WITHOUT --recursive to use systemd-resolved with public"
-        warning "resolvers (Cloudflare/Google/Quad9) instead."
+        warning "resolvers (Cloudflare/Google/Quad9/OpenDNS/AdGuard) instead."
         warning "Leaving the current resolver configuration untouched — DNS still works."
         echo ""
         return 1
@@ -1476,6 +1522,7 @@ main() {
         echo ""
     else
         ask_secure_dns
+        add_region_providers
         select_dns_providers || exit 1
     fi
 
