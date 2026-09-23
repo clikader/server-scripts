@@ -190,22 +190,36 @@ MOCK
     [ "${#DNS_PROVIDERS[@]}" -eq 7 ]
 }
 
-@test "is_mainland_china: false when google.com connects within the timeout" {
+@test "is_mainland_china: false when TCP to the resolved google.com IP connects" {
+    # Resolve step stubbed to a google.com address; the probe must connect BY
+    # IP (never through the local resolver) inside the timeout.
+    china_probe_ip() { printf '142.250.190.78'; }
     make_mock timeout --status 0
     run is_mainland_china
     [ "$status" -eq 1 ]
-    # The probe is a plain 2-second TCP connect, not a long timeout.
-    [[ "$(mock_last_args timeout)" == "2 bash -c "* ]]
-    [[ "$(mock_last_args timeout)" == *"/dev/tcp/google.com/443"* ]]
+    [[ "$(mock_last_args timeout)" == "3 bash -c "* ]]
+    [[ "$(mock_last_args timeout)" == *"/dev/tcp/142.250.190.78/443"* ]]
+    [[ "$(mock_last_args timeout)" != *"/dev/tcp/google.com/443"* ]]
 }
 
-@test "is_mainland_china: true when the probe times out or is refused" {
+@test "is_mainland_china: true when the TCP probe times out or is refused" {
+    china_probe_ip() { printf '142.250.190.78'; }
     make_mock timeout --status 124
     run is_mainland_china
     [ "$status" -eq 0 ]
     make_mock timeout --status 1
     run is_mainland_china
     [ "$status" -eq 0 ]
+}
+
+@test "is_mainland_china: undeterminable region (no resolver answers) is NOT mainland China" {
+    # Fail closed: a box that cannot even resolve google.com (broken/slow DNS,
+    # filtered port 53) must not get the China-only resolvers.
+    china_probe_ip() { return 1; }
+    make_mock timeout --status 124
+    run is_mainland_china
+    [ "$status" -eq 1 ]
+    [[ "$(mock_calls timeout)" -eq 0 ]]
 }
 
 @test "list: shows managed config, live state and resolv.conf" {
@@ -420,6 +434,20 @@ MOCK
     run verify_dns
     [ "$status" -eq 1 ]
     assert_output_contains "not running"
+}
+
+@test "verify_dns: no DNS servers at all -> refuse instead of leaving the box resolverless" {
+    cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "is-active" ]] && exit 0
+exit 0
+MOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    # resolved runs but the inventory lists no server (config rejected).
+    make_mock resolvectl --out 'Global:'
+    run verify_dns
+    [ "$status" -eq 1 ]
+    assert_output_contains "NO DNS servers after cutover"
 }
 
 @test "select_dns_providers: --yes auto-picks after probing" {

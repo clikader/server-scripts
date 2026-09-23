@@ -16,7 +16,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 # Bump whenever this component's behavior changes so downloaded runs are
 # identifiable in logs (clikader itself may be a different version).
-SETUP_DNS_REVISION="1.15.2"
+SETUP_DNS_REVISION="1.15.3"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -126,16 +126,42 @@ CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
 # POPs lose the latency race to the global resolvers, so they are only offered
 # when this host looks like it is inside mainland China.
 #
-# The check is deliberately blunt and fast: google.com is blocked on mainland
-# networks, so a TCP connection that succeeds within CHINA_PROBE_TIMEOUT means
-# the host is NOT there. Bash's /dev/tcp needs no packages (curl/wget are not
-# installed yet when setup reaches this step) and `timeout` bounds the whole
-# probe — DNS resolution included — so a slow resolver cannot stall it.
-CHINA_PROBE_TIMEOUT="${CHINA_PROBE_TIMEOUT:-2}"
+# The signal: on mainland networks google.com still RESOLVES through a Chinese
+# recursive resolver, but the TCP handshake to the returned address is dropped
+# by the GFW. So the probe (1) resolves google.com with a direct-IP query to
+# Alibaba's resolver (fallback Cloudflare) — the local resolver's speed or
+# health never enters the picture, and (2) TCP-connects to that address only.
+# Step (1) failing on BOTH resolvers means the region is UNDETERMINABLE
+# (outbound port 53 filtered, no IPv4 route): fail CLOSED — report "not
+# mainland China". A false "China" on a non-China box silently installs
+# China-optimized resolvers there (observed 2026-09-24 on a box whose slow
+# provider resolver made the old name-based probe time out), while a missed
+# detection only costs a mainland box the latency race it would lose anyway.
+# Bash's /dev/tcp needs no packages (curl/wget may not be installed yet when
+# setup reaches this step); dig is guaranteed by main() before this runs.
+CHINA_PROBE_TIMEOUT="${CHINA_PROBE_TIMEOUT:-3}"
 region_providers_added=0
 
+# Echo the first IPv4 address google.com resolves to via a direct-IP query, or
+# nothing when neither resolver answers.
+china_probe_ip() {
+    local server line answer
+    for server in 223.5.5.5 1.1.1.1; do
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+            printf '%s' "$line"
+            return 0
+        done <<< "$(dig_query "$server" google.com A)"
+    done
+    return 1
+}
+
+# True when this host looks like it is inside mainland China. Undeterminable
+# means NOT mainland China (see the rationale above).
 is_mainland_china() {
-    ! timeout "$CHINA_PROBE_TIMEOUT" bash -c 'exec 3<>/dev/tcp/google.com/443' 2>/dev/null
+    local ip
+    ip="$(china_probe_ip)" || return 1
+    ! timeout "$CHINA_PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/${ip}/443" 2>/dev/null
 }
 
 # Append the China-optimized resolvers on mainland networks; idempotent, so a
@@ -144,11 +170,11 @@ add_region_providers() {
     if (( region_providers_added )); then return 0; fi
     region_providers_added=1
     if is_mainland_china; then
-        log "google.com unreachable within ${CHINA_PROBE_TIMEOUT}s: mainland-China network detected"
+        log "google.com resolves but TCP:443 to it fails: mainland-China network detected"
         log "Adding China-optimized resolvers (Alibaba, DNSPod)"
         DNS_PROVIDERS+=("${CHINA_DNS_PROVIDERS[@]}")
     else
-        log "google.com reachable: outside mainland China, skipping Alibaba and DNSPod"
+        log "google.com reachable by IP: outside mainland China, skipping Alibaba and DNSPod"
     fi
     CUSTOM_DNS_INDEX=$(( ${#DNS_PROVIDERS[@]} + 1 ))
 }
@@ -1538,11 +1564,34 @@ verify_dns() {
     else
         warning "resolvectl status check failed"
     fi
-    
+
+    # Nothing-configured guard: this run always writes a global DNS= line
+    # (provider IPs in forward mode, 127.0.0.1 in recursive mode), so a server
+    # inventory without a single address means resolved silently REJECTED the
+    # configuration (e.g. an unreadable drop-in — the 2026-09-18 outage) and
+    # would answer nothing. Committing anyway is how a box ends up with "DNS
+    # set to nothing"; refuse and let the transaction roll the old resolver
+    # back instead. `resolvectl dns` lists global and per-link servers; any of
+    # them still serving means the box has a resolver.
+    local server_inventory
+    server_inventory="$(resolvectl dns 2>/dev/null || true)"
+    if ! grep -qE ':[[:space:]]*([0-9]{1,3}\.){3}[0-9]{1,3}([[:space:]]|$)' <<<"$server_inventory"; then
+        error "systemd-resolved reports NO DNS servers after cutover:"
+        error "it likely rejected the managed configuration (check 'journalctl -u systemd-resolved')."
+        error "Refusing to leave the box without DNS — rolling back to the previous resolver."
+        return 1
+    fi
+
     echo ""
     log "Testing DNS resolution..."
     if ! timeout 10 resolvectl query google.com >/dev/null 2>&1; then
         error 'systemd-resolved query failed'
+        return 1
+    fi
+    # A second, differently-hosted name catches a resolver that answers one
+    # name (or a poisoned/rewritten one) but not the general internet.
+    if ! timeout 10 resolvectl query deb.debian.org >/dev/null 2>&1; then
+        error 'systemd-resolved query failed for deb.debian.org'
         return 1
     fi
     if nslookup google.com >/dev/null 2>&1; then

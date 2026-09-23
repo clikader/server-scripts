@@ -774,9 +774,18 @@ step_ssh_hardening() (
     systemctl is-active --quiet ssh.socket && socket_active=1
     systemctl is-enabled --quiet ssh.socket && socket_enabled=1
     systemctl is-enabled --quiet ssh.service && service_enabled=1
+    # One full dump of the effective config for root, reused below: a pipe
+    # into an early-exiting awk could SIGPIPE sshd under pipefail, and
+    # suppressing stderr here once produced a completely silent step failure.
+    local sshd_dump=""
+    if ! sshd_dump="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>&1)"; then
+        error "sshd rejected the current configuration (sshd -T):"
+        error "${sshd_dump:-no diagnostic output}"
+        exit 1
+    fi
     if [[ "$ssh_auth_method" == key ]]; then
         local key_path
-        key_path="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 | awk '$1=="authorizedkeysfile" {print $2; exit}')" || exit 1
+        key_path="$(awk '$1=="authorizedkeysfile" {print $2; exit}' <<<"$sshd_dump")"
         if [[ -n "$key_path" ]]; then
             [[ "$key_path" != none ]] || { error 'AuthorizedKeysFile is disabled for root'; exit 1; }
             key_path="${key_path//%h//root}"
@@ -801,15 +810,16 @@ step_ssh_hardening() (
     if [[ "$ssh_auth_method" == key ]]; then
         valid_ssh_pubkey "$ssh_public_key" || { error 'Invalid SSH public key'; exit 1; }
     fi
-    tx_begin ssh restore_ssh || exit 1
-    tx_save "$sshd_config" "$sshd_conf_dir" "$AUTHORIZED_KEYS" || exit 1
+    tx_begin ssh restore_ssh || { error "Failed to start the ssh configuration transaction"; exit 1; }
+    tx_save "$sshd_config" "$sshd_conf_dir" "$AUTHORIZED_KEYS" \
+        || { error "Failed to snapshot ${sshd_config} / ${sshd_conf_dir}"; exit 1; }
 
     # Directives this step owns, wherever sshd reads them from.
     local managed_keywords='Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication'
 
     # --- Recon: what is effectively running right now? ---
     local current_ports
-    current_ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | tr '\n' ' ' | sed 's/ $//')"
+    current_ports="$(awk '$1 == "port" {print $2}' <<<"$sshd_dump" | tr '\n' ' ' | sed 's/ $//')"
     info "Effective sshd port(s) before hardening: ${current_ports:-unknown}"
     if [[ -n "$current_ports" && " ${current_ports} " != *" ${ssh_port} "* ]]; then
         warning "Provider SSH port (${current_ports}) differs from the requested ${ssh_port}."
@@ -891,12 +901,14 @@ step_ssh_hardening() (
         # authorized_keys BEFORE any restart: password auth is about to be
         # turned off, so the key must already be in place or root gets locked
         # out.
-        mkdir -p "$SSH_DIR"
-        mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
-        chmod 700 "$SSH_DIR"
-        touch "$AUTHORIZED_KEYS"
-        chmod 600 "$AUTHORIZED_KEYS"
-        chown root:root "$SSH_DIR" "$AUTHORIZED_KEYS" || exit 1
+        if ! { mkdir -p "$SSH_DIR" "$(dirname "$AUTHORIZED_KEYS")" \
+               && chmod 700 "$SSH_DIR" \
+               && touch "$AUTHORIZED_KEYS" \
+               && chmod 600 "$AUTHORIZED_KEYS" \
+               && chown root:root "$SSH_DIR" "$AUTHORIZED_KEYS"; }; then
+            error "Failed to prepare ${AUTHORIZED_KEYS} (permissions/ownership)"
+            exit 1
+        fi
         if [[ -n "$ssh_public_key" ]] && ! grep -qxF "$ssh_public_key" "$AUTHORIZED_KEYS"; then
             echo "$ssh_public_key" >> "$AUTHORIZED_KEYS"
             log "Added public key to $AUTHORIZED_KEYS"
@@ -907,7 +919,8 @@ step_ssh_hardening() (
     # Allow the new port in the running firewall before moving the listener.
     # The port manager preserves old listeners until the subsequent firewall step.
     if nft list table inet clikader_filter >/dev/null 2>&1 && [[ -f "$NFT_CONF" ]]; then
-        bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$ssh_port" tcp || exit 1
+        bash "$(dirname "${BASH_SOURCE[0]}")/nft_manager.sh" add "$ssh_port" tcp \
+            || { error "Failed to open port ${ssh_port}/tcp in the running firewall"; exit 1; }
     fi
 
     # Socket activation: while ssh.socket holds the listener, Port in
@@ -918,7 +931,11 @@ step_ssh_hardening() (
         systemctl disable --now ssh.socket
         systemctl enable ssh.service >/dev/null 2>&1
     fi
-    systemctl restart ssh.service || exit 1
+    if ! systemctl restart ssh.service; then
+        error "systemctl restart ssh.service failed — the previous config was restored;"
+        error "inspect 'journalctl -u ssh -n 50' and ${sshd_config}.backup_${ts}."
+        exit 1
+    fi
 
     # --- Verify: effective config AND real listener, not just exit codes. ---
     local effective eff_ports eff_pw eff_pk eff_prl eff_kbd fail=0
@@ -1479,7 +1496,11 @@ main() {
     # Run steps 1..12, skipping any already completed. Step 5 may exit for a reboot.
     local step
     for step in $(seq 1 $TOTAL_STEPS); do
-        run_step_if_needed "$step"
+        if ! run_step_if_needed "$step"; then
+            error "Step ${step}/${TOTAL_STEPS} failed. Fix the issue reported above, then re-run"
+            error "'clikader setup' — completed steps are remembered and it resumes at step ${step}."
+            exit 1
+        fi
         load_state || true
     done
 
